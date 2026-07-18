@@ -1,0 +1,35 @@
+[Unit]
+Description=Daily Seal web application
+After=network.target
+
+[Service]
+Type=simple
+User=dailyseal
+Group=dailyseal
+WorkingDirectory=/opt/daily-seal
+Environment=PYTHONUNBUFFERED=1
+Environment=DAILY_SEAL_DATA_DIR=/var/lib/daily-seal
+Environment=DAILY_SEAL_COOKIE_SECURE=1
+Environment=DAILY_SEAL_REGISTRATION_ENABLED=0
+ExecStart=/usr/bin/gunicorn --workers 2 --threads 2 --timeout 30 --bind 127.0.0.1:8766 app:app
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/daily-seal
+
+[Install]
+WantedBy=multi-user.target
