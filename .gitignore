@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.test-deps/
+vendor/
+.coverage
+.coverage.*
+htmlcov/
+
+# Daily Seal production and local data
+data/
+.local-data/
+instance/
+uploads/
+backups/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.sql
+*.dump
+daily-seal-*.json
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.seed.json
+secrets/
+credentials/
+.ssh/
+*askpass*
+
+# Logs, processes, archives and temporary files
+*.log
+*.pid
+*.tmp
+*.bak
+*.zip
+*.tar
+*.tar.gz
+
+# Visual QA captures can contain private task content
+screens/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Codex workspace metadata
+.agents/
+.codex/
+outputs/
