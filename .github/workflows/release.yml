@@ -1,0 +1,64 @@
+name: Publish version
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-version-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: app/requirements.txt
+
+      - name: Install dependencies
+        shell: bash
+        run: python -m pip install -r app/requirements.txt
+
+      - name: Run integration tests
+        shell: bash
+        run: python -m unittest discover -s tests -p "test_app.py" -v
+
+      - name: Choose version number
+        shell: bash
+        env:
+          COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+        run: |
+          set -Eeuo pipefail
+          release_date="$(date -u --date="${COMMIT_TIMESTAMP}" +'%Y.%m.%d')"
+          tag_name="v${release_date}.${GITHUB_RUN_ID}"
+          echo "TAG_NAME=${tag_name}" >> "${GITHUB_ENV}"
+          echo "Publishing ${tag_name}"
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            echo "Release ${TAG_NAME} already exists."
+            exit 0
+          fi
+
+          gh release create "${TAG_NAME}" \
+            --target "${GITHUB_SHA}" \
+            --title "Day1 ${TAG_NAME}" \
+            --generate-notes
