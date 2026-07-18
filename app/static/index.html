@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f5f6f2">
+  <meta name="description" content="Daily Seal — 清爽、安静的每日学习记录。">
+  <title>Daily Seal</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#dashboard-main">跳到主要内容</a>
+
+  <div id="app-root" class="app-root">
+    <section id="boot-view" class="boot-view" aria-live="polite">
+      <div class="boot-mark" aria-hidden="true">D</div>
+      <p>正在打开 Daily Seal…</p>
+    </section>
+
+    <main id="auth-view" class="auth-layout" hidden>
+      <section class="auth-intro" aria-labelledby="auth-brand-title">
+        <div class="brand-mark brand-mark-large" aria-hidden="true">D</div>
+        <p class="eyebrow">DAILY SEAL</p>
+        <h1 id="auth-brand-title">把重要的事，安静地做完。</h1>
+        <p class="auth-intro-copy">一个克制的每日任务与完成记录空间。管理者负责记录，其他账号只读浏览。</p>
+        <ul class="auth-points" aria-label="产品特点">
+          <li><span aria-hidden="true">✓</span> 每日任务与完成证明</li>
+          <li><span aria-hidden="true">✓</span> 清晰的历史完成记录</li>
+          <li><span aria-hidden="true">✓</span> 浏览账号无法修改内容</li>
+        </ul>
+      </section>
+
+      <section class="auth-card" aria-labelledby="auth-title">
+        <header class="auth-card-header">
+          <p class="mobile-brand"><span class="brand-mark" aria-hidden="true">D</span> Daily Seal</p>
+          <h2 id="auth-title">欢迎回来</h2>
+          <p id="auth-description" class="muted">登录后继续查看今天的记录。</p>
+        </header>
+
+        <div class="auth-tabs" role="tablist" aria-label="账户操作">
+          <button id="login-tab" class="auth-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="login-panel" data-auth-tab="login">登录</button>
+          <button id="register-tab" class="auth-tab" type="button" role="tab" aria-selected="false" aria-controls="register-panel" data-auth-tab="register" hidden>注册</button>
+        </div>
+
+        <div id="auth-message" class="form-message" role="status" aria-live="polite" hidden></div>
+
+        <section id="login-panel" class="auth-panel" role="tabpanel" aria-labelledby="login-tab" data-auth-panel="login">
+          <form id="login-form" class="form-stack" novalidate>
+            <div class="field">
+              <label for="login-email">邮箱</label>
+              <input id="login-email" name="email" type="email" inputmode="email" autocomplete="username" maxlength="254" placeholder="name@example.com" required>
+            </div>
+            <div class="field">
+              <div class="field-label-row">
+                <label for="login-password">密码</label>
+              </div>
+              <div class="password-field">
+                <input id="login-password" name="password" type="password" autocomplete="current-password" minlength="10" maxlength="128" placeholder="输入密码" required>
+                <button class="input-action" type="button" aria-label="显示登录密码" aria-pressed="false" data-toggle-password="login-password">显示</button>
+              </div>
+            </div>
+            <button id="login-submit" class="button button-primary button-block" type="submit" data-loading-label="正在登录…">登录</button>
+          </form>
+        </section>
+
+        <section id="register-panel" class="auth-panel" role="tabpanel" aria-labelledby="register-tab" data-auth-panel="register" hidden>
+          <div class="notice notice-readonly">
+            <span class="notice-icon" aria-hidden="true">i</span>
+            <p><strong>注册账号仅可查看</strong><br>不能新增、修改、删除或导出任何记录。</p>
+          </div>
+          <form id="register-form" class="form-stack" novalidate>
+            <div class="field">
+              <label for="register-email">邮箱</label>
+              <input id="register-email" name="email" type="email" inputmode="email" autocomplete="username" maxlength="254" placeholder="name@example.com" required>
+            </div>
+            <div class="field">
+              <label for="register-password">设置密码</label>
+              <div class="password-field">
+                <input id="register-password" name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" aria-describedby="register-password-help" placeholder="至少 10 个字符" required>
+                <button class="input-action" type="button" aria-label="显示注册密码" aria-pressed="false" data-toggle-password="register-password">显示</button>
+              </div>
+              <p id="register-password-help" class="field-help">建议使用一段只有你知道的长密码。</p>
+            </div>
+            <div class="field">
+              <label for="register-password-confirm">确认密码</label>
+              <input id="register-password-confirm" name="passwordConfirm" type="password" autocomplete="new-password" minlength="10" maxlength="128" placeholder="再次输入密码" required>
+            </div>
+            <button id="register-submit" class="button button-primary button-block" type="submit" data-loading-label="正在创建…">创建只读账号</button>
+          </form>
+        </section>
+
+        <p class="auth-footnote">登录即表示你了解：访客账号只用于查看管理者公开的任务与完成结果。</p>
+      </section>
+    </main>
+
+    <section id="app-view" class="app-view" hidden>
+      <header id="site-header" class="site-header">
+        <div class="site-header-inner">
+          <a class="site-brand" href="#today" aria-label="Daily Seal 首页">
+            <span class="brand-mark" aria-hidden="true">D</span>
+            <span class="site-brand-copy">
+              <strong>Daily Seal</strong>
+              <span id="brand-subtitle">每日学习记录</span>
+            </span>
+          </a>
+
+          <div class="header-actions">
+            <div id="view-switcher" class="view-switcher" role="group" aria-label="查看模式" hidden>
+              <button id="manage-view-button" class="view-switch is-active" type="button" aria-pressed="true" data-switch-view="owner">管理</button>
+              <button id="preview-view-button" class="view-switch" type="button" aria-pressed="false" data-switch-view="visitor">访客预览</button>
+            </div>
+
+            <span id="role-badge" class="role-badge">只读</span>
+
+            <details id="account-menu" class="account-menu">
+              <summary id="account-menu-button" class="account-trigger" aria-label="打开账户菜单">
+                <span id="account-avatar" class="account-avatar" aria-hidden="true">Q</span>
+                <span id="account-email-short" class="account-email-short">账户</span>
+                <span class="chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div id="account-menu-panel" class="account-menu-panel">
+                <div class="account-summary">
+                  <span id="account-avatar-large" class="account-avatar account-avatar-large" aria-hidden="true">Q</span>
+                  <p><strong id="account-email">—</strong><span id="account-role-label">只读访客</span></p>
+                </div>
+                <div class="menu-separator"></div>
+                <button id="open-password-dialog" class="menu-button" type="button">修改密码</button>
+                <button id="logout-button" class="menu-button menu-button-danger" type="button">退出登录</button>
+              </div>
+            </details>
+          </div>
+        </div>
+      </header>
+
+      <div id="preview-banner" class="preview-banner" role="status" hidden>
+        <div class="preview-banner-inner">
+          <p><strong>访客预览</strong><span>这是其他账号看到的只读页面。</span></p>
+          <button id="exit-preview-button" class="button button-small button-quiet" type="button" data-switch-view="owner">返回管理</button>
+        </div>
+      </div>
+
+      <main id="dashboard-main" class="dashboard-main">
+        <div id="page-message" class="page-message" role="status" aria-live="polite" hidden></div>
+
+        <section id="owner-view" class="dashboard-view" data-view="owner" aria-labelledby="owner-page-title">
+          <div class="page-heading">
+            <div>
+              <p id="owner-date-label" class="eyebrow">今天</p>
+              <h1 id="owner-page-title">把重要的事，安静地做完。</h1>
+              <p class="page-heading-copy">认真完成今天，也为更长的目标留下清晰轨迹。</p>
+            </div>
+            <div class="streak-card" aria-label="连续完成天数">
+              <span class="streak-dot" aria-hidden="true"></span>
+              <span><strong id="owner-streak-count" data-bind="streak-count">0</strong> 天连续完成</span>
+            </div>
+          </div>
+
+          <div class="owner-layout">
+            <div class="owner-primary-column">
+              <article id="today-task" class="card task-card task-card-today" data-task-scope="today">
+                <header class="card-header task-card-header">
+                  <div>
+                    <p class="card-kicker"><span class="status-dot" aria-hidden="true"></span> 今日任务</p>
+                    <p id="today-date" class="card-meta" data-bind="today-date">—</p>
+                  </div>
+                  <span id="today-status" class="status-chip status-pending" data-bind="today-status">待完成</span>
+                </header>
+                <div class="task-content">
+                  <p id="today-task-text" class="task-text" data-bind="today-task-text">今天还没有设置任务。</p>
+                  <p id="today-empty-hint" class="task-empty-hint">给今天留下一件明确、可完成的事。</p>
+                </div>
+                <div id="today-proof-summary" class="proof-summary" data-bind="today-proof-summary" hidden>
+                  <div id="today-result-icon" class="proof-summary-icon" aria-hidden="true">✓</div>
+                  <div>
+                    <strong id="today-result-label">已完成 · 100%</strong>
+                    <p id="today-proof-text" data-bind="today-proof-text">完成记录</p>
+                  </div>
+                  <button id="view-today-proof" class="text-button" type="button" data-action="view-proof" data-task-date="">查看记录</button>
+                </div>
+                <footer class="card-actions">
+                  <button id="edit-today-task" class="button button-secondary" type="button" data-action="edit-task" data-task-date="">编辑任务</button>
+                  <button id="complete-today-task" class="button button-primary" type="button" data-action="complete-task" data-task-date="">提交完成证明</button>
+                </footer>
+              </article>
+
+              <article id="tomorrow-task" class="card tomorrow-card" data-task-scope="tomorrow">
+                <header class="card-header">
+                  <div>
+                    <p class="card-kicker">明日任务</p>
+                    <p id="tomorrow-date" class="card-meta" data-bind="tomorrow-date">—</p>
+                  </div>
+                  <button id="edit-tomorrow-task" class="icon-text-button" type="button" data-action="edit-task" data-task-date="">编辑</button>
+                </header>
+                <p id="tomorrow-task-text" class="tomorrow-task-text" data-bind="tomorrow-task-text">还没有安排明天。</p>
+              </article>
+
+              <section id="history-section" class="card history-card" aria-labelledby="history-title">
+                <header class="card-header history-header">
+                  <div>
+                    <p class="card-kicker">完成轨迹</p>
+                    <h2 id="history-title">年度记录</h2>
+                  </div>
+                  <div class="year-controls" aria-label="选择年份">
+                    <button id="previous-year" class="icon-button" type="button" aria-label="上一年" data-history-year="previous">‹</button>
+                    <span id="history-year-label" data-bind="history-year">2026</span>
+                    <button id="next-year" class="icon-button" type="button" aria-label="下一年" data-history-year="next">›</button>
+                  </div>
+                </header>
+
+                <div class="history-summary" aria-label="年度统计">
+                  <p><strong id="history-done-count" data-bind="history-done-count">0</strong><span>完成天数</span></p>
+                  <p><strong id="history-rate" data-bind="history-rate">0%</strong><span>完成率</span></p>
+                  <p><strong id="history-best-streak" data-bind="history-best-streak">0</strong><span>最长连续</span></p>
+                </div>
+
+                <div class="heatmap-scroll" aria-label="年度完成热力图，可横向滚动">
+                  <div id="history-grid" class="heatmap-grid" role="grid" aria-label="每日完成记录" data-history-grid="owner"></div>
+                </div>
+                <div class="heatmap-legend" aria-label="年度记录图例">
+                  <span class="heatmap-scale"><span class="heatmap-scale-swatches" aria-hidden="true"><i class="progress-0"></i><i class="progress-1"></i><i class="progress-2"></i><i class="progress-3"></i><i class="progress-4"></i><i class="progress-5"></i></span>完成程度</span>
+                  <span><i class="is-stage-complete" aria-hidden="true"></i>阶段完成</span>
+                  <span><i class="is-focus-record" aria-hidden="true"></i>专注记录</span>
+                </div>
+
+                <div class="history-list-section">
+                  <div class="history-list-heading">
+                    <h3>最近记录</h3>
+                    <button id="show-all-history" class="text-button" type="button" data-action="show-all-history">查看全部</button>
+                  </div>
+                  <ol id="history-list" class="history-list" data-history-list="owner">
+                    <li class="history-empty">完成后，记录会安静地留在这里。</li>
+                  </ol>
+                </div>
+              </section>
+            </div>
+
+            <aside class="owner-side-column" aria-label="当前阶段、私人记录与数据">
+              <section id="owner-stage-card" class="card stage-card" aria-labelledby="owner-stage-heading">
+                <header class="card-header stage-card-header">
+                  <div>
+                    <p class="card-kicker">更长的目标</p>
+                    <h2 id="owner-stage-heading">当前阶段</h2>
+                  </div>
+                  <span id="owner-stage-status" class="stage-status">未设定</span>
+                </header>
+
+                <div id="owner-stage-active" class="stage-active" hidden>
+                  <h3 id="owner-stage-title" class="stage-title">—</h3>
+                  <p id="owner-stage-description" class="stage-description"></p>
+                  <button id="owner-stage-expand" class="stage-expand-toggle" type="button" aria-expanded="false" hidden>展开完整内容</button>
+                  <dl class="stage-meta">
+                    <div><dt>开始</dt><dd id="owner-stage-start">—</dd></div>
+                    <div><dt>已进行</dt><dd id="owner-stage-days">—</dd></div>
+                  </dl>
+                  <div class="stage-actions">
+                    <button id="edit-stage-button" class="button button-quiet button-small" type="button">编辑</button>
+                    <button id="complete-stage-button" class="button button-stage button-small" type="button">完成阶段</button>
+                  </div>
+                </div>
+
+                <div id="owner-stage-empty" class="stage-empty">
+                  <p id="owner-stage-empty-title"><strong>还没有当前阶段</strong></p>
+                  <p id="owner-stage-empty-copy">设定一个比每日任务更长的目标，完成后才能开始下一阶段。</p>
+                  <button id="create-stage-button" class="button button-secondary button-block" type="button">设定当前阶段</button>
+                </div>
+
+                <button id="owner-last-stage" class="last-stage-link" type="button" hidden>
+                  <span>上一阶段</span>
+                  <strong id="owner-last-stage-title">—</strong>
+                  <small id="owner-last-stage-meta">—</small>
+                </button>
+                <p class="stage-destination-note">完成后会保存在阶段记录，并在年度记录中标为金色。</p>
+              </section>
+
+              <section id="focus-card" class="card focus-card" aria-labelledby="focus-title">
+                <header class="card-header">
+                  <div>
+                    <p class="card-kicker">今天的节奏</p>
+                    <h2 id="focus-title">今日专注</h2>
+                  </div>
+                </header>
+                <form id="focus-form" class="focus-form" novalidate>
+                  <section class="focus-section focus-section-public" aria-labelledby="focus-poms-label">
+                    <div class="counter-field">
+                      <div>
+                        <div class="focus-label-row">
+                          <label id="focus-poms-label" for="focus-poms">专注番茄</label>
+                          <span class="visibility-badge is-public">公开</span>
+                        </div>
+                        <p>数量会显示在公开记录中</p>
+                      </div>
+                      <div class="stepper">
+                        <button id="focus-decrease" type="button" aria-label="减少一个番茄" data-step="-1">−</button>
+                        <input id="focus-poms" name="poms" type="number" inputmode="numeric" min="0" max="100000" value="0" aria-label="今日番茄数量">
+                        <button id="focus-increase" type="button" aria-label="增加一个番茄" data-step="1">+</button>
+                      </div>
+                    </div>
+                  </section>
+                  <section class="focus-section focus-section-private" aria-labelledby="focus-distractions-label">
+                    <div class="focus-section-heading">
+                      <div>
+                        <label id="focus-distractions-label" for="focus-distractions">分心记录</label>
+                        <p>记下打断专注的事情，之后再处理</p>
+                      </div>
+                      <span class="visibility-badge is-private">私密</span>
+                    </div>
+                    <textarea id="focus-distractions" name="distractions" rows="3" maxlength="10000" placeholder="分心了？把冲动写在这里，晚上回看。"></textarea>
+                  </section>
+                  <section class="focus-section focus-section-private" aria-labelledby="focus-note-label">
+                    <div class="focus-section-heading">
+                      <div>
+                        <label id="focus-note-label" for="focus-note">私人便签</label>
+                        <p>留给自己的补充，不进入公开页面</p>
+                      </div>
+                      <span class="visibility-badge is-private">私密</span>
+                    </div>
+                    <textarea id="focus-note" name="note" rows="4" maxlength="10000" placeholder="今天有什么值得记住？"></textarea>
+                  </section>
+                  <button id="save-focus" class="button button-secondary button-block" type="submit" data-loading-label="正在保存…">保存今日专注</button>
+                </form>
+              </section>
+
+              <section id="data-tools" class="card data-card" aria-labelledby="data-tools-title">
+                <header class="card-header">
+                  <div>
+                    <p class="card-kicker">账户数据</p>
+                    <h2 id="data-tools-title">迁移与备份</h2>
+                  </div>
+                </header>
+                <p class="muted">把这台设备里的旧记录合并到账号，或下载一份私人备份。</p>
+                <div id="legacy-data-status" class="data-status" role="status">
+                  <span class="data-status-dot" aria-hidden="true"></span>
+                  <span id="legacy-data-label">正在检查本机旧记录…</span>
+                </div>
+                <div class="data-actions">
+                  <button id="import-legacy-data" class="button button-secondary button-block" type="button" data-action="import-legacy">迁移本机旧记录</button>
+                  <a id="export-data" class="button button-quiet button-block" href="/api/export" download data-action="export">导出私人备份</a>
+                </div>
+                <p class="data-footnote">迁移只补充服务器中没有的日期，不会覆盖现有任务。</p>
+              </section>
+            </aside>
+          </div>
+        </section>
+
+        <section id="visitor-view" class="dashboard-view visitor-view" data-view="visitor" aria-labelledby="visitor-page-title" hidden>
+          <div class="visitor-heading">
+            <div>
+              <p id="visitor-date-label" class="eyebrow">DAILY SEAL</p>
+              <h1 id="visitor-page-title">blue 的每日记录</h1>
+              <p>这里展示已公开的任务与完成结果。内容为只读，无法修改或导出。</p>
+            </div>
+            <span class="readonly-pill"><span aria-hidden="true">○</span> 只读浏览</span>
+          </div>
+
+          <div class="visitor-layout">
+            <article id="visitor-today-task" class="card task-card visitor-task-card" data-task-scope="visitor-today">
+              <header class="card-header task-card-header">
+                <div>
+                  <p class="card-kicker"><span class="status-dot" aria-hidden="true"></span> 今天</p>
+                  <p id="visitor-today-date" class="card-meta" data-bind="today-date">—</p>
+                </div>
+                <span id="visitor-today-status" class="status-chip status-pending" data-bind="today-status">进行中</span>
+              </header>
+              <p id="visitor-today-task-text" class="task-text" data-bind="today-task-text">今天还没有公开任务。</p>
+              <div id="visitor-today-focus" class="visitor-focus-summary" aria-label="今日公开专注记录">
+                <span class="visitor-focus-mark" aria-hidden="true"></span>
+                <p><strong id="visitor-today-poms">0 个番茄</strong><span>今日专注 · 公开</span></p>
+              </div>
+              <div id="visitor-today-proof" class="visitor-proof" data-bind="today-proof-summary" hidden>
+                <div>
+                  <span id="visitor-result-icon" class="proof-check" aria-hidden="true">✓</span>
+                  <p><strong id="visitor-result-label">今日已完成 · 100%</strong><span id="visitor-proof-time" data-bind="today-proof-time">—</span></p>
+                </div>
+                <p id="visitor-proof-text" data-bind="today-proof-text"></p>
+                <button id="visitor-view-proof" class="button button-quiet button-small" type="button" data-action="view-proof" data-task-date="">查看记录</button>
+              </div>
+            </article>
+
+            <section id="visitor-stage-card" class="card stage-card visitor-stage-card" aria-labelledby="visitor-stage-heading">
+              <header class="card-header stage-card-header">
+                <div>
+                  <p class="card-kicker">更长的目标</p>
+                  <h2 id="visitor-stage-heading">当前阶段</h2>
+                </div>
+                <span id="visitor-stage-status" class="stage-status">未设定</span>
+              </header>
+              <div id="visitor-stage-active" class="stage-active" hidden>
+                <h3 id="visitor-stage-title" class="stage-title">—</h3>
+                <p id="visitor-stage-description" class="stage-description"></p>
+                <button id="visitor-stage-expand" class="stage-expand-toggle" type="button" aria-expanded="false" hidden>展开完整内容</button>
+                <dl class="stage-meta">
+                  <div><dt>开始</dt><dd id="visitor-stage-start">—</dd></div>
+                  <div><dt>已进行</dt><dd id="visitor-stage-days">—</dd></div>
+                </dl>
+              </div>
+              <div id="visitor-stage-empty" class="stage-empty stage-empty-readonly">
+                <p><strong>目前没有进行中的阶段</strong></p>
+                <p>新的阶段设定后，会显示在这里。</p>
+              </div>
+              <button id="visitor-last-stage" class="last-stage-link" type="button" hidden>
+                <span>最近完成</span>
+                <strong id="visitor-last-stage-title">—</strong>
+                <small id="visitor-last-stage-meta">—</small>
+              </button>
+            </section>
+
+            <section id="visitor-history-section" class="card history-card" aria-labelledby="visitor-history-title">
+              <header class="card-header history-header">
+                <div>
+                  <p class="card-kicker">公开记录</p>
+                  <h2 id="visitor-history-title">完成轨迹</h2>
+                </div>
+                <div class="year-controls" aria-label="选择年份">
+                  <button id="visitor-previous-year" class="icon-button" type="button" aria-label="上一年" data-visitor-history-year="previous">‹</button>
+                  <span id="visitor-history-year-label" data-bind="history-year">2026</span>
+                  <button id="visitor-next-year" class="icon-button" type="button" aria-label="下一年" data-visitor-history-year="next">›</button>
+                </div>
+              </header>
+
+              <div class="history-summary visitor-history-summary" aria-label="公开完成统计">
+                <p><strong id="visitor-history-done-count" data-bind="history-done-count">0</strong><span>完成天数</span></p>
+                <p><strong id="visitor-history-rate" data-bind="history-rate">0%</strong><span>完成率</span></p>
+                <p><strong id="visitor-history-best-streak" data-bind="history-best-streak">0</strong><span>最长连续</span></p>
+              </div>
+
+              <div class="heatmap-scroll" aria-label="年度完成热力图，可横向滚动">
+                <div id="visitor-history-grid" class="heatmap-grid" role="grid" aria-label="每日完成记录" data-history-grid="visitor"></div>
+              </div>
+              <div class="heatmap-legend" aria-label="年度记录图例">
+                <span class="heatmap-scale"><span class="heatmap-scale-swatches" aria-hidden="true"><i class="progress-0"></i><i class="progress-1"></i><i class="progress-2"></i><i class="progress-3"></i><i class="progress-4"></i><i class="progress-5"></i></span>完成程度</span>
+                <span><i class="is-stage-complete" aria-hidden="true"></i>阶段完成</span>
+                <span><i class="is-focus-record" aria-hidden="true"></i>专注记录</span>
+              </div>
+
+              <ol id="visitor-history-list" class="history-list visitor-history-list" data-history-list="visitor">
+                <li class="history-empty">暂时还没有完成记录。</li>
+              </ol>
+              <button id="visitor-load-more" class="button button-quiet button-block" type="button" data-action="load-more-history" hidden>查看更多记录</button>
+            </section>
+          </div>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        <p>Daily Seal <span aria-hidden="true">·</span> 安静记录，认真完成</p>
+      </footer>
+    </section>
+  </div>
+
+  <dialog id="task-dialog" class="dialog" aria-labelledby="task-dialog-title">
+    <form id="task-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">任务设置</p>
+          <h2 id="task-dialog-title">编辑任务</h2>
+          <p id="task-dialog-date" class="dialog-description">—</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="task-dialog">×</button>
+      </header>
+      <input id="task-date-input" name="taskDate" type="hidden">
+      <div class="field">
+        <label for="task-text-input">任务内容</label>
+        <textarea id="task-text-input" name="text" rows="5" maxlength="1000" aria-describedby="task-text-count" placeholder="写下一件明确、可完成的事…" required></textarea>
+        <p id="task-text-count" class="field-help field-help-end"><span data-character-count="task-text-input">0</span> / 1000</p>
+      </div>
+      <div id="task-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="task-dialog">取消</button>
+        <button id="delete-task-button" class="button button-danger-quiet dialog-danger-action" type="button" data-action="delete-task" hidden>删除任务</button>
+        <button id="save-task-button" class="button button-primary" type="submit" data-loading-label="正在保存…">保存任务</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="proof-dialog" class="dialog" aria-labelledby="proof-dialog-title">
+    <form id="proof-form" class="dialog-form" method="dialog" enctype="multipart/form-data" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">今日反馈</p>
+          <h2 id="proof-dialog-title">记录今日结果</h2>
+          <p id="proof-dialog-date" class="dialog-description">—</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="proof-dialog">×</button>
+      </header>
+      <input id="proof-date-input" name="taskDate" type="hidden">
+      <fieldset class="result-choice">
+        <legend>最终结果</legend>
+        <div class="result-choice-options">
+          <label>
+            <input id="result-status-completed" name="resultStatus" type="radio" value="completed" checked>
+            <span><strong>完成</strong><small>目标已全部完成</small></span>
+          </label>
+          <label>
+            <input id="result-status-incomplete" name="resultStatus" type="radio" value="incomplete">
+            <span><strong>未完成</strong><small>如实留下进度</small></span>
+          </label>
+        </div>
+      </fieldset>
+      <div id="result-progress-field" class="field result-progress-field">
+        <div class="result-progress-heading">
+          <label for="result-progress-input">完成程度</label>
+          <output id="result-progress-output" for="result-progress-input">100%</output>
+        </div>
+        <input id="result-progress-input" name="completionPercent" type="range" min="0" max="100" step="5" value="100" aria-describedby="result-progress-help">
+        <div class="result-progress-scale" aria-hidden="true"><span>0%</span><span>完成越多，记录颜色越深</span><span>100%</span></div>
+        <p id="result-progress-help" class="field-help">选择“完成”时自动记为 100%。</p>
+      </div>
+      <div class="field">
+        <label id="result-note-label" for="proof-text-input">完成备注</label>
+        <textarea id="proof-text-input" name="resultNote" rows="4" maxlength="1000" required aria-describedby="proof-requirement proof-text-count" placeholder="简单写下完成了什么、结果如何…"></textarea>
+        <div class="field-help-row">
+          <p id="proof-requirement" class="field-help">必填 · 会公开显示在当天记录中</p>
+          <p id="proof-text-count" class="field-help"><span data-character-count="proof-text-input">0</span> / 1000</p>
+        </div>
+      </div>
+      <div class="field">
+        <label for="proof-url-input">证据链接 <span class="label-optional">可选</span></label>
+        <input id="proof-url-input" name="proofUrl" type="url" inputmode="url" maxlength="2048" placeholder="https://…" aria-describedby="proof-url-help">
+        <p id="proof-url-help" class="field-help">支持以 http:// 或 https:// 开头的公开链接。</p>
+      </div>
+      <div class="field">
+        <label for="proof-image-input">照片或文件 <span class="label-optional">可选，限一个</span></label>
+        <label id="proof-dropzone" class="upload-field" for="proof-image-input" data-dropzone="proof-image-input">
+          <input id="proof-image-input" name="attachment" class="visually-hidden" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.txt,.csv,.docx,.xlsx,.pptx,image/jpeg,image/png,image/webp,application/pdf,text/plain,text/csv,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation" aria-describedby="proof-file-help">
+          <span class="upload-icon" aria-hidden="true">＋</span>
+          <span class="upload-copy"><strong>选择照片或文件</strong><small>拍照、照片图库、文件或拖放</small><small id="proof-file-help" class="upload-formats">JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX、PPTX · 最大 10 MB；HEIC 请转为 JPG</small></span>
+        </label>
+        <div id="proof-image-preview" class="attachment-preview" role="status" aria-live="polite" hidden>
+          <img id="proof-preview-image" class="attachment-thumbnail" alt="">
+          <span id="proof-preview-file-icon" class="attachment-type-icon" aria-hidden="true" hidden>FILE</span>
+          <div class="attachment-copy">
+            <span id="proof-file-type" class="attachment-type">附件</span>
+            <p id="proof-image-name" class="attachment-name">—</p>
+            <p id="proof-file-size" class="attachment-size">—</p>
+          </div>
+          <button id="remove-proof-image" class="attachment-remove" type="button" aria-label="移除所选附件">移除</button>
+        </div>
+        <p id="proof-existing-file" class="field-help attachment-existing" hidden></p>
+      </div>
+      <p class="record-destination-note">完成与未完成都会留在年度记录中，备注或原因公开可见。</p>
+      <div id="proof-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="proof-dialog">取消</button>
+        <button id="submit-proof-button" class="button button-primary" type="submit" data-loading-label="正在保存…">保存反馈</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="stage-dialog" class="dialog" aria-labelledby="stage-dialog-title">
+    <form id="stage-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">阶段目标</p>
+          <h2 id="stage-dialog-title">设定当前阶段</h2>
+          <p class="dialog-description">同一时间只保留一个阶段，完成后才能开始下一个。</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="stage-dialog">×</button>
+      </header>
+      <input id="stage-id-input" name="stageId" type="hidden">
+      <div class="field">
+        <label for="stage-title-input">阶段名称</label>
+        <input id="stage-title-input" name="title" type="text" maxlength="200" aria-describedby="stage-title-count" placeholder="例如：完成立体几何第一轮" required>
+        <p id="stage-title-count" class="field-help field-help-end"><span data-character-count="stage-title-input">0</span> / 200</p>
+      </div>
+      <div class="field">
+        <label for="stage-description-input">阶段说明 <span class="label-optional">可选</span></label>
+        <textarea id="stage-description-input" name="description" rows="5" maxlength="5000" aria-describedby="stage-description-count" placeholder="写下范围、完成标准或想提醒自己的事…"></textarea>
+        <p id="stage-description-count" class="field-help field-help-end"><span data-character-count="stage-description-input">0</span> / 5000</p>
+      </div>
+      <div id="stage-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="stage-dialog">取消</button>
+        <button id="save-stage-button" class="button button-primary" type="submit" data-loading-label="正在保存…">保存阶段</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="stage-complete-dialog" class="dialog" aria-labelledby="stage-complete-title">
+    <form id="stage-complete-form" class="dialog-form" method="dialog" enctype="multipart/form-data" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">阶段完成</p>
+          <h2 id="stage-complete-title">完成当前阶段</h2>
+          <p id="stage-complete-name" class="dialog-description">—</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="stage-complete-dialog">×</button>
+      </header>
+      <input id="stage-complete-id" name="stageId" type="hidden">
+      <div class="field">
+        <label for="stage-proof-text">完成说明 <span class="label-optional">可选</span></label>
+        <textarea id="stage-proof-text" name="proofText" rows="4" maxlength="1000" aria-describedby="stage-proof-requirement stage-proof-text-count" placeholder="写下完成了什么、结果如何…"></textarea>
+        <div class="field-help-row">
+          <p id="stage-proof-requirement" class="field-help">说明、证据链接或附件至少填写一项</p>
+          <p id="stage-proof-text-count" class="field-help"><span data-character-count="stage-proof-text">0</span> / 1000</p>
+        </div>
+      </div>
+      <div class="field">
+        <label for="stage-proof-url">证据链接 <span class="label-optional">可选</span></label>
+        <input id="stage-proof-url" name="proofUrl" type="url" inputmode="url" maxlength="2048" placeholder="https://…" aria-describedby="stage-proof-url-help">
+        <p id="stage-proof-url-help" class="field-help">支持以 http:// 或 https:// 开头的公开链接。</p>
+      </div>
+      <div class="field">
+        <label for="stage-proof-image">照片或文件 <span class="label-optional">可选，限一个</span></label>
+        <label id="stage-proof-dropzone" class="upload-field" for="stage-proof-image" data-dropzone="stage-proof-image">
+          <input id="stage-proof-image" name="attachment" class="visually-hidden" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.txt,.csv,.docx,.xlsx,.pptx,image/jpeg,image/png,image/webp,application/pdf,text/plain,text/csv,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation" aria-describedby="stage-proof-file-help">
+          <span class="upload-icon" aria-hidden="true">＋</span>
+          <span class="upload-copy"><strong>选择照片或文件</strong><small>拍照、照片图库、文件或拖放</small><small id="stage-proof-file-help" class="upload-formats">JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX、PPTX · 最大 10 MB；HEIC 请转为 JPG</small></span>
+        </label>
+        <div id="stage-image-preview" class="attachment-preview" role="status" aria-live="polite" hidden>
+          <img id="stage-preview-image" class="attachment-thumbnail" alt="">
+          <span id="stage-preview-file-icon" class="attachment-type-icon" aria-hidden="true" hidden>FILE</span>
+          <div class="attachment-copy">
+            <span id="stage-file-type" class="attachment-type">附件</span>
+            <p id="stage-image-name" class="attachment-name">—</p>
+            <p id="stage-file-size" class="attachment-size">—</p>
+          </div>
+          <button id="remove-stage-image" class="attachment-remove" type="button" aria-label="移除所选附件">移除</button>
+        </div>
+      </div>
+      <p class="record-destination-note is-stage">完成后会归档到阶段记录，并在年度记录中把当天标为金色；阶段与证明将不能再修改。</p>
+      <div id="stage-complete-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="stage-complete-dialog">取消</button>
+        <button id="submit-stage-complete" class="button button-stage" type="submit" data-loading-label="正在完成…">确认完成阶段</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="proof-view-dialog" class="dialog dialog-proof-view" aria-labelledby="proof-view-title">
+    <article class="dialog-form">
+      <header class="dialog-header">
+        <div>
+          <p id="proof-view-date" class="card-kicker">完成记录</p>
+          <h2 id="proof-view-title">完成证明</h2>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="proof-view-dialog">×</button>
+      </header>
+      <div id="proof-view-body" class="proof-view-body">
+        <section id="record-stage-section" class="record-section record-stage-section" aria-labelledby="record-stage-title" hidden>
+          <header class="record-section-header">
+            <span class="record-kind record-kind-stage">阶段成果</span>
+            <span id="record-stage-duration" class="record-duration">—</span>
+          </header>
+          <h3 id="record-stage-title">—</h3>
+          <p id="record-stage-description" class="record-description" hidden></p>
+          <dl class="record-dates">
+            <div><dt>开始</dt><dd id="record-stage-start">—</dd></div>
+            <div><dt>完成</dt><dd id="record-stage-completed">—</dd></div>
+          </dl>
+          <p id="record-stage-proof-text" class="record-proof-text" hidden></p>
+          <a id="record-stage-proof-url" class="record-proof-link" href="#" target="_blank" rel="noopener noreferrer nofollow" hidden>打开证据链接<span aria-hidden="true"> ↗</span></a>
+          <img id="record-stage-image" class="proof-view-image" alt="阶段成果图片" hidden>
+          <a id="record-stage-file" class="record-file-card" href="#" download hidden>
+            <span id="record-stage-file-type" class="record-file-type" aria-hidden="true">FILE</span>
+            <span class="record-file-copy"><strong id="record-stage-file-name">附件</strong><small id="record-stage-file-meta">—</small></span>
+            <span class="record-file-action">下载附件</span>
+          </a>
+        </section>
+
+        <section id="record-daily-section" class="record-section record-daily-section" aria-labelledby="record-daily-title" hidden>
+          <header class="record-section-header">
+            <span class="record-kind record-kind-daily">每日记录</span>
+            <span id="proof-view-time" class="record-duration">—</span>
+          </header>
+          <h3 id="record-daily-title">—</h3>
+          <div class="record-result-summary">
+            <span id="record-daily-status" class="record-result-status">—</span>
+            <span id="record-daily-progress" class="record-result-progress">—</span>
+          </div>
+          <div id="record-daily-feedback" class="record-feedback">
+            <span id="record-daily-feedback-label">完成备注</span>
+            <p id="proof-view-text" class="proof-view-text">—</p>
+          </div>
+          <a id="record-daily-proof-url" class="record-proof-link" href="#" target="_blank" rel="noopener noreferrer nofollow" hidden>打开证据链接<span aria-hidden="true"> ↗</span></a>
+          <img id="proof-view-image" class="proof-view-image" alt="每日完成证明图片" hidden>
+          <a id="record-daily-file" class="record-file-card" href="#" download hidden>
+            <span id="record-daily-file-type" class="record-file-type" aria-hidden="true">FILE</span>
+            <span class="record-file-copy"><strong id="record-daily-file-name">附件</strong><small id="record-daily-file-meta">—</small></span>
+            <span class="record-file-action">下载附件</span>
+          </a>
+        </section>
+
+        <section id="record-focus-section" class="record-section record-focus-section" aria-label="公开专注记录" hidden>
+          <header class="record-section-header">
+            <span class="record-kind record-kind-focus">专注记录</span>
+            <span class="record-duration">公开</span>
+          </header>
+          <p class="record-focus-total"><strong id="record-focus-count">0</strong><span>个专注番茄</span></p>
+        </section>
+
+        <section id="record-private-section" class="record-section record-private-section" aria-labelledby="record-private-title" hidden>
+          <header class="record-section-header">
+            <span id="record-private-title" class="record-kind record-kind-private">私人记录</span>
+            <span class="record-private-visibility">仅你可见</span>
+          </header>
+          <div id="record-distractions-block" class="record-private-item" role="group" aria-labelledby="record-distractions-title" hidden>
+            <h3 id="record-distractions-title">分心记录</h3>
+            <p id="record-distractions-text"></p>
+          </div>
+          <div id="record-note-block" class="record-private-item" role="group" aria-labelledby="record-note-title" hidden>
+            <h3 id="record-note-title">私人便签</h3>
+            <p id="record-note-text"></p>
+          </div>
+        </section>
+
+        <p id="record-empty-state" class="history-empty" hidden>这一天没有可查看的完成记录。</p>
+      </div>
+      <footer class="dialog-actions">
+        <button class="button button-primary" type="button" data-close-dialog="proof-view-dialog">关闭</button>
+      </footer>
+    </article>
+  </dialog>
+
+  <dialog id="password-dialog" class="dialog" aria-labelledby="password-dialog-title">
+    <form id="password-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">账户安全</p>
+          <h2 id="password-dialog-title">修改密码</h2>
+          <p id="password-dialog-description" class="dialog-description">修改后，其他设备会退出登录。</p>
+        </div>
+        <button id="password-dialog-close" class="dialog-close" type="button" aria-label="关闭" data-close-dialog="password-dialog">×</button>
+      </header>
+      <div id="password-required-notice" class="notice notice-warning" role="status" hidden>
+        <span class="notice-icon" aria-hidden="true">!</span>
+        <p><strong>请先设置一个新密码</strong><br>首次登录需要完成这一步才能继续管理。</p>
+      </div>
+      <div class="field">
+        <label for="current-password">当前密码</label>
+        <input id="current-password" name="currentPassword" type="password" autocomplete="current-password" maxlength="128" required>
+      </div>
+      <div class="field">
+        <label for="new-password">新密码</label>
+        <input id="new-password" name="newPassword" type="password" autocomplete="new-password" minlength="10" maxlength="128" aria-describedby="new-password-help" required>
+        <p id="new-password-help" class="field-help">至少 10 个字符，不要与当前密码相同。</p>
+      </div>
+      <div class="field">
+        <label for="new-password-confirm">确认新密码</label>
+        <input id="new-password-confirm" name="newPasswordConfirm" type="password" autocomplete="new-password" minlength="10" maxlength="128" required>
+      </div>
+      <div id="password-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button id="cancel-password-change" class="button button-quiet" type="button" data-close-dialog="password-dialog">取消</button>
+        <button id="save-password-button" class="button button-primary" type="submit" data-loading-label="正在修改…">保存新密码</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="dialog dialog-compact" aria-labelledby="confirm-dialog-title">
+    <form id="confirm-form" class="dialog-form" method="dialog">
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">请确认</p>
+          <h2 id="confirm-dialog-title">确认操作</h2>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="confirm-dialog">×</button>
+      </header>
+      <p id="confirm-dialog-description" class="confirm-description">此操作需要你的确认。</p>
+      <footer class="dialog-actions">
+        <button id="confirm-cancel" class="button button-quiet" type="button" data-close-dialog="confirm-dialog">取消</button>
+        <button id="confirm-submit" class="button button-danger" type="submit">确认</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <noscript>
+    <div class="noscript-message">Daily Seal 需要启用 JavaScript 才能登录和查看记录。</div>
+  </noscript>
+</body>
+</html>
