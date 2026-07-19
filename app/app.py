@@ -33,7 +33,7 @@ REGISTRATION_ENABLED = os.environ.get("DAILY_SEAL_REGISTRATION_ENABLED", "1") !=
 SESSION_COOKIE = "ds_session"
 CSRF_COOKIE = "ds_csrf"
 SESSION_SECONDS = 7 * 24 * 60 * 60
-MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024
 # Retain the old public constant for older clients and maintenance scripts.
 MAX_IMAGE_BYTES = MAX_ATTACHMENT_BYTES
 MAX_IMPORT_BYTES = 1024 * 1024
@@ -93,7 +93,7 @@ RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
-app.config.update(MAX_CONTENT_LENGTH=12 * 1024 * 1024, JSON_AS_ASCII=False)
+app.config.update(MAX_CONTENT_LENGTH=32 * 1024 * 1024, JSON_AS_ASCII=False)
 
 
 SCHEMA = """
@@ -718,7 +718,7 @@ def security_headers(response):
 
 @app.errorhandler(413)
 def request_too_large(_error):
-    return api_error("附件不能超过 10 MB。", 413, "attachment_too_large")
+    return api_error("附件不能超过 30 MB。", 413, "attachment_too_large")
 
 
 @app.errorhandler(404)
@@ -1383,7 +1383,7 @@ def get_proof_upload():
 def attachment_api_error(error):
     code = str(error)
     if code == "attachment_too_large":
-        return api_error("附件不能超过 10 MB。", 413, code)
+        return api_error("附件不能超过 30 MB。", 413, code)
     if code == "multiple_attachments":
         return api_error("一次只能上传一个附件。", 400, code)
     return api_error(

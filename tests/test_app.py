@@ -904,6 +904,19 @@ class DailySealApiTests(unittest.TestCase):
             },
         )
 
+    def test_attachment_limits_are_consistent_at_30_mib(self):
+        self.assertEqual(server.MAX_ATTACHMENT_BYTES, 30 * 1024 * 1024)
+        self.assertEqual(server.app.config["MAX_CONTENT_LENGTH"], 32 * 1024 * 1024)
+
+        app_script = (WORK_DIR / "app" / "static" / "app.js").read_text(encoding="utf-8")
+        index_html = (WORK_DIR / "app" / "static" / "index.html").read_text(encoding="utf-8")
+        nginx_config = (WORK_DIR / "deploy" / "nginx-daily-seal.conf").read_text(encoding="utf-8")
+        self.assertIn("const MAX_PROOF_FILE_BYTES = 30 * 1024 * 1024;", app_script)
+        self.assertIn('setMessage(ui.message, "附件不能超过 30 MB。");', app_script)
+        self.assertEqual(index_html.count("最大 30 MB；HEIC 请转为 JPG"), 2)
+        self.assertNotIn("最大 10 MB", index_html)
+        self.assertIn("client_max_body_size 32m;", nginx_config)
+
     def test_completion_rejects_missing_invalid_unsupported_and_oversize_proof(self):
         self.login_unlocked_owner()
         self.assertEqual(self.put_task(self.client).status_code, 200)

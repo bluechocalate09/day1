@@ -4,7 +4,7 @@
   const LEGACY_KEY = "daily-seal-v1";
   const PREVIEW_KEY = "daily-seal-owner-view";
   const SHANGHAI_TZ = "Asia/Shanghai";
-  const MAX_PROOF_FILE_BYTES = 10 * 1024 * 1024;
+  const MAX_PROOF_FILE_BYTES = 30 * 1024 * 1024;
   const PROOF_FILE_RULES = Object.freeze({
     jpg: { label: "JPG", image: true },
     jpeg: { label: "JPG", image: true },
@@ -1192,7 +1192,7 @@
     }
     if (file.size > MAX_PROOF_FILE_BYTES) {
       clearAttachmentPreview(scope);
-      setMessage(ui.message, "附件不能超过 10 MB。");
+      setMessage(ui.message, "附件不能超过 30 MB。");
       return;
     }
     if (state[ui.previewKey]) URL.revokeObjectURL(state[ui.previewKey]);

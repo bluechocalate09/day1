@@ -11,7 +11,7 @@ Daily Seal 是一个简洁的个人学习记录网站，用于安排每日任务
 - 阶段目标、完成证明、用时记录与年度金色标记
 - 番茄钟、公开完成记录、私密便签与分心记录
 - 管理者可编辑，访客账号只读
-- JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX、PPTX 附件，单个最大 10 MiB
+- JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX、PPTX 附件，单个最大 30 MiB
 - 桌面、iPad 与手机响应式界面
 - JSON 迁移与备份、登录限流、CSRF 与安全响应头
 
@@ -56,7 +56,7 @@ $env:DAILY_SEAL_REGISTRATION_ENABLED = "1"
 .\.venv\Scripts\python -m unittest discover -s tests -p "test_app.py" -v
 ```
 
-当前存档版本包含 34 项集成测试，覆盖登录与权限、每日结果反馈、公开与私密字段隔离、阶段目标、导入导出、附件校验、大小边界、并发替换和孤立文件清理。
+当前存档版本包含 35 项集成测试，覆盖登录与权限、每日结果反馈、公开与私密字段隔离、阶段目标、导入导出、附件校验、大小边界、前后端限制一致性、并发替换和孤立文件清理。
 
 ## 自动版本存档
 
