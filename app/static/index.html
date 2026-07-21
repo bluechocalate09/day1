@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#f5f6f2">
-  <meta name="description" content="Daily Seal — 清爽、安静的每日学习记录。">
-  <title>Daily Seal</title>
+  <meta name="description" content="Blue — 安静、清晰的每日行动记录。">
+  <title>Blue Day1</title>
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/app.js" defer></script>
 </head>
@@ -15,26 +15,22 @@
 
   <div id="app-root" class="app-root">
     <section id="boot-view" class="boot-view" aria-live="polite">
-      <div class="boot-mark" aria-hidden="true">D</div>
-      <p>正在打开 Daily Seal…</p>
+      <div class="boot-mark" aria-hidden="true">B</div>
+      <p>正在打开 Blue…</p>
     </section>
 
     <main id="auth-view" class="auth-layout" hidden>
       <section class="auth-intro" aria-labelledby="auth-brand-title">
-        <div class="brand-mark brand-mark-large" aria-hidden="true">D</div>
-        <p class="eyebrow">DAILY SEAL</p>
+        <div class="brand-mark brand-mark-large" aria-hidden="true">B</div>
+        <p class="eyebrow">BLUE DAY1</p>
         <h1 id="auth-brand-title">把重要的事，安静地做完。</h1>
-        <p class="auth-intro-copy">一个克制的每日任务与完成记录空间。管理者负责记录，其他账号只读浏览。</p>
-        <ul class="auth-points" aria-label="产品特点">
-          <li><span aria-hidden="true">✓</span> 每日任务与完成证明</li>
-          <li><span aria-hidden="true">✓</span> 清晰的历史完成记录</li>
-          <li><span aria-hidden="true">✓</span> 浏览账号无法修改内容</li>
-        </ul>
+        <p class="auth-intro-copy">把一天拆成看得见的小步，疲惫时也知道下一步往哪里走。</p>
+        <p class="auth-trust-note">进度、结果与证据清楚留存；访客账号始终只读。</p>
       </section>
 
       <section class="auth-card" aria-labelledby="auth-title">
         <header class="auth-card-header">
-          <p class="mobile-brand"><span class="brand-mark" aria-hidden="true">D</span> Daily Seal</p>
+          <p class="mobile-brand"><span class="brand-mark" aria-hidden="true">B</span> Blue Day1</p>
           <h2 id="auth-title">欢迎回来</h2>
           <p id="auth-description" class="muted">登录后继续查看今天的记录。</p>
         </header>
@@ -98,11 +94,11 @@
     <section id="app-view" class="app-view" hidden>
       <header id="site-header" class="site-header">
         <div class="site-header-inner">
-          <a class="site-brand" href="#today" aria-label="Daily Seal 首页">
-            <span class="brand-mark" aria-hidden="true">D</span>
+          <a class="site-brand" href="#today" aria-label="Blue Day1 首页">
+            <span class="brand-mark" aria-hidden="true">B</span>
             <span class="site-brand-copy">
-              <strong>Daily Seal</strong>
-              <span id="brand-subtitle">每日学习记录</span>
+              <strong>Blue</strong>
+              <span id="brand-subtitle">Day1</span>
             </span>
           </a>
 
@@ -149,7 +145,7 @@
             <div>
               <p id="owner-date-label" class="eyebrow">今天</p>
               <h1 id="owner-page-title">把重要的事，安静地做完。</h1>
-              <p class="page-heading-copy">认真完成今天，也为更长的目标留下清晰轨迹。</p>
+              <p id="owner-context-line" class="page-heading-copy">先看清眼前这一小步，再继续向前。</p>
             </div>
             <div class="streak-card" aria-label="连续完成天数">
               <span class="streak-dot" aria-hidden="true"></span>
@@ -181,7 +177,8 @@
                 </div>
                 <footer class="card-actions">
                   <button id="edit-today-task" class="button button-secondary" type="button" data-action="edit-task" data-task-date="">编辑任务</button>
-                  <button id="complete-today-task" class="button button-primary" type="button" data-action="complete-task" data-task-date="">提交完成证明</button>
+                  <button id="add-today-progress" class="button button-secondary" type="button" data-action="add-progress" data-task-date="">添加进度</button>
+                  <button id="complete-today-task" class="button button-primary" type="button" data-action="complete-task" data-task-date="">记录最终结果</button>
                 </footer>
               </article>
 
@@ -322,36 +319,41 @@
                 </form>
               </section>
 
-              <section id="data-tools" class="card data-card" aria-labelledby="data-tools-title">
-                <header class="card-header">
+              <details id="data-tools" class="card data-card">
+                <summary class="data-card-summary">
                   <div>
                     <p class="card-kicker">账户数据</p>
                     <h2 id="data-tools-title">迁移与备份</h2>
                   </div>
-                </header>
-                <p class="muted">把这台设备里的旧记录合并到账号，或下载一份私人备份。</p>
-                <div id="legacy-data-status" class="data-status" role="status">
-                  <span class="data-status-dot" aria-hidden="true"></span>
-                  <span id="legacy-data-label">正在检查本机旧记录…</span>
+                  <span class="data-summary-action">展开</span>
+                </summary>
+                <div class="data-tools-body">
+                  <p class="muted">把这台设备里的旧记录合并到账号，或下载一份轻量的文字与索引备份。</p>
+                  <div id="legacy-data-status" class="data-status" role="status">
+                    <span class="data-status-dot" aria-hidden="true"></span>
+                    <span id="legacy-data-label">正在检查本机旧记录…</span>
+                  </div>
+                  <div class="data-actions">
+                    <button id="import-legacy-data" class="button button-secondary button-block" type="button" data-action="import-legacy">迁移本机旧记录</button>
+                    <a id="export-data" class="button button-quiet button-block" href="/api/export" download data-action="export">导出文字与索引</a>
+                  </div>
+                  <p class="data-footnote">JSON 不重复打包照片和文件本体；它们仍只保存在服务器。迁移不会覆盖现有任务。</p>
                 </div>
-                <div class="data-actions">
-                  <button id="import-legacy-data" class="button button-secondary button-block" type="button" data-action="import-legacy">迁移本机旧记录</button>
-                  <a id="export-data" class="button button-quiet button-block" href="/api/export" download data-action="export">导出私人备份</a>
-                </div>
-                <p class="data-footnote">迁移只补充服务器中没有的日期，不会覆盖现有任务。</p>
-              </section>
+              </details>
             </aside>
           </div>
         </section>
 
         <section id="visitor-view" class="dashboard-view visitor-view" data-view="visitor" aria-labelledby="visitor-page-title" hidden>
-          <div class="visitor-heading">
-            <div>
-              <p id="visitor-date-label" class="eyebrow">DAILY SEAL</p>
-              <h1 id="visitor-page-title">blue 的每日记录</h1>
-              <p>这里展示已公开的任务与完成结果。内容为只读，无法修改或导出。</p>
+          <div class="visitor-heading visitor-heading-with-mascot">
+            <div class="visitor-heading-copy">
+              <p id="visitor-date-label" class="eyebrow">BLUE <span class="visitor-readonly-label">只读记录</span></p>
+              <h1 id="visitor-page-title">Blue 的每日记录</h1>
+              <p id="visitor-context-line">沿着今天留下的轨迹，看看事情正走到哪里。</p>
             </div>
-            <span class="readonly-pill"><span aria-hidden="true">○</span> 只读浏览</span>
+            <figure id="visitor-mascot" class="visitor-mascot" aria-hidden="true">
+              <img src="/static/blue-mascot.png" alt="">
+            </figure>
           </div>
 
           <div class="visitor-layout">
@@ -444,7 +446,7 @@
       </main>
 
       <footer class="site-footer">
-        <p>Daily Seal <span aria-hidden="true">·</span> 安静记录，认真完成</p>
+        <p>Blue <span aria-hidden="true">·</span> 看清下一步，安静地继续</p>
       </footer>
     </section>
   </div>
@@ -474,12 +476,65 @@
     </form>
   </dialog>
 
-  <dialog id="proof-dialog" class="dialog" aria-labelledby="proof-dialog-title">
-    <form id="proof-form" class="dialog-form" method="dialog" enctype="multipart/form-data" novalidate>
+  <dialog id="progress-dialog" class="dialog dialog-progress" aria-labelledby="progress-dialog-title">
+    <form id="progress-form" class="dialog-form" method="dialog" novalidate>
       <header class="dialog-header">
         <div>
-          <p class="card-kicker">今日反馈</p>
-          <h2 id="proof-dialog-title">记录今日结果</h2>
+          <p class="card-kicker">过程记录</p>
+          <h2 id="progress-dialog-title">添加一次进度</h2>
+          <p id="progress-dialog-date" class="dialog-description">—</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="progress-dialog">×</button>
+      </header>
+      <input id="progress-date-input" name="taskDate" type="hidden">
+      <div id="progress-controls">
+        <div class="field result-progress-field">
+          <div class="result-progress-heading">
+            <label for="progress-percent-input">当前完成程度</label>
+            <output id="progress-percent-output" for="progress-percent-input">0%</output>
+          </div>
+          <input id="progress-percent-input" name="progressPercent" type="range" min="0" max="100" step="5" value="0">
+          <div class="result-progress-scale" aria-hidden="true"><span>0%</span><span>选择此刻最接近的进度</span><span>100%</span></div>
+        </div>
+        <div class="field">
+          <label for="progress-note-input">备注 <span class="label-optional">可选</span></label>
+          <textarea id="progress-note-input" name="note" rows="4" maxlength="1000" aria-describedby="progress-note-help progress-note-count" placeholder="写下这一步做了什么，或下一步准备做什么…"></textarea>
+          <div class="field-help-row">
+            <p id="progress-note-help" class="field-help">每次保存都会追加一条公开时间记录，不会覆盖之前的内容。</p>
+            <p id="progress-note-count" class="field-help"><span data-character-count="progress-note-input">0</span> / 1000</p>
+          </div>
+        </div>
+        <div class="field">
+          <label for="progress-links-input">证据链接 <span class="label-optional">可选，可多个</span></label>
+          <textarea id="progress-links-input" name="links" rows="3" inputmode="url" aria-describedby="progress-links-help" placeholder="每行粘贴一个 https:// 链接"></textarea>
+          <p id="progress-links-help" class="field-help">每行一个 http:// 或 https:// 链接，保存后仍可继续追加。</p>
+        </div>
+      </div>
+      <p id="progress-existing-assets" class="field-help progress-existing-summary" aria-live="polite" hidden></p>
+      <div class="field">
+        <label for="progress-file-input">照片或文件 <span class="label-optional">可选，可持续追加</span></label>
+        <label id="progress-dropzone" class="upload-field" for="progress-file-input" data-dropzone="progress-file-input">
+          <input id="progress-file-input" class="visually-hidden" type="file" multiple accept=".jpg,.jpeg,.png,.webp,.pdf,.txt,.csv,.docx,.xlsx,.pptx,image/jpeg,image/png,image/webp,application/pdf,text/plain,text/csv,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation" aria-describedby="progress-files-help">
+          <span class="upload-icon" aria-hidden="true">＋</span>
+          <span class="upload-copy"><strong>选择这次新增的照片或文件</strong><small>以前上传的附件会原样保留，无需重新选择；不限制累计数量</small><small id="progress-files-help" class="upload-formats">每个文件最大 10 MB；支持 JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX、PPTX；HEIC 请先转成 JPG 或截图</small></span>
+        </label>
+        <div id="progress-files-preview" class="attachment-queue" role="list" aria-live="polite" hidden></div>
+      </div>
+      <p class="record-destination-note">保存一次，就增加一个带时间的公开节点；备注、链接和附件会给访客查看。私人便签和分心记录始终不会公开。</p>
+      <div id="progress-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="progress-dialog">取消</button>
+        <button id="submit-progress-button" class="button button-primary" type="submit" data-loading-label="正在保存…">保存这次进度</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="proof-dialog" class="dialog" aria-labelledby="proof-dialog-title">
+    <form id="proof-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">一天结束</p>
+          <h2 id="proof-dialog-title">记录最终结果</h2>
           <p id="proof-dialog-date" class="dialog-description">—</p>
         </div>
         <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="proof-dialog">×</button>
@@ -508,42 +563,18 @@
         <p id="result-progress-help" class="field-help">选择“完成”时自动记为 100%。</p>
       </div>
       <div class="field">
-        <label id="result-note-label" for="proof-text-input">完成备注</label>
-        <textarea id="proof-text-input" name="resultNote" rows="4" maxlength="1000" required aria-describedby="proof-requirement proof-text-count" placeholder="简单写下完成了什么、结果如何…"></textarea>
+        <label id="result-note-label" for="proof-text-input">备注</label>
+        <textarea id="proof-text-input" name="resultNote" rows="4" maxlength="1000" required aria-describedby="proof-requirement proof-text-count" placeholder="简单写下今天最后走到了哪里…"></textarea>
         <div class="field-help-row">
           <p id="proof-requirement" class="field-help">必填 · 会公开显示在当天记录中</p>
           <p id="proof-text-count" class="field-help"><span data-character-count="proof-text-input">0</span> / 1000</p>
         </div>
       </div>
-      <div class="field">
-        <label for="proof-url-input">证据链接 <span class="label-optional">可选</span></label>
-        <input id="proof-url-input" name="proofUrl" type="url" inputmode="url" maxlength="2048" placeholder="https://…" aria-describedby="proof-url-help">
-        <p id="proof-url-help" class="field-help">支持以 http:// 或 https:// 开头的公开链接。</p>
-      </div>
-      <div class="field">
-        <label for="proof-image-input">照片或文件 <span class="label-optional">可选，限一个</span></label>
-        <label id="proof-dropzone" class="upload-field" for="proof-image-input" data-dropzone="proof-image-input">
-          <input id="proof-image-input" name="attachment" class="visually-hidden" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.txt,.csv,.docx,.xlsx,.pptx,image/jpeg,image/png,image/webp,application/pdf,text/plain,text/csv,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation" aria-describedby="proof-file-help">
-          <span class="upload-icon" aria-hidden="true">＋</span>
-          <span class="upload-copy"><strong>选择照片或文件</strong><small>拍照、照片图库、文件或拖放</small><small id="proof-file-help" class="upload-formats">JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX、PPTX · 最大 30 MB；HEIC 请转为 JPG</small></span>
-        </label>
-        <div id="proof-image-preview" class="attachment-preview" role="status" aria-live="polite" hidden>
-          <img id="proof-preview-image" class="attachment-thumbnail" alt="">
-          <span id="proof-preview-file-icon" class="attachment-type-icon" aria-hidden="true" hidden>FILE</span>
-          <div class="attachment-copy">
-            <span id="proof-file-type" class="attachment-type">附件</span>
-            <p id="proof-image-name" class="attachment-name">—</p>
-            <p id="proof-file-size" class="attachment-size">—</p>
-          </div>
-          <button id="remove-proof-image" class="attachment-remove" type="button" aria-label="移除所选附件">移除</button>
-        </div>
-        <p id="proof-existing-file" class="field-help attachment-existing" hidden></p>
-      </div>
-      <p class="record-destination-note">完成与未完成都会留在年度记录中，备注或原因公开可见。</p>
+      <p class="record-destination-note">完成与未完成都会留在年度记录中；这一步只确认最终结果，过程文件请使用“添加进度”。</p>
       <div id="proof-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
       <footer class="dialog-actions">
         <button class="button button-quiet" type="button" data-close-dialog="proof-dialog">取消</button>
-        <button id="submit-proof-button" class="button button-primary" type="submit" data-loading-label="正在保存…">保存反馈</button>
+        <button id="submit-proof-button" class="button button-primary" type="submit" data-loading-label="正在保存…">保存最终结果</button>
       </footer>
     </form>
   </dialog>
@@ -606,7 +637,7 @@
         <label id="stage-proof-dropzone" class="upload-field" for="stage-proof-image" data-dropzone="stage-proof-image">
           <input id="stage-proof-image" name="attachment" class="visually-hidden" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.txt,.csv,.docx,.xlsx,.pptx,image/jpeg,image/png,image/webp,application/pdf,text/plain,text/csv,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation" aria-describedby="stage-proof-file-help">
           <span class="upload-icon" aria-hidden="true">＋</span>
-          <span class="upload-copy"><strong>选择照片或文件</strong><small>拍照、照片图库、文件或拖放</small><small id="stage-proof-file-help" class="upload-formats">JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX、PPTX · 最大 30 MB；HEIC 请转为 JPG</small></span>
+          <span class="upload-copy"><strong>选择照片或文件</strong><small>拍照、照片图库、文件或拖放</small><small id="stage-proof-file-help" class="upload-formats">JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX、PPTX · 最大 10 MB；HEIC 请转为 JPG</small></span>
         </label>
         <div id="stage-image-preview" class="attachment-preview" role="status" aria-live="polite" hidden>
           <img id="stage-preview-image" class="attachment-thumbnail" alt="">
@@ -670,9 +701,19 @@
             <span id="record-daily-progress" class="record-result-progress">—</span>
           </div>
           <div id="record-daily-feedback" class="record-feedback">
-            <span id="record-daily-feedback-label">完成备注</span>
+            <span id="record-daily-feedback-label">备注</span>
             <p id="proof-view-text" class="proof-view-text">—</p>
           </div>
+          <section id="record-progress-section" class="record-progress-section" aria-labelledby="record-progress-title" hidden>
+            <header class="record-progress-heading">
+              <div>
+                <p class="card-kicker">当天轨迹</p>
+                <h4 id="record-progress-title">进度记录</h4>
+              </div>
+              <span id="record-progress-count" class="record-duration">0 次更新</span>
+            </header>
+            <div id="record-progress-list" class="record-progress-list"></div>
+          </section>
           <a id="record-daily-proof-url" class="record-proof-link" href="#" target="_blank" rel="noopener noreferrer nofollow" hidden>打开证据链接<span aria-hidden="true"> ↗</span></a>
           <img id="proof-view-image" class="proof-view-image" alt="每日完成证明图片" hidden>
           <a id="record-daily-file" class="record-file-card" href="#" download hidden>
@@ -708,6 +749,7 @@
         <p id="record-empty-state" class="history-empty" hidden>这一天没有可查看的完成记录。</p>
       </div>
       <footer class="dialog-actions">
+        <button id="record-add-progress" class="button button-quiet dialog-secondary-action" type="button" hidden>继续补充进度</button>
         <button class="button button-primary" type="button" data-close-dialog="proof-view-dialog">关闭</button>
       </footer>
     </article>
@@ -768,7 +810,7 @@
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
   <noscript>
-    <div class="noscript-message">Daily Seal 需要启用 JavaScript 才能登录和查看记录。</div>
+    <div class="noscript-message">Blue 需要启用 JavaScript 才能登录和查看记录。</div>
   </noscript>
 </body>
 </html>
