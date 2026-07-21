@@ -4,7 +4,7 @@
   const LEGACY_KEY = "daily-seal-v1";
   const PREVIEW_KEY = "daily-seal-owner-view";
   const SHANGHAI_TZ = "Asia/Shanghai";
-  const MAX_PROOF_FILE_BYTES = 30 * 1024 * 1024;
+  const MAX_PROOF_FILE_BYTES = 10 * 1024 * 1024;
   const PROOF_FILE_RULES = Object.freeze({
     jpg: { label: "JPG", image: true },
     jpeg: { label: "JPG", image: true },
@@ -48,8 +48,15 @@
     visitorHistoryLimit: 8,
     selectedOwnerDate: "",
     selectedVisitorDate: "",
-    proofPreviewUrl: "",
+    progressFiles: [],
+    progressPreviewUrls: [],
+    progressRecordId: "",
+    progressUploadId: null,
+    progressUploadDate: "",
+    progressBaselinePercent: 0,
     stageImagePreviewUrl: "",
+    recordViewDate: "",
+    recordViewScope: "visitor",
     forcedPasswordChange: false,
     confirmResolver: null,
     focusSaveTimer: null,
@@ -58,6 +65,11 @@
 
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+
+  function uniqueToken(prefix) {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") return `${prefix}-${window.crypto.randomUUID()}`;
+    return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  }
 
   function fileExtension(name) {
     const match = typeof name === "string" ? name.trim().match(/\.([a-z0-9]+)$/i) : null;
@@ -183,6 +195,32 @@
     return state.tasks.find((task) => task.date === key) || null;
   }
 
+  function taskProgressEntries(task) {
+    if (!task || !Array.isArray(task.progressEntries)) return [];
+    return task.progressEntries
+      .filter((entry) => entry && typeof entry === "object")
+      .slice()
+      .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  }
+
+  function progressPercent(entry) {
+    const value = Number.parseInt(entry && entry.progressPercent, 10);
+    return Number.isInteger(value) ? Math.min(100, Math.max(0, value)) : 0;
+  }
+
+  function latestProgressEntry(task) {
+    const entries = taskProgressEntries(task);
+    return entries.length ? entries[entries.length - 1] : null;
+  }
+
+  function taskHasProgress(task) {
+    return taskProgressEntries(task).length > 0;
+  }
+
+  function taskHasPublicRecord(task) {
+    return Boolean(task && (taskHasResult(task) || taskHasProgress(task)));
+  }
+
   function taskResultStatus(task) {
     if (!task) return "pending";
     if (["completed", "incomplete"].includes(task.resultStatus)) return task.resultStatus;
@@ -193,10 +231,21 @@
     return taskResultStatus(task) !== "pending";
   }
 
+  function taskResultIsStale(task) {
+    if (!taskHasResult(task)) return false;
+    if (typeof task.resultIsStale === "boolean") return task.resultIsStale;
+    const latest = latestProgressEntry(task);
+    if (!latest) return false;
+    const latestTime = Date.parse(latest.createdAt || "");
+    const resultTime = Date.parse(task.resultRecordedAt || task.completedAt || "");
+    return Number.isFinite(latestTime) && Number.isFinite(resultTime) && latestTime > resultTime;
+  }
+
   function taskCompletionPercent(task) {
     const status = taskResultStatus(task);
     if (status === "completed") return 100;
-    if (status === "pending") return 0;
+    if (status === "pending") return progressPercent(latestProgressEntry(task));
+    if (taskResultIsStale(task)) return progressPercent(latestProgressEntry(task));
     const value = Number.parseInt(task && task.completionPercent, 10);
     return Number.isInteger(value) ? Math.min(99, Math.max(0, value)) : 0;
   }
@@ -208,7 +257,7 @@
   }
 
   function taskProgressLevel(task) {
-    if (!taskHasResult(task)) return 0;
+    if (!taskHasPublicRecord(task)) return 0;
     const percent = taskCompletionPercent(task);
     if (percent === 0) return 0;
     if (percent < 25) return 1;
@@ -222,7 +271,11 @@
     const status = taskResultStatus(task);
     if (status === "completed") return includePercent ? "已完成 · 100%" : "已完成";
     if (status === "incomplete") {
+      if (taskResultIsStale(task)) return includePercent ? `有新进度 · ${taskCompletionPercent(task)}%` : "有新进度";
       return includePercent ? `未完成 · ${taskCompletionPercent(task)}%` : "未完成";
+    }
+    if (taskHasProgress(task)) {
+      return includePercent ? `进行中 · ${taskCompletionPercent(task)}%` : "进行中";
     }
     return "待反馈";
   }
@@ -340,10 +393,65 @@
 
   function taskProofLabel(task) {
     if (!task) return "";
+    const latest = latestProgressEntry(task);
+    const latestTime = latest ? Date.parse(latest.createdAt || "") : Number.NaN;
+    const resultTime = Date.parse(task.resultRecordedAt || task.completedAt || "");
+    const latestIsNewest = Boolean(latest && (!Number.isFinite(resultTime) || (Number.isFinite(latestTime) && latestTime >= resultTime)));
+    if (latestIsNewest && typeof latest.note === "string" && latest.note.trim()) return latest.note.trim();
+    if (latestIsNewest) return `${taskProgressEntries(task).length} 次进度更新 · 当前 ${progressPercent(latest)}%`;
     if (taskResultNote(task)) return taskResultNote(task);
+    if (latest && typeof latest.note === "string" && latest.note.trim()) return latest.note.trim();
+    if (latest) return `${taskProgressEntries(task).length} 次进度更新 · 当前 ${progressPercent(latest)}%`;
     if (task.proofUrl) return "已添加证据链接";
     if (hasProofAttachment(task)) return "已上传完成附件";
-    return taskResultStatus(task) === "incomplete" ? "已留下未完成反馈" : "已留下完成记录";
+    return taskResultStatus(task) === "incomplete" ? "已留下最终反馈" : "已留下完成记录";
+  }
+
+  function shanghaiHour() {
+    const value = new Intl.DateTimeFormat("en-GB", {
+      timeZone: SHANGHAI_TZ,
+      hour: "2-digit",
+      hour12: false,
+    }).format(new Date());
+    return Number.parseInt(value, 10) || 0;
+  }
+
+  function contextualCopy(task, visitor) {
+    const hour = shanghaiHour();
+    const status = taskResultStatus(task);
+    if (!task) {
+      return visitor
+        ? "今天的页面还很安静，新的任务出现后会留在这里。"
+        : "先定下一件事，今天就从一个清楚的起点开始。";
+    }
+    if (status === "completed") {
+      return visitor
+        ? "今天的目标已经收好，过程与结果都留在了这里。"
+        : "今天已经收好。停下来看看这一路，再安心结束。";
+    }
+    if (status === "incomplete") {
+      return visitor
+        ? "真实的进度也被认真留下，下一次可以从这里继续。"
+        : "结果不必被修饰。记住走到哪里，明天就不必重新寻找方向。";
+    }
+    if (taskHasProgress(task)) {
+      const percent = taskCompletionPercent(task);
+      if (hour >= 20) return visitor
+        ? `今天已经走到 ${percent}%，晚些时候会留下最后的落点。`
+        : `今天走到 ${percent}% 了。只确认下一步，不必一次想完全部。`;
+      return visitor
+        ? `今天已经留下 ${taskProgressEntries(task).length} 次脚印，事情正在向前。`
+        : `已经走到 ${percent}%。把范围收小，继续完成眼前这一段。`;
+    }
+    if (hour < 11) return visitor
+      ? "新的一天刚刚展开，今天的方向已经写在这里。"
+      : "先从最小的一步开始，让行动带来后面的清晰。";
+    if (hour < 18) return visitor
+      ? "事情正在发生，下一次进度会接着写在这里。"
+      : "不需要追赶全部，只把此刻能推进的一段做实。";
+    return visitor
+      ? "一天还没有定稿，最后的结果会如实留在这里。"
+      : "先停一下，确认现在的位置，再选择今晚最值得完成的一步。";
   }
 
   async function loadStageYear(year) {
@@ -444,7 +552,7 @@
     $("#auth-title").textContent = name === "login" ? "欢迎回来" : "创建只读账号";
     $("#auth-description").textContent = name === "login"
       ? "登录后继续查看今天的记录。"
-      : "注册后可查看 blue 的任务、阶段与完成记录。";
+      : "注册后可查看 Blue 的任务、阶段与完成记录。";
     setMessage($("#auth-message"), "");
     const focusTarget = name === "login" ? $("#login-email") : $("#register-email");
     window.setTimeout(() => focusTarget.focus(), 0);
@@ -564,22 +672,25 @@
     resetRecordAttachment("stage");
     $("#record-stage-section").hidden = true;
     $("#record-daily-section").hidden = true;
+    $("#record-progress-section").hidden = true;
+    $("#record-progress-list").replaceChildren();
     $("#record-focus-section").hidden = true;
     $("#record-private-section").hidden = true;
     $("#record-distractions-text").textContent = "";
     $("#record-note-text").textContent = "";
+    $("#record-add-progress").hidden = true;
     $("#account-email").textContent = "—";
     $("#account-email-short").textContent = "账户";
     $("#account-role-label").textContent = "";
     $("#task-form").reset();
+    $("#progress-form").reset();
     $("#proof-form").reset();
     $("#stage-form").reset();
     $("#stage-complete-form").reset();
     $("#password-form").reset();
-    clearProofPreview();
-    setExistingProofAttachment(null);
+    clearProgressFiles();
     clearStageImagePreview();
-    ["#task-dialog", "#proof-dialog", "#stage-dialog", "#stage-complete-dialog", "#proof-view-dialog", "#password-dialog", "#confirm-dialog"].forEach((selector) => {
+    ["#task-dialog", "#progress-dialog", "#proof-dialog", "#stage-dialog", "#stage-complete-dialog", "#proof-view-dialog", "#password-dialog", "#confirm-dialog"].forEach((selector) => {
       const dialog = $(selector);
       if (dialog.open) closeDialog(dialog);
     });
@@ -626,7 +737,7 @@
       element.textContent = "未完成";
       element.classList.add("status-incomplete");
     } else {
-      element.textContent = task ? pendingText : emptyText;
+      element.textContent = task && taskHasProgress(task) ? `进行中 · ${taskCompletionPercent(task)}%` : (task ? pendingText : emptyText);
       element.classList.add("status-pending");
     }
   }
@@ -721,6 +832,7 @@
     const nowLabel = dateLabel(today);
 
     $("#owner-date-label").textContent = nowLabel;
+    $("#owner-context-line").textContent = contextualCopy(todayTask, false);
     $("#today-date").textContent = `${today} · ${nowLabel}`;
     $("#tomorrow-date").textContent = `${tomorrow} · ${dateLabel(tomorrow)}`;
     $("#owner-streak-count").textContent = String(currentStreak(state.tasks));
@@ -733,14 +845,17 @@
     $("#edit-today-task").hidden = Boolean(todayTask && taskHasResult(todayTask));
     $("#complete-today-task").dataset.taskDate = today;
     $("#complete-today-task").hidden = !todayTask;
-    $("#complete-today-task").textContent = todayTask && taskHasResult(todayTask) ? "更新反馈" : "记录今日结果";
+    $("#complete-today-task").textContent = todayTask && taskHasResult(todayTask) ? "更新最终结果" : "记录最终结果";
+    $("#add-today-progress").dataset.taskDate = today;
+    $("#add-today-progress").hidden = !todayTask;
+    $("#add-today-progress").textContent = todayTask && taskHasProgress(todayTask) ? "继续补充进度" : "添加进度";
 
-    const ownerResult = Boolean(todayTask && taskHasResult(todayTask));
-    $("#today-proof-summary").hidden = !ownerResult;
-    $("#today-proof-summary").classList.toggle("is-incomplete", Boolean(ownerResult && taskResultStatus(todayTask) === "incomplete"));
-    if (ownerResult) {
+    const ownerRecord = Boolean(todayTask && taskHasPublicRecord(todayTask));
+    $("#today-proof-summary").hidden = !ownerRecord;
+    $("#today-proof-summary").classList.toggle("is-incomplete", Boolean(ownerRecord && taskResultStatus(todayTask) === "incomplete"));
+    if (ownerRecord) {
       $("#today-result-label").textContent = taskResultLabel(todayTask, true);
-      $("#today-result-icon").textContent = taskResultStatus(todayTask) === "completed" ? "✓" : "—";
+      $("#today-result-icon").textContent = taskResultStatus(todayTask) === "completed" ? "✓" : (taskResultStatus(todayTask) === "incomplete" ? "—" : "↗");
       $("#today-proof-text").textContent = taskProofLabel(todayTask);
       $("#view-today-proof").dataset.taskDate = today;
     }
@@ -759,17 +874,24 @@
   function renderVisitor() {
     const today = dateKeyInShanghai();
     const task = taskFor(today);
+    $("#visitor-context-line").textContent = contextualCopy(task, true);
+    $("#visitor-mascot").classList.toggle("is-resting", Boolean(task && taskHasResult(task)));
+    $("#visitor-mascot").classList.toggle("is-following", Boolean(task && taskHasProgress(task) && !taskHasResult(task)));
     $("#visitor-today-date").textContent = `${today} · ${dateLabel(today)}`;
     $("#visitor-today-task-text").textContent = task ? task.text : "今天还没有公开任务。";
     updateStatus($("#visitor-today-status"), task, "暂无任务", "进行中");
     $("#visitor-today-poms").textContent = `${publicPomsFor(today)} 个番茄`;
-    const hasResult = Boolean(task && taskHasResult(task));
-    $("#visitor-today-proof").hidden = !hasResult;
-    $("#visitor-today-proof").classList.toggle("is-incomplete", Boolean(hasResult && taskResultStatus(task) === "incomplete"));
-    if (hasResult) {
+    const hasRecord = Boolean(task && taskHasPublicRecord(task));
+    $("#visitor-today-proof").hidden = !hasRecord;
+    $("#visitor-today-proof").classList.toggle("is-incomplete", Boolean(hasRecord && taskResultStatus(task) === "incomplete"));
+    if (hasRecord) {
       $("#visitor-result-label").textContent = `今日${taskResultLabel(task, true)}`;
-      $("#visitor-result-icon").textContent = taskResultStatus(task) === "completed" ? "✓" : "—";
-      $("#visitor-proof-time").textContent = completionTime(task.resultRecordedAt || task.completedAt) || "已记录";
+      $("#visitor-result-icon").textContent = taskResultStatus(task) === "completed" ? "✓" : (taskResultStatus(task) === "incomplete" ? "—" : "↗");
+      const latest = latestProgressEntry(task);
+      const resultValue = task.resultRecordedAt || task.completedAt || "";
+      const latestValue = latest && latest.createdAt ? latest.createdAt : "";
+      const newestValue = Date.parse(latestValue) >= Date.parse(resultValue) ? latestValue : resultValue;
+      $("#visitor-proof-time").textContent = completionTime(newestValue || latestValue || resultValue) || "已记录";
       $("#visitor-proof-text").textContent = taskProofLabel(task);
       $("#visitor-view-proof").dataset.taskDate = today;
     }
@@ -847,7 +969,7 @@
       cell.dataset.recordDate = key;
       cell.setAttribute("role", "gridcell");
       if (task) cell.classList.add("is-task");
-      if (task && taskHasResult(task)) {
+      if (task && taskHasPublicRecord(task)) {
         cell.classList.add("is-recorded", `progress-${taskProgressLevel(task)}`);
         cell.style.setProperty("--daily-result-color", `var(--progress-${taskProgressLevel(task)})`);
       }
@@ -856,12 +978,12 @@
       if (poms > 0) cell.classList.add("is-focus-record");
       if (hasPrivate) cell.classList.add("has-private-record");
       if (stageId !== undefined) cell.classList.add("is-stage-complete");
-      if (stageId !== undefined && task && taskHasResult(task)) cell.classList.add("has-daily-result");
+      if (stageId !== undefined && task && taskHasPublicRecord(task)) cell.classList.add("has-daily-result");
       if (selectedDate === key) cell.classList.add("is-selected");
       const status = [];
       if (stageId !== undefined) status.push(`阶段已完成${stage ? `：${stage.title}` : ""}`);
       if (task) {
-        const result = taskHasResult(task) ? taskResultLabel(task, true) : "待反馈";
+        const result = taskHasPublicRecord(task) ? taskResultLabel(task, true) : "待反馈";
         const feedback = taskHasResult(task) && taskResultNote(task) ? `；反馈：${taskResultNote(task)}` : "";
         status.push(`每日任务${result}：${task.text}${feedback}`);
       }
@@ -1002,7 +1124,7 @@
         }
         const action = document.createElement("button");
         action.type = "button";
-        if (entry.stageId !== null && entry.task && taskHasResult(entry.task)) {
+        if (entry.stageId !== null && entry.task && taskHasPublicRecord(entry.task)) {
           action.className = "history-item-status is-combined";
           action.textContent = `阶段 · ${taskResultLabel(entry.task, false)}`;
         } else if (entry.stageId !== null) {
@@ -1017,7 +1139,7 @@
         } else {
           const status = taskResultStatus(entry.task);
           action.className = `history-item-status${status === "completed" ? " is-done" : (status === "incomplete" ? " is-incomplete" : " is-pending")}`;
-          action.textContent = taskResultLabel(entry.task, status === "incomplete");
+          action.textContent = taskResultLabel(entry.task, status === "incomplete" || taskHasProgress(entry.task));
         }
         const recordKinds = [];
         if (entry.stageId !== null) recordKinds.push("阶段成果");
@@ -1062,8 +1184,8 @@
   function openTaskEditor(key) {
     if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
     const task = taskFor(key);
-    if (task && task.done) {
-      toast("已完成的任务不能直接修改。", "error");
+    if (task && taskHasResult(task)) {
+      toast("已记录最终结果的任务不能直接修改。", "error");
       return;
     }
     $("#task-date-input").value = key;
@@ -1137,34 +1259,29 @@
     }
   }
 
-  function attachmentUploadUi(scope) {
-    const daily = scope === "daily";
+  function stageUploadUi() {
     return {
-      previewKey: daily ? "proofPreviewUrl" : "stageImagePreviewUrl",
-      input: $(daily ? "#proof-image-input" : "#stage-proof-image"),
-      dropzone: $(daily ? "#proof-dropzone" : "#stage-proof-dropzone"),
-      preview: $(daily ? "#proof-image-preview" : "#stage-image-preview"),
-      image: $(daily ? "#proof-preview-image" : "#stage-preview-image"),
-      imageAlt: daily ? "待上传的每日完成证明图片预览" : "待上传的阶段成果图片预览",
-      icon: $(daily ? "#proof-preview-file-icon" : "#stage-preview-file-icon"),
-      type: $(daily ? "#proof-file-type" : "#stage-file-type"),
-      name: $(daily ? "#proof-image-name" : "#stage-image-name"),
-      size: $(daily ? "#proof-file-size" : "#stage-file-size"),
-      remove: $(daily ? "#remove-proof-image" : "#remove-stage-image"),
-      message: $(daily ? "#proof-dialog-message" : "#stage-complete-message"),
-      existing: daily ? $("#proof-existing-file") : null,
+      input: $("#stage-proof-image"),
+      dropzone: $("#stage-proof-dropzone"),
+      preview: $("#stage-image-preview"),
+      image: $("#stage-preview-image"),
+      icon: $("#stage-preview-file-icon"),
+      type: $("#stage-file-type"),
+      name: $("#stage-image-name"),
+      size: $("#stage-file-size"),
+      remove: $("#remove-stage-image"),
+      message: $("#stage-complete-message"),
     };
   }
 
-  function clearAttachmentPreview(scope) {
-    const ui = attachmentUploadUi(scope);
-    if (state[ui.previewKey]) URL.revokeObjectURL(state[ui.previewKey]);
-    state[ui.previewKey] = "";
+  function clearStageImagePreview() {
+    const ui = stageUploadUi();
+    if (state.stageImagePreviewUrl) URL.revokeObjectURL(state.stageImagePreviewUrl);
+    state.stageImagePreviewUrl = "";
     ui.input.value = "";
     ui.image.hidden = true;
     ui.image.removeAttribute("src");
     ui.image.removeAttribute("title");
-    ui.image.alt = ui.imageAlt;
     ui.icon.hidden = true;
     ui.icon.textContent = "FILE";
     ui.type.textContent = "附件";
@@ -1173,38 +1290,31 @@
     ui.size.textContent = "—";
     ui.preview.hidden = true;
     ui.dropzone.hidden = false;
-    if (ui.existing) ui.existing.hidden = !ui.existing.dataset.label;
   }
 
-  function previewAttachmentFile(file, scope) {
+  function previewStageFile(file) {
     if (!file) return;
-    const ui = attachmentUploadUi(scope);
+    const ui = stageUploadUi();
     const info = proofFileInfo(file);
-    if (!info.allowed) {
-      clearAttachmentPreview(scope);
-      setMessage(
-        ui.message,
-        ["heic", "heif"].includes(info.extension)
+    if (!info.allowed || file.size > MAX_PROOF_FILE_BYTES) {
+      clearStageImagePreview();
+      setMessage(ui.message, !info.allowed
+        ? (["heic", "heif"].includes(info.extension)
           ? "HEIC 暂不支持，请在照片中导出为 JPG，或上传截图。"
-          : "附件必须带有受支持的扩展名：JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX 或 PPTX。",
-      );
+          : "附件必须是受支持的照片或文件格式。")
+        : "附件不能超过 10 MB。");
       return;
     }
-    if (file.size > MAX_PROOF_FILE_BYTES) {
-      clearAttachmentPreview(scope);
-      setMessage(ui.message, "附件不能超过 30 MB。");
-      return;
-    }
-    if (state[ui.previewKey]) URL.revokeObjectURL(state[ui.previewKey]);
-    state[ui.previewKey] = "";
+    if (state.stageImagePreviewUrl) URL.revokeObjectURL(state.stageImagePreviewUrl);
+    state.stageImagePreviewUrl = "";
     ui.image.hidden = true;
     ui.image.removeAttribute("src");
     ui.icon.hidden = info.isImage;
     ui.icon.textContent = info.label;
     if (info.isImage) {
       try {
-        state[ui.previewKey] = URL.createObjectURL(file);
-        ui.image.src = state[ui.previewKey];
+        state.stageImagePreviewUrl = URL.createObjectURL(file);
+        ui.image.src = state.stageImagePreviewUrl;
         ui.image.title = file.name;
         ui.image.alt = `${file.name} 图片预览`;
         ui.image.hidden = false;
@@ -1218,28 +1328,252 @@
     ui.size.textContent = formatFileSize(file.size);
     ui.preview.hidden = false;
     ui.dropzone.hidden = true;
-    if (ui.existing) ui.existing.hidden = true;
     setMessage(ui.message, "");
   }
 
-  function setExistingProofAttachment(task) {
-    const note = $("#proof-existing-file");
-    const attachment = proofAttachment(task);
-    note.dataset.label = attachment ? attachment.name : "";
-    note.textContent = attachment
-      ? `已保存：${attachment.name}。选择新附件会替换；不选择则保留。`
-      : "";
-    if (attachment) note.title = attachment.name;
-    else note.removeAttribute("title");
-    note.hidden = !attachment;
+  function revokeProgressPreviewUrls() {
+    state.progressPreviewUrls.forEach((url) => URL.revokeObjectURL(url));
+    state.progressPreviewUrls = [];
   }
 
-  function clearProofPreview() {
-    clearAttachmentPreview("daily");
+  function clearProgressFiles() {
+    revokeProgressPreviewUrls();
+    state.progressFiles = [];
+    state.progressRecordId = "";
+    state.progressUploadId = null;
+    state.progressUploadDate = "";
+    state.progressBaselinePercent = 0;
+    const input = $("#progress-file-input");
+    if (input) input.value = "";
+    const preview = $("#progress-files-preview");
+    if (preview) {
+      preview.replaceChildren();
+      preview.hidden = true;
+    }
+    const controls = $("#progress-controls");
+    if (controls) controls.querySelectorAll("input, textarea").forEach((element) => { element.disabled = false; });
+    const button = $("#submit-progress-button");
+    if (button && !button.disabled) button.textContent = "保存这次进度";
   }
 
-  function clearStageImagePreview() {
-    clearAttachmentPreview("stage");
+  function renderProgressFiles() {
+    revokeProgressPreviewUrls();
+    const preview = $("#progress-files-preview");
+    preview.replaceChildren();
+    preview.hidden = state.progressFiles.length === 0;
+    let foldedBody = null;
+    if (state.progressFiles.length > 6) {
+      const details = document.createElement("details");
+      details.className = "progress-assets-more attachment-queue-more";
+      const summary = document.createElement("summary");
+      summary.textContent = `查看其余 ${state.progressFiles.length - 6} 个待上传文件`;
+      foldedBody = document.createElement("div");
+      foldedBody.className = "progress-assets-more-body";
+      details.append(summary, foldedBody);
+      preview.appendChild(details);
+    }
+    state.progressFiles.forEach((queued, index) => {
+      const file = queued.file;
+      const info = proofFileInfo(file);
+      const item = document.createElement("article");
+      item.className = "attachment-preview attachment-queue-item";
+      item.setAttribute("role", "listitem");
+      let visual;
+      if (info.isImage && index < 6) {
+        visual = document.createElement("img");
+        visual.className = "attachment-thumbnail";
+        visual.alt = "";
+        try {
+          const url = URL.createObjectURL(file);
+          state.progressPreviewUrls.push(url);
+          visual.src = url;
+        } catch (_error) {
+          visual = null;
+        }
+      }
+      if (!visual) {
+        visual = document.createElement("span");
+        visual.className = "attachment-type-icon";
+        visual.setAttribute("aria-hidden", "true");
+        visual.textContent = info.label;
+      }
+      const copy = document.createElement("div");
+      copy.className = "attachment-copy";
+      const type = document.createElement("span");
+      type.className = "attachment-type";
+      type.textContent = info.isImage ? `${info.label} 图片` : `${info.label} 文件`;
+      const name = document.createElement("p");
+      name.className = "attachment-name";
+      name.textContent = file.name;
+      name.title = file.name;
+      const size = document.createElement("p");
+      size.className = "attachment-size";
+      size.textContent = formatFileSize(file.size);
+      copy.append(type, name, size);
+      const remove = document.createElement("button");
+      remove.className = "attachment-remove";
+      remove.type = "button";
+      remove.textContent = "移除";
+      remove.setAttribute("aria-label", `移除 ${file.name}`);
+      remove.addEventListener("click", () => {
+        state.progressFiles.splice(index, 1);
+        renderProgressFiles();
+        $("#progress-file-input").focus();
+      });
+      item.append(visual, copy, remove);
+      if (foldedBody && index >= 6) foldedBody.appendChild(item);
+      else preview.insertBefore(item, preview.querySelector(".attachment-queue-more"));
+    });
+  }
+
+  function addProgressFiles(files) {
+    const rejected = [];
+    const fileKey = (file) => [file.name, file.size, file.lastModified, file.type].join("\u0000");
+    const existing = new Set(state.progressFiles.map((queued) => fileKey(queued.file)));
+    Array.from(files || []).forEach((file) => {
+      const info = proofFileInfo(file);
+      if (!info.allowed) rejected.push(`${file.name}：格式不支持`);
+      else if (file.size > MAX_PROOF_FILE_BYTES) rejected.push(`${file.name}：超过 10 MB`);
+      else if (existing.has(fileKey(file))) rejected.push(`${file.name}：已在待上传列表`);
+      else {
+        existing.add(fileKey(file));
+        state.progressFiles.push({ file, clientUploadId: uniqueToken("upload") });
+      }
+    });
+    $("#progress-file-input").value = "";
+    renderProgressFiles();
+    setMessage($("#progress-dialog-message"), rejected.length
+      ? `${rejected.slice(0, 3).join("；")}${rejected.length > 3 ? `；另有 ${rejected.length - 3} 个文件未加入` : ""}`
+      : "");
+  }
+
+  function updateProgressOutput() {
+    const value = Math.min(100, Math.max(0, Number.parseInt($("#progress-percent-input").value, 10) || 0));
+    $("#progress-percent-output").textContent = `${value}%`;
+  }
+
+  function openProgressEditor(key) {
+    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    const task = taskFor(key);
+    if (!task) return;
+    clearProgressFiles();
+    $("#progress-form").reset();
+    state.progressRecordId = uniqueToken("progress");
+    $("#progress-date-input").value = key;
+    $("#progress-dialog-date").textContent = `${key} · ${task.text}`;
+    const latest = latestProgressEntry(task);
+    state.progressBaselinePercent = Math.max(
+      latest ? progressPercent(latest) : 0,
+      taskCompletionPercent(task),
+    );
+    $("#progress-percent-input").value = String(state.progressBaselinePercent);
+    const existingAssets = taskProgressEntries(task).flatMap((entry) => Array.isArray(entry.assets) ? entry.assets : []);
+    const existingFiles = existingAssets.filter((asset) => asset && asset.kind === "file").length;
+    const existingLinks = existingAssets.filter((asset) => asset && asset.kind === "link").length;
+    const existingSummary = $("#progress-existing-assets");
+    existingSummary.hidden = existingFiles + existingLinks === 0;
+    existingSummary.textContent = existingSummary.hidden
+      ? ""
+      : `今天已保留 ${existingFiles} 个照片或文件、${existingLinks} 个链接；本次只需选择新增内容。`;
+    updateProgressOutput();
+    updateCharacterCount($("#progress-note-input"));
+    setMessage($("#progress-dialog-message"), "");
+    showDialog($("#progress-dialog"));
+    window.setTimeout(() => $("#progress-note-input").focus(), 0);
+  }
+
+  function createdProgressFromPayload(payload) {
+    const direct = payload && (payload.progress || payload.progressEntry || payload.entry);
+    if (direct && direct.id !== undefined && direct.id !== null) return direct;
+    const task = payload && payload.task;
+    const entries = taskProgressEntries(task);
+    return entries.length ? entries[entries.length - 1] : null;
+  }
+
+  async function submitProgress(event) {
+    event.preventDefault();
+    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    const key = $("#progress-date-input").value;
+    const button = $("#submit-progress-button");
+    const rawLinks = $("#progress-links-input").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    const invalidLink = rawLinks.find((value) => !httpUrl(value));
+    if (!state.progressUploadId && invalidLink) {
+      setMessage($("#progress-dialog-message"), `链接格式不正确：${invalidLink}`);
+      $("#progress-links-input").focus();
+      return;
+    }
+    const nextPercent = Math.min(100, Math.max(0, Number.parseInt($("#progress-percent-input").value, 10) || 0));
+    const note = $("#progress-note-input").value.trim();
+    if (!state.progressUploadId
+      && !note
+      && rawLinks.length === 0
+      && state.progressFiles.length === 0
+      && nextPercent === state.progressBaselinePercent) {
+      setMessage($("#progress-dialog-message"), "这次还没有新增内容。写一句备注、调整进度，或添加链接/文件后再保存。");
+      $("#progress-note-input").focus();
+      return;
+    }
+    setLoading(button, true);
+    setMessage($("#progress-dialog-message"), "");
+    let keepOpen = false;
+    try {
+      if (!state.progressUploadId) {
+        const payload = await api(`/api/tasks/${encodeURIComponent(key)}/progress`, {
+          method: "POST",
+          body: {
+            note,
+            progressPercent: nextPercent,
+            links: rawLinks.map((value) => httpUrl(value)),
+            hasPendingFiles: state.progressFiles.length > 0,
+            clientRecordId: state.progressRecordId,
+          },
+        });
+        const created = createdProgressFromPayload(payload);
+        if (!created || created.id === undefined || created.id === null) {
+          throw new ApiError("进度已经保存，但服务器没有返回附件接收编号。刷新后可继续添加。", 0, "missing_progress_id");
+        }
+        state.progressUploadId = created.id;
+        state.progressUploadDate = key;
+      }
+
+      const failed = [];
+      const files = state.progressFiles.slice();
+      for (let index = 0; index < files.length; index += 1) {
+        const queued = files[index];
+        const file = queued.file;
+        button.textContent = `正在上传 ${index + 1}/${files.length}…`;
+        const formData = new FormData();
+        formData.append("attachment", file, file.name);
+        formData.append("clientUploadId", queued.clientUploadId);
+        try {
+          await api(`/api/tasks/${encodeURIComponent(state.progressUploadDate)}/progress/${encodeURIComponent(String(state.progressUploadId))}/files`, {
+            method: "POST",
+            body: formData,
+          });
+        } catch (error) {
+          failed.push({ queued, error });
+        }
+      }
+
+      await loadData();
+      if (failed.length) {
+        keepOpen = true;
+        state.progressFiles = failed.map((item) => item.queued);
+        renderProgressFiles();
+        $("#progress-controls").querySelectorAll("input, textarea").forEach((element) => { element.disabled = true; });
+        const firstError = failed[0].error && failed[0].error.message ? failed[0].error.message : "上传失败";
+        setMessage($("#progress-dialog-message"), `进度与已成功的附件都已保存；还有 ${failed.length} 个附件未上传。${firstError}`);
+      } else {
+        closeDialog($("#progress-dialog"));
+        clearProgressFiles();
+        toast(files.length ? `进度已保存，${files.length} 个附件已按顺序上传。` : "这次进度已保存。", "success");
+      }
+    } catch (error) {
+      setMessage($("#progress-dialog-message"), error.message);
+    } finally {
+      setLoading(button, false);
+      if (keepOpen) button.textContent = "重试未上传附件";
+    }
   }
 
   function selectedResultStatus() {
@@ -1258,7 +1592,15 @@
       progress.disabled = true;
     } else {
       progress.max = "99";
-      if (previousProgress >= 100) progress.value = "50";
+      if (previousProgress >= 100) {
+        const task = taskFor($("#proof-date-input").value);
+        const latest = latestProgressEntry(task);
+        const stored = Number.parseInt(task && task.completionPercent, 10);
+        const baseline = latest
+          ? progressPercent(latest)
+          : (taskResultStatus(task) === "incomplete" && Number.isInteger(stored) ? stored : 0);
+        progress.value = String(Math.min(99, Math.max(0, baseline)));
+      }
       progress.disabled = false;
     }
     const percent = completed ? 100 : Math.min(99, Math.max(0, Number.parseInt(progress.value, 10) || 0));
@@ -1267,20 +1609,17 @@
     $("#result-progress-help").textContent = completed
       ? "选择“完成”时自动记为 100%。"
       : "选择最接近实际进度的数值，年度记录会随完成量加深。";
-    $("#result-note-label").textContent = completed ? "完成备注" : "未完成原因";
+    $("#result-note-label").textContent = "备注";
     $("#proof-text-input").placeholder = completed
-      ? "简单写下完成了什么、结果如何…"
-      : "简单记录卡在哪里、下一步怎样调整…";
-    $("#proof-requirement").textContent = completed
-      ? "必填 · 完成备注会公开显示"
-      : "必填 · 未完成原因会公开显示";
+      ? "简单写下今天完成了什么、结果如何…"
+      : "如实写下今天最后走到了哪里…";
+    $("#proof-requirement").textContent = "必填 · 备注会公开显示在当天记录中";
   }
 
   function openProofEditor(key) {
     if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
     const task = taskFor(key);
     if (!task) return;
-    clearProofPreview();
     $("#proof-date-input").value = key;
     $("#proof-dialog-date").textContent = `${key} · ${task.text}`;
     $("#proof-dialog-title").textContent = taskHasResult(task) ? "更新今日反馈" : "记录今日结果";
@@ -1289,9 +1628,7 @@
     $("#result-status-incomplete").checked = status === "incomplete";
     $("#result-progress-input").value = String(status === "completed" ? 100 : taskCompletionPercent(task));
     $("#proof-text-input").value = taskResultNote(task);
-    $("#proof-url-input").value = task.proofUrl || "";
-    setExistingProofAttachment(task);
-    $("#submit-proof-button").textContent = taskHasResult(task) ? "更新反馈" : "保存反馈";
+    $("#submit-proof-button").textContent = taskHasResult(task) ? "更新最终结果" : "保存最终结果";
     setMessage($("#proof-dialog-message"), "");
     updateResultForm();
     updateCharacterCount($("#proof-text-input"));
@@ -1308,16 +1645,8 @@
       ? 100
       : Math.min(99, Math.max(0, Number.parseInt($("#result-progress-input").value, 10) || 0));
     const resultNote = $("#proof-text-input").value.trim();
-    const proofUrlRaw = $("#proof-url-input").value.trim();
-    const proofUrl = httpUrl(proofUrlRaw);
-    const file = $("#proof-image-input").files[0];
-    if (proofUrlRaw && !proofUrl) {
-      setMessage($("#proof-dialog-message"), "证据链接必须以 http:// 或 https:// 开头。");
-      $("#proof-url-input").focus();
-      return;
-    }
     if (!resultNote) {
-      setMessage($("#proof-dialog-message"), resultStatus === "completed" ? "请填写完成备注。" : "请填写未完成原因。");
+      setMessage($("#proof-dialog-message"), "请填写备注。");
       $("#proof-text-input").focus();
       return;
     }
@@ -1325,15 +1654,12 @@
     formData.append("resultStatus", resultStatus);
     formData.append("completionPercent", String(completionPercent));
     formData.append("resultNote", resultNote);
-    formData.append("proofUrl", proofUrl);
-    if (file) formData.append("attachment", file, file.name);
     const button = $("#submit-proof-button");
     setLoading(button, true);
     setMessage($("#proof-dialog-message"), "");
     try {
       await api(`/api/tasks/${encodeURIComponent(key)}/result`, { method: "POST", body: formData });
       closeDialog($("#proof-dialog"));
-      clearProofPreview();
       await loadData();
       toast(task && taskHasResult(task) ? "今日反馈已更新。" : "今日反馈已保存。", "success");
     } catch (error) {
@@ -1396,11 +1722,196 @@
     ui.file.hidden = false;
   }
 
+  function isRemovableProgressAsset(entry, asset) {
+    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return false;
+    if (!entry || entry.legacy || !asset) return false;
+    return /^\d+$/.test(String(entry.id)) && /^\d+$/.test(String(asset.id));
+  }
+
+  function assetRemoveButton(taskDate, entry, asset, label) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "progress-asset-remove";
+    button.textContent = "移除";
+    button.setAttribute("aria-label", `移除${label}`);
+    button.addEventListener("click", async () => {
+      const description = label === "链接"
+        ? "确定移除这条链接吗？只会移除链接，不会删除整条进度。"
+        : `确定删除这个${label}吗？文件会立即从服务器删除且不能恢复；不会删除整条进度。`;
+      const confirmed = await confirmAction(description, "确认移除");
+      if (!confirmed) return;
+      button.disabled = true;
+      try {
+        await api(`/api/tasks/${encodeURIComponent(taskDate)}/progress/${encodeURIComponent(String(entry.id))}/assets/${encodeURIComponent(String(asset.id))}`, { method: "DELETE" });
+        await loadData();
+        const refreshed = taskFor(taskDate);
+        if (refreshed && $("#proof-view-dialog").open) renderDailyRecord(refreshed);
+        toast(`${label}已移除。`, "success");
+      } catch (error) {
+        button.disabled = false;
+        toast(error.message, "error");
+      }
+    });
+    return button;
+  }
+
+  function appendProgressItems(container, items, label) {
+    const visibleCount = 4;
+    items.slice(0, visibleCount).forEach((item) => container.appendChild(item));
+    if (items.length <= visibleCount) return;
+    const details = document.createElement("details");
+    details.className = "progress-assets-more";
+    const summary = document.createElement("summary");
+    summary.textContent = `查看其余 ${items.length - visibleCount} 个${label}`;
+    const body = document.createElement("div");
+    body.className = "progress-assets-more-body";
+    items.slice(visibleCount).forEach((item) => body.appendChild(item));
+    details.append(summary, body);
+    container.appendChild(details);
+  }
+
+  function progressLinkItem(taskDate, entry, asset) {
+    const row = document.createElement("div");
+    row.className = "progress-link-row";
+    const link = document.createElement("a");
+    link.className = "progress-link";
+    link.href = httpUrl(asset.url);
+    link.target = "_blank";
+    link.rel = "noopener noreferrer nofollow";
+    link.textContent = asset.url;
+    link.title = asset.url;
+    const action = document.createElement("span");
+    action.setAttribute("aria-hidden", "true");
+    action.textContent = "↗";
+    link.appendChild(action);
+    row.appendChild(link);
+    if (isRemovableProgressAsset(entry, asset)) row.appendChild(assetRemoveButton(taskDate, entry, asset, "链接"));
+    return row;
+  }
+
+  function progressFileItem(taskDate, entry, asset) {
+    const attachment = proofAttachment(asset);
+    if (!attachment) return null;
+    const row = document.createElement("div");
+    row.className = `progress-file-row${attachment.isImage ? " is-image" : ""}`;
+    if (attachment.isImage) {
+      const link = document.createElement("a");
+      link.className = "progress-image-link";
+      link.href = attachment.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.setAttribute("aria-label", `打开图片：${attachment.name}`);
+      const image = document.createElement("img");
+      image.src = attachment.url;
+      image.alt = attachment.name;
+      image.loading = "lazy";
+      link.appendChild(image);
+      const caption = document.createElement("span");
+      caption.textContent = attachment.name;
+      link.appendChild(caption);
+      row.appendChild(link);
+    } else {
+      const link = document.createElement("a");
+      link.className = "record-file-card progress-file-card";
+      link.href = attachment.url;
+      link.download = attachment.name;
+      link.setAttribute("aria-label", `下载附件：${attachment.name}`);
+      const type = document.createElement("span");
+      type.className = "record-file-type";
+      type.textContent = attachment.label;
+      const copy = document.createElement("span");
+      copy.className = "record-file-copy";
+      const name = document.createElement("strong");
+      name.textContent = attachment.name;
+      name.title = attachment.name;
+      const meta = document.createElement("small");
+      meta.textContent = [attachment.label, formatFileSize(attachment.size)].filter(Boolean).join(" · ");
+      copy.append(name, meta);
+      const action = document.createElement("span");
+      action.className = "record-file-action";
+      action.textContent = "下载";
+      link.append(type, copy, action);
+      row.appendChild(link);
+    }
+    if (isRemovableProgressAsset(entry, asset)) row.appendChild(assetRemoveButton(taskDate, entry, asset, attachment.isImage ? "图片" : "附件"));
+    return row;
+  }
+
+  function buildProgressEntry(taskDate, entry, latest) {
+    const article = document.createElement("article");
+    article.className = `progress-entry${latest ? " is-latest" : ""}${entry.legacy ? " is-legacy" : ""}`;
+    const header = document.createElement("header");
+    header.className = "progress-entry-header";
+    const time = document.createElement("time");
+    time.dateTime = entry.createdAt || "";
+    time.textContent = completionTime(entry.createdAt) || "已记录";
+    const percent = document.createElement("span");
+    percent.className = "progress-entry-percent";
+    percent.textContent = `${progressPercent(entry)}%`;
+    header.append(time, percent);
+    article.appendChild(header);
+    if (entry.legacy) {
+      const legacy = document.createElement("p");
+      legacy.className = "progress-entry-legacy";
+      legacy.textContent = "此前保存的证据";
+      article.appendChild(legacy);
+    }
+    if (typeof entry.note === "string" && entry.note.trim()) {
+      const note = document.createElement("p");
+      note.className = "progress-entry-note";
+      note.textContent = entry.note.trim();
+      article.appendChild(note);
+    }
+    const assets = Array.isArray(entry.assets) ? entry.assets : [];
+    const linkItems = assets.filter((asset) => asset && asset.kind === "link" && httpUrl(asset.url))
+      .map((asset) => progressLinkItem(taskDate, entry, asset));
+    const fileItems = assets.filter((asset) => asset && asset.kind === "file")
+      .map((asset) => progressFileItem(taskDate, entry, asset)).filter(Boolean);
+    if (linkItems.length) {
+      const group = document.createElement("div");
+      group.className = "progress-link-list";
+      appendProgressItems(group, linkItems, "链接");
+      article.appendChild(group);
+    }
+    if (fileItems.length) {
+      const group = document.createElement("div");
+      group.className = "progress-file-list";
+      appendProgressItems(group, fileItems, "文件");
+      article.appendChild(group);
+    }
+    return article;
+  }
+
+  function renderProgressTimeline(task) {
+    const section = $("#record-progress-section");
+    const list = $("#record-progress-list");
+    const entries = taskProgressEntries(task);
+    list.replaceChildren();
+    section.hidden = entries.length === 0;
+    $("#record-progress-count").textContent = `${entries.length} 次更新`;
+    if (!entries.length) return;
+    const latest = entries[entries.length - 1];
+    list.appendChild(buildProgressEntry(task.date, latest, true));
+    if (entries.length > 1) {
+      const details = document.createElement("details");
+      details.className = "progress-archive";
+      const summary = document.createElement("summary");
+      summary.textContent = `查看较早的 ${entries.length - 1} 次进度`;
+      const body = document.createElement("div");
+      body.className = "progress-archive-body";
+      entries.slice(0, -1).reverse().forEach((entry) => body.appendChild(buildProgressEntry(task.date, entry, false)));
+      details.append(summary, body);
+      list.appendChild(details);
+    }
+  }
+
   function resetRecordDetails() {
     $("#record-stage-section").hidden = true;
     $("#record-daily-section").hidden = true;
     $("#record-focus-section").hidden = true;
     $("#record-private-section").hidden = true;
+    $("#record-progress-section").hidden = true;
+    $("#record-progress-list").replaceChildren();
     $("#record-distractions-block").hidden = true;
     $("#record-note-block").hidden = true;
     $("#record-distractions-text").textContent = "";
@@ -1440,14 +1951,21 @@
     statusElement.textContent = taskResultLabel(task, false);
     $("#record-daily-title").textContent = task.text;
     $("#record-daily-progress").textContent = hasResult ? `完成程度 ${taskCompletionPercent(task)}%` : "尚未记录结果";
-    $("#record-daily-feedback-label").textContent = status === "incomplete" ? "未完成原因" : "完成备注";
+    $("#record-daily-feedback-label").textContent = "备注";
     $("#proof-view-text").textContent = taskResultNote(task) || "未填写文字反馈。";
     $("#record-daily-feedback").hidden = !hasResult;
+    const latest = latestProgressEntry(task);
     $("#proof-view-time").textContent = hasResult
-      ? `记录于 ${completionTime(task.resultRecordedAt || task.completedAt) || "已记录"}`
-      : "等待反馈";
-    setExternalProofLink($("#record-daily-proof-url"), task.proofUrl);
-    renderRecordAttachment(task, "daily");
+      ? `最终结果 · ${completionTime(task.resultRecordedAt || task.completedAt) || "已记录"}`
+      : (latest ? `最近更新 · ${completionTime(latest.createdAt) || "已记录"}` : "等待反馈");
+    renderProgressTimeline(task);
+    if (taskHasProgress(task)) {
+      setExternalProofLink($("#record-daily-proof-url"), "");
+      resetRecordAttachment("daily");
+    } else {
+      setExternalProofLink($("#record-daily-proof-url"), task.proofUrl);
+      renderRecordAttachment(task, "daily");
+    }
   }
 
   function renderFocusRecord(key) {
@@ -1473,6 +1991,8 @@
   }
 
   async function openDateRecord(key, task, stageId, scope) {
+    state.recordViewDate = key;
+    state.recordViewScope = scope;
     resetRecordDetails();
     let stage = stageId === null || stageId === undefined ? null : stageFromCache(stageId);
     if (!stage && stageId !== null && stageId !== undefined) {
@@ -1487,6 +2007,9 @@
     if (task) renderDailyRecord(task);
     const hasFocus = renderFocusRecord(key);
     const hasPrivate = renderPrivateRecord(key, scope);
+    const canAddProgress = Boolean(task && scope === "owner" && state.user && state.user.role === "owner" && state.mode === "owner");
+    $("#record-add-progress").hidden = !canAddProgress;
+    $("#record-add-progress").dataset.taskDate = canAddProgress ? key : "";
     const sectionCount = Number(Boolean(stage)) + Number(Boolean(task)) + Number(hasFocus) + Number(hasPrivate);
     $("#proof-view-title").textContent = sectionCount > 1
       ? "当日记录"
@@ -1815,11 +2338,11 @@
     if (counter) counter.textContent = String(input.value.length);
   }
 
-  function bindAttachmentPicker(scope) {
-    const ui = attachmentUploadUi(scope);
-    ui.input.addEventListener("change", (event) => previewAttachmentFile(event.target.files[0], scope));
+  function bindStageAttachmentPicker() {
+    const ui = stageUploadUi();
+    ui.input.addEventListener("change", (event) => previewStageFile(event.target.files[0]));
     ui.remove.addEventListener("click", () => {
-      clearAttachmentPreview(scope);
+      clearStageImagePreview();
       ui.input.focus();
     });
     ["dragenter", "dragover"].forEach((name) => ui.dropzone.addEventListener(name, (event) => {
@@ -1835,7 +2358,7 @@
       const files = event.dataTransfer ? Array.from(event.dataTransfer.files || []) : [];
       if (!files.length) return;
       if (files.length !== 1) {
-        clearAttachmentPreview(scope);
+        clearStageImagePreview();
         setMessage(ui.message, "一次只能选择一个附件。");
         return;
       }
@@ -1844,12 +2367,28 @@
         transfer.items.add(files[0]);
         ui.input.files = transfer.files;
       } catch (_error) {
-        clearAttachmentPreview(scope);
+        clearStageImagePreview();
         setMessage(ui.message, "当前浏览器无法拖放附件，请点按选择。");
         return;
       }
-      previewAttachmentFile(files[0], scope);
+      previewStageFile(files[0]);
     });
+  }
+
+  function bindProgressPicker() {
+    const input = $("#progress-file-input");
+    const dropzone = $("#progress-dropzone");
+    input.addEventListener("change", (event) => addProgressFiles(event.target.files));
+    ["dragenter", "dragover"].forEach((name) => dropzone.addEventListener(name, (event) => {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      dropzone.classList.add("is-dragging");
+    }));
+    ["dragleave", "drop"].forEach((name) => dropzone.addEventListener(name, (event) => {
+      event.preventDefault();
+      dropzone.classList.remove("is-dragging");
+    }));
+    dropzone.addEventListener("drop", (event) => addProgressFiles(event.dataTransfer ? event.dataTransfer.files : []));
   }
 
   function bindEvents() {
@@ -1871,9 +2410,16 @@
     $$('[data-switch-view]').forEach((button) => button.addEventListener("click", () => setMode(button.dataset.switchView)));
     $("#edit-today-task").addEventListener("click", () => openTaskEditor($("#edit-today-task").dataset.taskDate));
     $("#edit-tomorrow-task").addEventListener("click", () => openTaskEditor($("#edit-tomorrow-task").dataset.taskDate));
+    $("#add-today-progress").addEventListener("click", () => openProgressEditor($("#add-today-progress").dataset.taskDate));
     $("#complete-today-task").addEventListener("click", () => openProofEditor($("#complete-today-task").dataset.taskDate));
     $("#view-today-proof").addEventListener("click", () => openRecord(taskFor($("#view-today-proof").dataset.taskDate), "owner"));
     $("#visitor-view-proof").addEventListener("click", () => openRecord(taskFor($("#visitor-view-proof").dataset.taskDate), "visitor"));
+    $("#record-add-progress").addEventListener("click", () => {
+      const key = $("#record-add-progress").dataset.taskDate;
+      if (!key) return;
+      closeDialog($("#proof-view-dialog"));
+      openProgressEditor(key);
+    });
     $("#create-stage-button").addEventListener("click", openStageEditor);
     $("#edit-stage-button").addEventListener("click", openStageEditor);
     $("#complete-stage-button").addEventListener("click", openStageCompletion);
@@ -1887,11 +2433,13 @@
     }));
     $("#task-form").addEventListener("submit", saveTask);
     $("#delete-task-button").addEventListener("click", deleteTask);
+    $("#progress-form").addEventListener("submit", submitProgress);
+    $("#progress-percent-input").addEventListener("input", updateProgressOutput);
     $("#proof-form").addEventListener("submit", submitProof);
     $$('input[name="resultStatus"]').forEach((input) => input.addEventListener("change", updateResultForm));
     $("#result-progress-input").addEventListener("input", updateResultForm);
-    bindAttachmentPicker("daily");
-    bindAttachmentPicker("stage");
+    bindProgressPicker();
+    bindStageAttachmentPicker();
     $("#focus-form").addEventListener("submit", (event) => {
       event.preventDefault();
       saveFocus(true);
@@ -1944,12 +2492,12 @@
       event.preventDefault();
       finishConfirmation(false);
     });
-    [$("#task-dialog"), $("#proof-dialog"), $("#stage-dialog"), $("#stage-complete-dialog")].forEach((dialog) => dialog.addEventListener("close", () => {
+    [$("#task-dialog"), $("#progress-dialog"), $("#proof-dialog"), $("#stage-dialog"), $("#stage-complete-dialog")].forEach((dialog) => dialog.addEventListener("close", () => {
       setMessage(dialog.querySelector(".form-message"), "");
-      if (dialog === $("#proof-dialog")) clearProofPreview();
+      if (dialog === $("#progress-dialog")) clearProgressFiles();
       if (dialog === $("#stage-complete-dialog")) clearStageImagePreview();
     }));
-    [$("#task-text-input"), $("#proof-text-input"), $("#stage-title-input"), $("#stage-description-input"), $("#stage-proof-text")].forEach((input) => {
+    [$("#task-text-input"), $("#progress-note-input"), $("#proof-text-input"), $("#stage-title-input"), $("#stage-description-input"), $("#stage-proof-text")].forEach((input) => {
       input.addEventListener("input", () => updateCharacterCount(input));
     });
   }
@@ -1959,6 +2507,11 @@
 
   window.setInterval(async () => {
     const current = dateKeyInShanghai();
+    if (state.user) {
+      const task = taskFor(current);
+      $("#owner-context-line").textContent = contextualCopy(task, false);
+      $("#visitor-context-line").textContent = contextualCopy(task, true);
+    }
     if (current !== state.renderedDate) {
       state.renderedDate = current;
       state.historyYear = Number(current.slice(0, 4));

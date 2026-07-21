@@ -13,6 +13,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from contextlib import contextmanager
@@ -65,6 +66,8 @@ class DailySealApiTests(unittest.TestCase):
                 DELETE FROM sessions;
                 DELETE FROM auth_events;
                 DELETE FROM stages;
+                DELETE FROM task_progress_assets;
+                DELETE FROM task_progress;
                 DELETE FROM tasks;
                 DELETE FROM daily_stats;
                 DELETE FROM users;
@@ -205,6 +208,40 @@ class DailySealApiTests(unittest.TestCase):
         return client.put(
             f"/api/tasks/{task_date}",
             json={"text": text},
+            headers={"X-CSRF-Token": self.csrf(client)},
+        )
+
+    def create_progress(
+        self,
+        client=None,
+        task_date="2026-07-17",
+        note="Morning work",
+        progress_percent=35,
+        links=None,
+    ):
+        client = client or self.client
+        return client.post(
+            f"/api/tasks/{task_date}/progress",
+            json={
+                "note": note,
+                "progressPercent": progress_percent,
+                "links": list(links or []),
+            },
+            headers={"X-CSRF-Token": self.csrf(client)},
+        )
+
+    def upload_progress_file(
+        self,
+        progress_id,
+        raw,
+        name,
+        client=None,
+        task_date="2026-07-17",
+    ):
+        client = client or self.client
+        return client.post(
+            f"/api/tasks/{task_date}/progress/{progress_id}/files",
+            data={"attachment": (io.BytesIO(raw), name)},
             headers={"X-CSRF-Token": self.csrf(client)},
         )
 
@@ -487,6 +524,24 @@ class DailySealApiTests(unittest.TestCase):
                 },
                 headers={"X-CSRF-Token": token},
             ),
+            self.client.post(
+                "/api/tasks/2026-07-17/progress",
+                json={
+                    "note": "forbidden",
+                    "progressPercent": 25,
+                    "links": ["https://example.test/forbidden"],
+                },
+                headers={"X-CSRF-Token": token},
+            ),
+            self.client.post(
+                "/api/tasks/2026-07-17/progress/1/files",
+                data={"attachment": (io.BytesIO(b"forbidden"), "forbidden.txt")},
+                headers={"X-CSRF-Token": token},
+            ),
+            self.client.delete(
+                "/api/tasks/2026-07-17/progress/1/assets/1",
+                headers={"X-CSRF-Token": token},
+            ),
             self.client.put(
                 "/api/stats/2026-07-17",
                 json={"poms": 1, "note": "forbidden"},
@@ -519,6 +574,11 @@ class DailySealApiTests(unittest.TestCase):
             self.assertEqual(response.get_json()["code"], "read_only")
         with self.db() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM task_progress").fetchone()[0], 0)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM task_progress_assets").fetchone()[0],
+                0,
+            )
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM daily_stats").fetchone()[0], 0)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM stages").fetchone()[0], 0)
 
@@ -876,6 +936,1245 @@ class DailySealApiTests(unittest.TestCase):
         self.assertEqual(exported_task["resultNote"], "Imported reason stays public.")
         self.assertIsNotNone(exported_task["resultRecordedAt"])
 
+    def test_later_progress_marks_final_result_stale_until_result_is_reconfirmed(self):
+        self.login_unlocked_owner()
+        task_date = server.business_today_key()
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        token = self.csrf()
+        base_time = server.now_ts()
+        with patch.object(server, "now_ts", return_value=base_time + 10):
+            first_progress = self.client.post(
+                f"/api/tasks/{task_date}/progress",
+                json={
+                    "note": "First checkpoint",
+                    "progressPercent": 50,
+                    "links": [],
+                },
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(first_progress.status_code, 201, first_progress.get_data(as_text=True))
+        with patch.object(server, "now_ts", return_value=base_time + 20):
+            first_result = self.client.post(
+                f"/api/tasks/{task_date}/result",
+                data={
+                    "resultStatus": "incomplete",
+                    "completionPercent": "60",
+                    "resultNote": "First final note remains visible.",
+                },
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(first_result.status_code, 200, first_result.get_data(as_text=True))
+        self.assertFalse(first_result.get_json()["task"]["resultIsStale"])
+
+        # A checkpoint created after the result in the very same wall-clock
+        # second must still make that result stale.
+        with patch.object(server, "now_ts", return_value=base_time + 20):
+            later_progress = self.client.post(
+                f"/api/tasks/{task_date}/progress",
+                json={
+                    "note": "Work continued after the result",
+                    "progressPercent": 80,
+                    "links": [],
+                },
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(later_progress.status_code, 201, later_progress.get_data(as_text=True))
+        stale_task = later_progress.get_json()["task"]
+        self.assertTrue(stale_task["resultIsStale"])
+        self.assertEqual(stale_task["resultNote"], "First final note remains visible.")
+        owner_task = next(
+            task
+            for task in self.client.get("/api/data").get_json()["tasks"]
+            if task["date"] == task_date
+        )
+        self.assertTrue(owner_task["resultIsStale"])
+        self.assertEqual(owner_task["resultNote"], "First final note remains visible.")
+        exported_task = json.loads(
+            self.client.get("/api/export").get_data(as_text=True)
+        )["tasks"][task_date]
+        self.assertTrue(exported_task["resultIsStale"])
+
+        viewer = server.app.test_client()
+        self.assertEqual(self.register_viewer(viewer).status_code, 200)
+        viewer_task = next(
+            task
+            for task in viewer.get("/api/data").get_json()["tasks"]
+            if task["date"] == task_date
+        )
+        self.assertTrue(viewer_task["resultIsStale"])
+        self.assertEqual(viewer_task["resultNote"], "First final note remains visible.")
+
+        with patch.object(server, "now_ts", return_value=base_time + 20):
+            reconfirmed = self.client.post(
+                f"/api/tasks/{task_date}/result",
+                data={
+                    "resultStatus": "incomplete",
+                    "completionPercent": "85",
+                    "resultNote": "Reconfirmed after the later checkpoint.",
+                },
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(reconfirmed.status_code, 200, reconfirmed.get_data(as_text=True))
+        self.assertFalse(reconfirmed.get_json()["task"]["resultIsStale"])
+        self.assertEqual(
+            reconfirmed.get_json()["task"]["resultNote"],
+            "Reconfirmed after the later checkpoint.",
+        )
+
+    def test_concurrent_same_second_result_writes_use_version_compare_and_swap(self):
+        client_a = server.app.test_client()
+        client_b = server.app.test_client()
+        self.login_unlocked_owner(client_a)
+        self.login_unlocked_owner(client_b)
+        task_date = "2026-07-22"
+        self.assertEqual(self.put_task(client_a, task_date=task_date).status_code, 200)
+        csrf_a = self.csrf(client_a)
+        csrf_b = self.csrf(client_b)
+        original_process = server.process_proof_attachment
+        ready = threading.Barrier(2)
+
+        def synchronized_process(upload):
+            attachment = original_process(upload)
+            ready.wait(timeout=10)
+            return attachment
+
+        responses = [None, None]
+
+        def write_result(index, client, csrf_token, note):
+            responses[index] = client.post(
+                f"/api/tasks/{task_date}/result",
+                data={
+                    "resultStatus": "incomplete",
+                    "completionPercent": "50",
+                    "resultNote": note,
+                },
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        # Both requests read result_version=0 before either takes the write
+        # lock; exactly one may advance it to 1.
+        same_time = server.now_ts()
+        with (
+            patch.object(server, "now_ts", return_value=same_time),
+            patch.object(
+                server,
+                "process_proof_attachment",
+                side_effect=synchronized_process,
+            ),
+        ):
+            threads = [
+                threading.Thread(
+                    target=write_result,
+                    args=(0, client_a, csrf_a, "Concurrent result A"),
+                ),
+                threading.Thread(
+                    target=write_result,
+                    args=(1, client_b, csrf_b, "Concurrent result B"),
+                ),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=20)
+                self.assertFalse(thread.is_alive())
+
+        self.assertEqual(sorted(response.status_code for response in responses), [200, 409])
+        conflict = next(response for response in responses if response.status_code == 409)
+        self.assertEqual(conflict.get_json()["code"], "proof_conflict")
+        winner_note = next(
+            response.get_json()["task"]["resultNote"]
+            for response in responses
+            if response.status_code == 200
+        )
+        with self.db() as connection:
+            stored = connection.execute(
+                "SELECT result_note, result_version, result_confirmed_progress_id "
+                "FROM tasks WHERE task_date = ?",
+                (task_date,),
+            ).fetchone()
+        self.assertEqual(stored["result_note"], winner_note)
+        self.assertEqual(stored["result_version"], 1)
+        self.assertEqual(stored["result_confirmed_progress_id"], 0)
+
+    def test_progress_entries_append_in_order_without_overwriting_the_daily_result(self):
+        self.login_unlocked_owner()
+        task_date = "2026-07-24"
+        self.assertEqual(
+            self.put_task(self.client, task_date=task_date, text="Work through the plan in blocks").status_code,
+            200,
+        )
+        first_time = server.now_ts() + 5
+        first_links = [
+            "https://drive.google.com/file/d/morning-one/view",
+            "https://example.test/morning-summary",
+        ]
+        with patch.object(server, "now_ts", return_value=first_time):
+            first_response = self.create_progress(
+                task_date=task_date,
+                note="上午完成三角形的第一部分。",
+                progress_percent=30,
+                links=first_links,
+            )
+        self.assertEqual(first_response.status_code, 201, first_response.get_data(as_text=True))
+        first = first_response.get_json()["progress"]
+        self.assertEqual(first["note"], "上午完成三角形的第一部分。")
+        self.assertEqual(first["progressPercent"], 30)
+        self.assertEqual(first["createdAt"], server.utc_iso(first_time))
+        self.assertEqual(
+            [(asset["kind"], asset["url"]) for asset in first["assets"]],
+            [("link", link) for link in first_links],
+        )
+        first_snapshot = json.loads(json.dumps(first, ensure_ascii=False))
+
+        # More than a typical compact UI fold threshold proves that links are
+        # not constrained to one field or an arbitrary low item count.
+        later_links = [f"https://example.test/afternoon/{index}" for index in range(12)]
+        second_time = first_time + 90
+        with patch.object(server, "now_ts", return_value=second_time):
+            second_response = self.create_progress(
+                task_date=task_date,
+                note="下午补完立体几何例题，晚上还会继续。",
+                progress_percent=68,
+                links=later_links,
+            )
+        self.assertEqual(second_response.status_code, 201, second_response.get_data(as_text=True))
+        payload = second_response.get_json()
+        second = payload["progress"]
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(second["createdAt"], server.utc_iso(second_time))
+        self.assertEqual([asset["url"] for asset in second["assets"]], later_links)
+
+        task = payload["task"]
+        self.assertEqual(task["resultStatus"], "pending")
+        self.assertFalse(task["done"])
+        self.assertEqual(task["resultNote"], "")
+        self.assertIsNone(task["resultRecordedAt"])
+        self.assertEqual([entry["id"] for entry in task["progressEntries"]], [first["id"], second["id"]])
+        self.assertEqual(task["progressEntries"][0], first_snapshot)
+
+        stored = self.client.get("/api/data").get_json()["tasks"][0]
+        self.assertEqual(stored["progressEntries"], task["progressEntries"])
+        with self.db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_progress WHERE task_date = ?", (task_date,)
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_progress_assets WHERE kind = 'link'"
+                ).fetchone()[0],
+                len(first_links) + len(later_links),
+            )
+
+    def test_progress_entries_created_in_the_same_second_keep_numeric_id_order(self):
+        self.login_unlocked_owner()
+        task_date = "2026-07-31"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        shared_time = server.now_ts() + 10
+        created_ids = []
+        with patch.object(server, "now_ts", return_value=shared_time):
+            for index in range(12):
+                response = self.create_progress(
+                    task_date=task_date,
+                    note=f"same-second-{index}",
+                    progress_percent=index,
+                )
+                self.assertEqual(response.status_code, 201, response.get_data(as_text=True))
+                created_ids.append(response.get_json()["progress"]["id"])
+
+        task = next(
+            item
+            for item in self.client.get("/api/data").get_json()["tasks"]
+            if item["date"] == task_date
+        )
+        self.assertEqual([entry["id"] for entry in task["progressEntries"]], created_ids)
+        self.assertEqual(
+            [entry["note"] for entry in task["progressEntries"]],
+            [f"same-second-{index}" for index in range(12)],
+        )
+        self.assertEqual(
+            {entry["createdAt"] for entry in task["progressEntries"]},
+            {server.utc_iso(shared_time)},
+        )
+
+    def test_progress_files_upload_sequentially_and_never_duplicate_existing_assets(self):
+        self.login_unlocked_owner()
+        task_date = "2026-07-25"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        created = self.create_progress(
+            task_date=task_date,
+            note="第一轮材料",
+            progress_percent=40,
+            links=["https://example.test/plan"],
+        )
+        self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+        progress_id = created.get_json()["progress"]["id"]
+        samples = [
+            (self.png_bytes(), "morning.png", "image/jpeg"),
+            (self.pdf_bytes(), "worksheet.pdf", "application/pdf"),
+            ("下午总结".encode(), "summary.txt", "text/plain"),
+        ]
+        known_file_ids = []
+        known_file_urls = []
+        for index, (raw, name, expected_mime) in enumerate(samples, start=1):
+            before_files = set(server.UPLOAD_DIR.iterdir())
+            uploaded = self.upload_progress_file(
+                progress_id,
+                raw,
+                name,
+                task_date=task_date,
+            )
+            self.assertEqual(uploaded.status_code, 201, uploaded.get_data(as_text=True))
+            progress = uploaded.get_json()["progress"]
+            file_assets = [asset for asset in progress["assets"] if asset["kind"] == "file"]
+            self.assertEqual(len(file_assets), index)
+            self.assertEqual(
+                [asset["id"] for asset in file_assets[:-1]],
+                known_file_ids,
+                "adding a file must keep, not copy or replace, earlier assets",
+            )
+            self.assertEqual(
+                [asset["proofFileUrl"] for asset in file_assets[:-1]],
+                known_file_urls,
+            )
+            newest = file_assets[-1]
+            self.assertEqual(newest["proofFileName"], name)
+            self.assertEqual(newest["proofFileMime"], expected_mime)
+            self.assertIsNotNone(newest["createdAt"])
+            known_file_ids.append(newest["id"])
+            known_file_urls.append(newest["proofFileUrl"])
+            after_files = set(server.UPLOAD_DIR.iterdir())
+            self.assertEqual(len(after_files - before_files), 1)
+            self.assertTrue(before_files.issubset(after_files))
+
+        final_progress = uploaded.get_json()["progress"]
+        self.assertEqual(len(final_progress["assets"]), 4)
+        self.assertEqual(final_progress["assets"][0]["kind"], "link")
+        for url, (_, raw_name, expected_mime) in zip(known_file_urls, samples):
+            downloaded = self.client.get(url)
+            self.assertEqual(downloaded.status_code, 200, raw_name)
+            self.assertEqual(downloaded.mimetype, expected_mime)
+            downloaded.close()
+
+        # The transport accepts exactly one file per request. The browser can
+        # choose many, but sends these requests sequentially in the background.
+        before_rejected = set(server.UPLOAD_DIR.iterdir())
+        rejected = self.client.post(
+            f"/api/tasks/{task_date}/progress/{progress_id}/files",
+            data={
+                "attachment": [
+                    (io.BytesIO(b"one"), "one.txt"),
+                    (io.BytesIO(b"two"), "two.txt"),
+                ]
+            },
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(rejected.get_json()["code"], "multiple_attachments")
+        self.assertEqual(set(server.UPLOAD_DIR.iterdir()), before_rejected)
+
+    def test_progress_and_file_retry_tokens_prevent_duplicate_storage(self):
+        self.login_unlocked_owner()
+        task_date = "2026-08-02"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        progress_token = "progress-retry-token-0001"
+        request_body = {
+            "note": "A request whose response may be lost",
+            "progressPercent": 42,
+            "links": ["https://example.test/retry"],
+            "clientRecordId": progress_token,
+        }
+        first = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json=request_body,
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(first.status_code, 201, first.get_data(as_text=True))
+        retried = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json=request_body,
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(retried.status_code, 200, retried.get_data(as_text=True))
+        self.assertTrue(retried.get_json()["idempotent"])
+        progress_id = first.get_json()["progress"]["id"]
+        self.assertEqual(retried.get_json()["progress"]["id"], progress_id)
+
+        upload_token = "upload-retry-token-000001"
+        upload = lambda raw: self.client.post(
+            f"/api/tasks/{task_date}/progress/{progress_id}/files",
+            data={
+                "attachment": (io.BytesIO(raw), "retry.txt"),
+                "clientUploadId": upload_token,
+            },
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        first_upload = upload(b"stored once")
+        self.assertEqual(first_upload.status_code, 201, first_upload.get_data(as_text=True))
+        files_after_first = set(server.UPLOAD_DIR.iterdir())
+        retried_upload = upload(b"must not create a second physical file")
+        self.assertEqual(retried_upload.status_code, 200, retried_upload.get_data(as_text=True))
+        self.assertTrue(retried_upload.get_json()["idempotent"])
+        self.assertEqual(
+            retried_upload.get_json()["asset"]["id"],
+            first_upload.get_json()["asset"]["id"],
+        )
+        self.assertEqual(set(server.UPLOAD_DIR.iterdir()), files_after_first)
+        with self.db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_progress WHERE task_date = ?", (task_date,)
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_progress_assets WHERE progress_id = ?",
+                    (progress_id,),
+                ).fetchone()[0],
+                2,
+            )
+
+    def test_empty_unchanged_progress_is_rejected_after_idempotency_recheck(self):
+        self.login_unlocked_owner()
+        task_date = "2026-08-04"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        token = self.csrf()
+        empty = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json={"note": "", "progressPercent": 0, "links": []},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(empty.status_code, 400, empty.get_data(as_text=True))
+        self.assertEqual(empty.get_json()["code"], "no_progress_change")
+        explicit_false = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json={
+                "note": "",
+                "progressPercent": 0,
+                "links": [],
+                "hasPendingFiles": False,
+            },
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(
+            explicit_false.status_code, 400, explicit_false.get_data(as_text=True)
+        )
+        self.assertEqual(explicit_false.get_json()["code"], "no_progress_change")
+        invalid_pending_files = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json={
+                "note": "",
+                "progressPercent": 0,
+                "links": [],
+                "hasPendingFiles": "yes",
+            },
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(
+            invalid_pending_files.status_code,
+            400,
+            invalid_pending_files.get_data(as_text=True),
+        )
+        self.assertEqual(
+            invalid_pending_files.get_json()["code"], "invalid_pending_files"
+        )
+
+        file_only_body = {
+            "note": "",
+            "progressPercent": 0,
+            "links": [],
+            "hasPendingFiles": True,
+            "clientRecordId": "file-only-progress-token-0001",
+        }
+        file_only = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json=file_only_body,
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(file_only.status_code, 201, file_only.get_data(as_text=True))
+        file_only_retry = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json={**file_only_body, "hasPendingFiles": False},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(
+            file_only_retry.status_code, 200, file_only_retry.get_data(as_text=True)
+        )
+        self.assertTrue(file_only_retry.get_json()["idempotent"])
+        self.assertEqual(
+            file_only_retry.get_json()["progress"]["id"],
+            file_only.get_json()["progress"]["id"],
+        )
+
+        request_body = {
+            "note": "",
+            "progressPercent": 25,
+            "links": [],
+            "clientRecordId": "progress-change-token-000001",
+        }
+        changed = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json=request_body,
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(changed.status_code, 201, changed.get_data(as_text=True))
+        retried = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json=request_body,
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(retried.status_code, 200, retried.get_data(as_text=True))
+        self.assertTrue(retried.get_json()["idempotent"])
+        self.assertEqual(
+            retried.get_json()["progress"]["id"],
+            changed.get_json()["progress"]["id"],
+        )
+
+        repeated_percent = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json={"note": "", "progressPercent": 25, "links": []},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(
+            repeated_percent.status_code, 400, repeated_percent.get_data(as_text=True)
+        )
+        self.assertEqual(repeated_percent.get_json()["code"], "no_progress_change")
+        note_only = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json={"note": "Same percent, new observation", "progressPercent": 25, "links": []},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(note_only.status_code, 201, note_only.get_data(as_text=True))
+        with self.db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_progress WHERE task_date = ?", (task_date,)
+                ).fetchone()[0],
+                3,
+            )
+
+    def test_concurrent_retry_tokens_return_one_progress_and_one_physical_file(self):
+        client_a = server.app.test_client()
+        client_b = server.app.test_client()
+        self.login_unlocked_owner(client_a)
+        self.login_unlocked_owner(client_b)
+        task_date = "2026-08-03"
+        self.assertEqual(self.put_task(client_a, task_date=task_date).status_code, 200)
+        csrf_a = self.csrf(client_a)
+        csrf_b = self.csrf(client_b)
+        progress_token = "concurrent-progress-token-0001"
+        request_body = {
+            "note": "Concurrent retry",
+            "progressPercent": 45,
+            "links": [],
+            "clientRecordId": progress_token,
+        }
+        start = threading.Barrier(2)
+        responses = [None, None]
+
+        def post_progress(index, client, csrf_token):
+            start.wait(timeout=10)
+            responses[index] = client.post(
+                f"/api/tasks/{task_date}/progress",
+                json=request_body,
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        threads = [
+            threading.Thread(target=post_progress, args=(0, client_a, csrf_a)),
+            threading.Thread(target=post_progress, args=(1, client_b, csrf_b)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sorted(response.status_code for response in responses), [200, 201])
+        progress_ids = {response.get_json()["progress"]["id"] for response in responses}
+        self.assertEqual(len(progress_ids), 1)
+        progress_id = progress_ids.pop()
+
+        # Force both requests past validation and physical staging before
+        # either reaches BEGIN IMMEDIATE. The losing retry must remove only its
+        # own staged file and return the winning asset.
+        original_process = server.process_proof_attachment
+        file_barrier = threading.Barrier(2)
+
+        def synchronized_process(upload):
+            attachment = original_process(upload)
+            file_barrier.wait(timeout=10)
+            return attachment
+
+        file_responses = [None, None]
+        upload_token = "concurrent-upload-token-000001"
+
+        def post_file(index, client, csrf_token, raw):
+            file_responses[index] = client.post(
+                f"/api/tasks/{task_date}/progress/{progress_id}/files",
+                data={
+                    "attachment": (io.BytesIO(raw), "concurrent.txt"),
+                    "clientUploadId": upload_token,
+                },
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        with patch.object(server, "process_proof_attachment", side_effect=synchronized_process):
+            file_threads = [
+                threading.Thread(
+                    target=post_file,
+                    args=(0, client_a, csrf_a, b"winner candidate a"),
+                ),
+                threading.Thread(
+                    target=post_file,
+                    args=(1, client_b, csrf_b, b"winner candidate b"),
+                ),
+            ]
+            for thread in file_threads:
+                thread.start()
+            for thread in file_threads:
+                thread.join(timeout=20)
+                self.assertFalse(thread.is_alive())
+
+        self.assertEqual(
+            sorted(response.status_code for response in file_responses), [200, 201]
+        )
+        asset_ids = {response.get_json()["asset"]["id"] for response in file_responses}
+        self.assertEqual(len(asset_ids), 1)
+        self.assertEqual(len(list(server.UPLOAD_DIR.iterdir())), 1)
+        with self.db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_progress WHERE task_date = ?", (task_date,)
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_progress_assets "
+                    "WHERE progress_id = ? AND kind = 'file'",
+                    (progress_id,),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_each_progress_file_has_an_independent_exact_10_mib_limit(self):
+        self.login_unlocked_owner()
+        task_date = "2026-07-26"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        progress = self.create_progress(
+            task_date=task_date,
+            note="Large evidence boundary",
+            progress_percent=50,
+        ).get_json()["progress"]
+
+        exact = b"a" * (10 * 1024 * 1024)
+        accepted = self.upload_progress_file(
+            progress["id"], exact, "exact.txt", task_date=task_date
+        )
+        self.assertEqual(accepted.status_code, 201, accepted.get_data(as_text=True))
+        accepted_asset = next(
+            asset
+            for asset in accepted.get_json()["progress"]["assets"]
+            if asset["kind"] == "file"
+        )
+        self.assertEqual(accepted_asset["proofFileSize"], 10 * 1024 * 1024)
+        files_after_exact = set(server.UPLOAD_DIR.iterdir())
+        self.assertEqual(len(files_after_exact), 1)
+
+        rejected = self.upload_progress_file(
+            progress["id"], exact + b"b", "too-large.txt", task_date=task_date
+        )
+        self.assertEqual(rejected.status_code, 413, rejected.get_data(as_text=True))
+        self.assertEqual(rejected.get_json()["code"], "attachment_too_large")
+        self.assertEqual(set(server.UPLOAD_DIR.iterdir()), files_after_exact)
+        with self.db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_progress_assets WHERE progress_id = ? AND kind = 'file'",
+                    (progress["id"],),
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_viewer_sees_public_progress_assets_but_not_future_progress(self):
+        owner = server.app.test_client()
+        self.login_unlocked_owner(owner)
+        today = "2026-07-27"
+        future = "2026-07-28"
+        for task_date in (today, future):
+            self.assertEqual(self.put_task(owner, task_date=task_date).status_code, 200)
+        current_progress = self.create_progress(
+            owner,
+            task_date=today,
+            note="今天公开的进度备注",
+            progress_percent=45,
+            links=["https://example.test/today-a", "https://example.test/today-b"],
+        ).get_json()["progress"]
+        current_file = self.upload_progress_file(
+            current_progress["id"],
+            self.pdf_bytes(),
+            "today.pdf",
+            client=owner,
+            task_date=today,
+        ).get_json()["progress"]
+        current_file_url = next(
+            asset["proofFileUrl"] for asset in current_file["assets"] if asset["kind"] == "file"
+        )
+        future_progress = self.create_progress(
+            owner,
+            task_date=future,
+            note="future progress must stay hidden",
+            progress_percent=20,
+            links=["https://example.test/future"],
+        ).get_json()["progress"]
+        future_file = self.upload_progress_file(
+            future_progress["id"],
+            b"future evidence",
+            "future.txt",
+            client=owner,
+            task_date=future,
+        ).get_json()["progress"]
+        future_file_url = next(
+            asset["proofFileUrl"] for asset in future_file["assets"] if asset["kind"] == "file"
+        )
+
+        viewer = server.app.test_client()
+        self.assertEqual(self.register_viewer(viewer).status_code, 200)
+        with patch.object(server, "business_today_key", return_value=today):
+            response = viewer.get("/api/data")
+            self.assertEqual(response.status_code, 200)
+            tasks = {task["date"]: task for task in response.get_json()["tasks"]}
+            self.assertEqual(set(tasks), {today})
+            self.assertEqual(tasks[today]["resultStatus"], "pending")
+            self.assertEqual(tasks[today]["progressEntries"][0]["note"], "今天公开的进度备注")
+            self.assertEqual(len(tasks[today]["progressEntries"][0]["assets"]), 3)
+            visible = viewer.get(current_file_url)
+            hidden = viewer.get(future_file_url)
+        self.assertEqual(visible.status_code, 200)
+        visible.close()
+        self.assertEqual(hidden.status_code, 404)
+        self.assertEqual(hidden.get_json()["code"], "not_found")
+        self.assertNotIn("future progress must stay hidden", response.get_data(as_text=True))
+
+    def test_shared_progress_file_is_visible_when_any_reference_date_is_visible(self):
+        owner = server.app.test_client()
+        self.login_unlocked_owner(owner)
+        today = "2026-07-27"
+        future = "2026-07-28"
+        for task_date in (today, future):
+            self.assertEqual(self.put_task(owner, task_date=task_date).status_code, 200)
+
+        # Insert the future reference first so authorization cannot depend on
+        # whichever matching row SQLite happens to return first.
+        future_progress = self.create_progress(
+            owner,
+            task_date=future,
+            note="Future reference created first",
+            progress_percent=20,
+        ).get_json()["progress"]
+        shared_raw = b"one immutable file referenced by two dates"
+        future_shared = self.upload_progress_file(
+            future_progress["id"],
+            shared_raw,
+            "future-shared.txt",
+            client=owner,
+            task_date=future,
+        ).get_json()["asset"]
+        future_only = self.upload_progress_file(
+            future_progress["id"],
+            b"future only bytes",
+            "future-only.txt",
+            client=owner,
+            task_date=future,
+        ).get_json()["asset"]
+
+        today_progress = self.create_progress(
+            owner,
+            task_date=today,
+            note="Visible reference created second",
+            progress_percent=40,
+        ).get_json()["progress"]
+        today_shared = self.upload_progress_file(
+            today_progress["id"],
+            shared_raw,
+            "today-shared.txt",
+            client=owner,
+            task_date=today,
+        ).get_json()["asset"]
+        self.assertEqual(
+            future_shared["proofFileUrl"], today_shared["proofFileUrl"]
+        )
+        self.assertEqual(len(list(server.UPLOAD_DIR.iterdir())), 2)
+
+        viewer = server.app.test_client()
+        self.assertEqual(self.register_viewer(viewer).status_code, 200)
+        with patch.object(server, "business_today_key", return_value=today):
+            visible_shared = viewer.get(today_shared["proofFileUrl"])
+            hidden_future_only = viewer.get(future_only["proofFileUrl"])
+        self.assertEqual(visible_shared.status_code, 200)
+        visible_shared.close()
+        self.assertEqual(hidden_future_only.status_code, 404)
+        self.assertEqual(hidden_future_only.get_json()["code"], "not_found")
+
+    def test_progress_timeline_and_asset_metadata_are_exported(self):
+        self.login_unlocked_owner()
+        task_date = "2026-07-29"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        first = self.create_progress(
+            task_date=task_date,
+            note="First checkpoint",
+            progress_percent=25,
+            links=["https://example.test/checkpoint/one"],
+        ).get_json()["progress"]
+        uploaded = self.upload_progress_file(
+            first["id"], self.pdf_bytes(), "checkpoint.pdf", task_date=task_date
+        )
+        self.assertEqual(uploaded.status_code, 201, uploaded.get_data(as_text=True))
+        self.assertEqual(
+            self.create_progress(
+                task_date=task_date,
+                note="Second checkpoint",
+                progress_percent=75,
+                links=[
+                    "https://example.test/checkpoint/two",
+                    "https://example.test/checkpoint/three",
+                ],
+            ).status_code,
+            201,
+        )
+
+        exported = self.client.get("/api/export")
+        self.assertEqual(exported.status_code, 200)
+        task = json.loads(exported.get_data(as_text=True))["tasks"][task_date]
+        self.assertEqual(task["resultStatus"], "pending")
+        self.assertEqual([entry["note"] for entry in task["progressEntries"]], [
+            "First checkpoint",
+            "Second checkpoint",
+        ])
+        self.assertEqual([entry["progressPercent"] for entry in task["progressEntries"]], [25, 75])
+        first_assets = task["progressEntries"][0]["assets"]
+        self.assertEqual([asset["kind"] for asset in first_assets], ["link", "file"])
+        self.assertEqual(first_assets[0]["url"], "https://example.test/checkpoint/one")
+        self.assertEqual(first_assets[1]["proofFileName"], "checkpoint.pdf")
+        self.assertEqual(first_assets[1]["proofFileMime"], "application/pdf")
+        self.assertGreater(first_assets[1]["proofFileSize"], 0)
+        self.assertIsNotNone(first_assets[1]["createdAt"])
+
+    def test_progress_text_and_links_round_trip_idempotently_while_files_are_reported(self):
+        self.login_unlocked_owner()
+        task_date = "2026-07-20"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        first = self.create_progress(
+            task_date=task_date,
+            note="Morning checkpoint",
+            progress_percent=30,
+            links=["https://example.test/morning"],
+        ).get_json()["progress"]
+        self.assertEqual(
+            self.upload_progress_file(
+                first["id"], self.pdf_bytes(), "morning.pdf", task_date=task_date
+            ).status_code,
+            201,
+        )
+        self.assertEqual(
+            self.create_progress(
+                task_date=task_date,
+                note="Evening checkpoint",
+                progress_percent=80,
+                links=[
+                    "https://example.test/evening/one",
+                    "https://example.test/evening/two",
+                ],
+            ).status_code,
+            201,
+        )
+
+        exported = json.loads(self.client.get("/api/export").get_data(as_text=True))
+        self.assertEqual(exported["formatVersion"], 2)
+        self.assertFalse(exported["attachmentsIncluded"])
+        self.assertEqual(
+            self.client.delete(
+                f"/api/tasks/{task_date}",
+                headers={"X-CSRF-Token": self.csrf()},
+            ).status_code,
+            200,
+        )
+        self.assertEqual(list(server.UPLOAD_DIR.iterdir()), [])
+
+        first_import = self.client.post(
+            "/api/import",
+            json={"data": exported},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(first_import.status_code, 200, first_import.get_data(as_text=True))
+        self.assertEqual(
+            first_import.get_json(),
+            {
+                "ok": True,
+                "importedTasks": 1,
+                "importedProgressEntries": 2,
+                "importedLinks": 3,
+                "skippedAttachments": 1,
+                "skippedMismatchedProgressEntries": 0,
+            },
+        )
+        restored = next(
+            task
+            for task in self.client.get("/api/data").get_json()["tasks"]
+            if task["date"] == task_date
+        )
+        self.assertEqual(
+            [entry["note"] for entry in restored["progressEntries"]],
+            ["Morning checkpoint", "Evening checkpoint"],
+        )
+        self.assertEqual(
+            [asset["url"] for entry in restored["progressEntries"] for asset in entry["assets"]],
+            [
+                "https://example.test/morning",
+                "https://example.test/evening/one",
+                "https://example.test/evening/two",
+            ],
+        )
+        self.assertFalse(
+            any(
+                asset["kind"] == "file"
+                for entry in restored["progressEntries"]
+                for asset in entry["assets"]
+            )
+        )
+
+        repeated = self.client.post(
+            "/api/import",
+            json={"data": exported},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.get_data(as_text=True))
+        self.assertEqual(repeated.get_json()["importedTasks"], 0)
+        self.assertEqual(repeated.get_json()["importedProgressEntries"], 0)
+        self.assertEqual(repeated.get_json()["importedLinks"], 0)
+        self.assertEqual(repeated.get_json()["skippedAttachments"], 1)
+        with self.db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_progress WHERE task_date = ?", (task_date,)
+                ).fetchone()[0],
+                2,
+            )
+
+    def test_export_import_preserves_stale_and_fresh_result_confirmation_positions(self):
+        self.login_unlocked_owner()
+        stale_date = "2026-07-23"
+        fresh_date = "2026-07-24"
+        token = self.csrf()
+        same_time = server.now_ts() + 10
+        for task_date in (stale_date, fresh_date):
+            self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+            with patch.object(server, "now_ts", return_value=same_time):
+                created = self.client.post(
+                    f"/api/tasks/{task_date}/progress",
+                    json={
+                        "note": f"Initial progress {task_date}",
+                        "progressPercent": 50,
+                        "links": [],
+                    },
+                    headers={"X-CSRF-Token": token},
+                )
+                self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+                result = self.client.post(
+                    f"/api/tasks/{task_date}/result",
+                    data={
+                        "resultStatus": "incomplete",
+                        "completionPercent": "60",
+                        "resultNote": f"Result for {task_date}",
+                    },
+                    headers={"X-CSRF-Token": token},
+                )
+                self.assertEqual(result.status_code, 200, result.get_data(as_text=True))
+        with patch.object(server, "now_ts", return_value=same_time):
+            later = self.client.post(
+                f"/api/tasks/{stale_date}/progress",
+                json={
+                    "note": "Later progress in the same second",
+                    "progressPercent": 75,
+                    "links": [],
+                },
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(later.status_code, 201, later.get_data(as_text=True))
+        self.assertTrue(later.get_json()["task"]["resultIsStale"])
+
+        exported = json.loads(self.client.get("/api/export").get_data(as_text=True))
+        stale_export = exported["tasks"][stale_date]
+        fresh_export = exported["tasks"][fresh_date]
+        self.assertTrue(stale_export["resultIsStale"])
+        self.assertFalse(fresh_export["resultIsStale"])
+        self.assertEqual(stale_export["resultConfirmedProgressCount"], 1)
+        self.assertEqual(fresh_export["resultConfirmedProgressCount"], 1)
+        recorded_times = {
+            stale_date: stale_export["resultRecordedAt"],
+            fresh_date: fresh_export["resultRecordedAt"],
+        }
+
+        with self.db() as connection:
+            connection.execute(
+                "DELETE FROM task_progress_assets WHERE progress_id IN ("
+                "SELECT id FROM task_progress WHERE task_date IN (?, ?)"
+                ")",
+                (stale_date, fresh_date),
+            )
+            connection.execute(
+                "DELETE FROM task_progress WHERE task_date IN (?, ?)",
+                (stale_date, fresh_date),
+            )
+            connection.execute(
+                "DELETE FROM tasks WHERE task_date IN (?, ?)",
+                (stale_date, fresh_date),
+            )
+        restored_response = self.client.post(
+            "/api/import",
+            json={"data": exported},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(
+            restored_response.status_code,
+            200,
+            restored_response.get_data(as_text=True),
+        )
+        restored_tasks = {
+            task["date"]: task for task in self.client.get("/api/data").get_json()["tasks"]
+        }
+        self.assertTrue(restored_tasks[stale_date]["resultIsStale"])
+        self.assertFalse(restored_tasks[fresh_date]["resultIsStale"])
+        self.assertEqual(
+            restored_tasks[stale_date]["resultRecordedAt"], recorded_times[stale_date]
+        )
+        self.assertEqual(
+            restored_tasks[fresh_date]["resultRecordedAt"], recorded_times[fresh_date]
+        )
+        self.assertEqual(
+            restored_tasks[stale_date]["resultConfirmedProgressCount"], 1
+        )
+        self.assertEqual(
+            restored_tasks[fresh_date]["resultConfirmedProgressCount"], 1
+        )
+
+    def test_progress_asset_and_task_deletion_remove_only_their_physical_files(self):
+        self.login_unlocked_owner()
+        task_date = "2026-07-30"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        progress = self.create_progress(
+            task_date=task_date,
+            note="Files that can be corrected",
+            progress_percent=55,
+            links=["https://example.test/keep-until-task-delete"],
+        ).get_json()["progress"]
+        first_upload = self.upload_progress_file(
+            progress["id"], b"first attachment", "first.txt", task_date=task_date
+        ).get_json()["progress"]
+        first_asset = next(asset for asset in first_upload["assets"] if asset["kind"] == "file")
+        first_path = server.UPLOAD_DIR / first_asset["proofFileUrl"].rsplit("/", 1)[-1]
+        self.assertTrue(first_path.is_file())
+
+        second_upload = self.upload_progress_file(
+            progress["id"], self.pdf_bytes(), "second.pdf", task_date=task_date
+        ).get_json()["progress"]
+        file_assets = [asset for asset in second_upload["assets"] if asset["kind"] == "file"]
+        self.assertEqual(file_assets[0]["id"], first_asset["id"])
+        second_asset = file_assets[1]
+        second_path = server.UPLOAD_DIR / second_asset["proofFileUrl"].rsplit("/", 1)[-1]
+        self.assertEqual(set(server.UPLOAD_DIR.iterdir()), {first_path, second_path})
+
+        deleted = self.client.delete(
+            f"/api/tasks/{task_date}/progress/{progress['id']}/assets/{first_asset['id']}",
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.get_data(as_text=True))
+        self.assertFalse(first_path.exists())
+        self.assertTrue(second_path.exists())
+        remaining = deleted.get_json()["progress"]["assets"]
+        self.assertNotIn(first_asset["id"], {asset["id"] for asset in remaining})
+        self.assertIn(second_asset["id"], {asset["id"] for asset in remaining})
+
+        files_before_failure = set(server.UPLOAD_DIR.iterdir())
+        original_get_db = server.get_db
+        failure_token = self.csrf()
+
+        class FailingProgressAssetDatabase:
+            def __init__(self, database):
+                self.database = database
+
+            def execute(self, sql, parameters=()):
+                if "INSERT INTO task_progress_assets" in sql:
+                    raise sqlite3.OperationalError("forced progress asset failure")
+                return self.database.execute(sql, parameters)
+
+            def rollback(self):
+                self.database.rollback()
+
+            def __getattr__(self, name):
+                return getattr(self.database, name)
+
+        with patch.object(
+            server,
+            "get_db",
+            side_effect=lambda: FailingProgressAssetDatabase(original_get_db()),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.client.post(
+                    f"/api/tasks/{task_date}/progress/{progress['id']}/files",
+                    data={"attachment": (io.BytesIO(b"orphan candidate"), "failed.txt")},
+                    headers={"X-CSRF-Token": failure_token},
+                )
+        self.assertEqual(set(server.UPLOAD_DIR.iterdir()), files_before_failure)
+
+        removed_task = self.client.delete(
+            f"/api/tasks/{task_date}",
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(removed_task.status_code, 200, removed_task.get_data(as_text=True))
+        self.assertFalse(second_path.exists())
+        self.assertEqual(list(server.UPLOAD_DIR.iterdir()), [])
+        with self.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM task_progress").fetchone()[0], 0)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM task_progress_assets").fetchone()[0],
+                0,
+            )
+
+    def test_identical_progress_uploads_share_disk_bytes_until_the_last_reference(self):
+        self.login_unlocked_owner()
+        task_date = "2026-07-21"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        first_progress = self.create_progress(
+            task_date=task_date,
+            note="First evidence checkpoint",
+            progress_percent=40,
+        ).get_json()["progress"]
+        second_progress = self.create_progress(
+            task_date=task_date,
+            note="Second evidence checkpoint",
+            progress_percent=60,
+        ).get_json()["progress"]
+        raw = b"the same immutable evidence bytes"
+        first_response = self.upload_progress_file(
+            first_progress["id"], raw, "first-name.txt", task_date=task_date
+        )
+        second_response = self.upload_progress_file(
+            second_progress["id"], raw, "second-name.txt", task_date=task_date
+        )
+        self.assertEqual(first_response.status_code, 201, first_response.get_data(as_text=True))
+        self.assertEqual(second_response.status_code, 201, second_response.get_data(as_text=True))
+        first_asset = first_response.get_json()["asset"]
+        second_asset = second_response.get_json()["asset"]
+        self.assertNotEqual(first_asset["id"], second_asset["id"])
+        self.assertEqual(first_asset["proofFileUrl"], second_asset["proofFileUrl"])
+        self.assertEqual(first_asset["proofFileName"], "first-name.txt")
+        self.assertEqual(second_asset["proofFileName"], "second-name.txt")
+        self.assertEqual(len(list(server.UPLOAD_DIR.iterdir())), 1)
+        shared_url = first_asset["proofFileUrl"]
+        shared_path = server.UPLOAD_DIR / shared_url.rsplit("/", 1)[-1]
+
+        # A failed attempt to add the same source removes only its newly
+        # processed staging file; it must never unlink the shared committed file.
+        original_get_db = server.get_db
+
+        class FailingSharedAssetDatabase:
+            def __init__(self, database):
+                self.database = database
+
+            def execute(self, sql, parameters=()):
+                if "INSERT INTO task_progress_assets" in sql:
+                    raise sqlite3.OperationalError("forced shared asset failure")
+                return self.database.execute(sql, parameters)
+
+            def __getattr__(self, name):
+                return getattr(self.database, name)
+
+        with patch.object(
+            server,
+            "get_db",
+            side_effect=lambda: FailingSharedAssetDatabase(original_get_db()),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.client.post(
+                    f"/api/tasks/{task_date}/progress/{second_progress['id']}/files",
+                    data={"attachment": (io.BytesIO(raw), "failed-copy.txt")},
+                    headers={"X-CSRF-Token": self.csrf()},
+                )
+        self.assertEqual(list(server.UPLOAD_DIR.iterdir()), [shared_path])
+        still_available = self.client.get(shared_url)
+        self.assertEqual(still_available.status_code, 200)
+        still_available.close()
+
+        first_delete = self.client.delete(
+            f"/api/tasks/{task_date}/progress/{first_progress['id']}/assets/{first_asset['id']}",
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(first_delete.status_code, 200, first_delete.get_data(as_text=True))
+        self.assertTrue(shared_path.is_file())
+        remaining_download = self.client.get(shared_url)
+        self.assertEqual(remaining_download.status_code, 200)
+        remaining_download.close()
+
+        last_delete = self.client.delete(
+            f"/api/tasks/{task_date}/progress/{second_progress['id']}/assets/{second_asset['id']}",
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(last_delete.status_code, 200, last_delete.get_data(as_text=True))
+        self.assertFalse(shared_path.exists())
+        self.assertEqual(list(server.UPLOAD_DIR.iterdir()), [])
+
+        # Equal bytes with different validated types must not be deduplicated
+        # into a file carrying the wrong extension or MIME metadata.
+        text_upload = self.upload_progress_file(
+            first_progress["id"], raw, "evidence.txt", task_date=task_date
+        )
+        csv_upload = self.upload_progress_file(
+            second_progress["id"], raw, "evidence.csv", task_date=task_date
+        )
+        self.assertEqual(text_upload.status_code, 201, text_upload.get_data(as_text=True))
+        self.assertEqual(csv_upload.status_code, 201, csv_upload.get_data(as_text=True))
+        self.assertEqual(text_upload.get_json()["asset"]["proofFileMime"], "text/plain")
+        self.assertEqual(csv_upload.get_json()["asset"]["proofFileMime"], "text/csv")
+        self.assertNotEqual(
+            text_upload.get_json()["asset"]["proofFileUrl"],
+            csv_upload.get_json()["asset"]["proofFileUrl"],
+        )
+        self.assertEqual(len(list(server.UPLOAD_DIR.iterdir())), 2)
+
+    def test_startup_cleanup_removes_only_unreferenced_internal_uploads(self):
+        self.login_unlocked_owner()
+        task_date = "2026-08-01"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        progress = self.create_progress(
+            task_date=task_date,
+            note="Keep the referenced file",
+            progress_percent=10,
+        ).get_json()["progress"]
+        uploaded = self.upload_progress_file(
+            progress["id"], b"referenced", "referenced.txt", task_date=task_date
+        ).get_json()["progress"]
+        referenced_asset = next(
+            asset for asset in uploaded["assets"] if asset["kind"] == "file"
+        )
+        referenced = server.UPLOAD_DIR / referenced_asset["proofFileUrl"].rsplit("/", 1)[-1]
+        orphan = server.UPLOAD_DIR / ("f" * 32 + ".txt")
+        interrupted = server.UPLOAD_DIR / ("." + "e" * 32 + ".txt.tmp")
+        unrelated = server.UPLOAD_DIR / "operator-note.bin"
+        orphan.write_bytes(b"orphan")
+        interrupted.write_bytes(b"interrupted")
+        unrelated.write_bytes(b"not an application-managed attachment")
+
+        server.init_db()
+
+        self.assertTrue(referenced.is_file())
+        self.assertFalse(orphan.exists())
+        self.assertFalse(interrupted.exists())
+        self.assertTrue(unrelated.is_file())
+
     def test_stats_legacy_payload_preserves_existing_distraction_log(self):
         self.login_unlocked_owner()
         initial = self.client.put(
@@ -904,18 +2203,52 @@ class DailySealApiTests(unittest.TestCase):
             },
         )
 
-    def test_attachment_limits_are_consistent_at_30_mib(self):
-        self.assertEqual(server.MAX_ATTACHMENT_BYTES, 30 * 1024 * 1024)
-        self.assertEqual(server.app.config["MAX_CONTENT_LENGTH"], 32 * 1024 * 1024)
+    def test_attachment_limits_are_consistent_at_10_mib_per_file(self):
+        self.assertEqual(server.MAX_ATTACHMENT_BYTES, 10 * 1024 * 1024)
+        self.assertEqual(server.app.config["MAX_CONTENT_LENGTH"], 12 * 1024 * 1024)
 
         app_script = (WORK_DIR / "app" / "static" / "app.js").read_text(encoding="utf-8")
         index_html = (WORK_DIR / "app" / "static" / "index.html").read_text(encoding="utf-8")
         nginx_config = (WORK_DIR / "deploy" / "nginx-daily-seal.conf").read_text(encoding="utf-8")
-        self.assertIn("const MAX_PROOF_FILE_BYTES = 30 * 1024 * 1024;", app_script)
-        self.assertIn('setMessage(ui.message, "附件不能超过 30 MB。");', app_script)
-        self.assertEqual(index_html.count("最大 30 MB；HEIC 请转为 JPG"), 2)
-        self.assertNotIn("最大 10 MB", index_html)
-        self.assertIn("client_max_body_size 32m;", nginx_config)
+        self.assertIn("const MAX_PROOF_FILE_BYTES = 10 * 1024 * 1024;", app_script)
+        self.assertIn("10 MB", app_script)
+        self.assertNotIn("30 MB", app_script)
+        self.assertGreaterEqual(index_html.count("10 MB"), 2)
+        self.assertNotIn("30 MB", index_html)
+        self.assertIn("client_max_body_size 12m;", nginx_config)
+
+    def test_blue_day1_is_limited_to_browser_title_and_top_brand(self):
+        index_html = (WORK_DIR / "app" / "static" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn("<title>Blue Day1</title>", index_html)
+        self.assertIn('aria-label="Blue Day1 首页"', index_html)
+        self.assertIn("<strong>Blue</strong>", index_html)
+        self.assertIn('class="mobile-brand"', index_html)
+        self.assertIn("Blue Day1</p>", index_html)
+        self.assertIn('<h1 id="visitor-page-title">Blue 的每日记录</h1>', index_html)
+        self.assertIn('id="brand-subtitle">Day1</span>', index_html)
+        self.assertIn('id="visitor-context-line">沿着今天留下的轨迹，看看事情正走到哪里。</p>', index_html)
+        self.assertIn("Blue <span aria-hidden=\"true\">·</span> 看清下一步，安静地继续", index_html)
+
+    def test_progress_and_result_forms_use_unified_remarks_and_multi_file_selection(self):
+        index_html = (WORK_DIR / "app" / "static" / "index.html").read_text(encoding="utf-8")
+        app_script = (WORK_DIR / "app" / "static" / "app.js").read_text(encoding="utf-8")
+        combined = index_html + "\n" + app_script
+
+        self.assertNotIn("未完成原因", combined)
+        self.assertNotIn("完成备注", combined)
+        self.assertRegex(
+            index_html,
+            r'<label[^>]+id="result-note-label"[^>]*>\s*备注\s*</label>',
+        )
+        self.assertIn('id="progress-dialog"', index_html)
+        self.assertRegex(
+            index_html,
+            r'<input[^>]+id="progress-file-input"[^>]+multiple(?:\s|>)',
+        )
+        self.assertIn('id="progress-links-input"', index_html)
+        self.assertIn("每行粘贴一个", index_html)
+        self.assertIn("每个文件最大 10 MB", index_html)
 
     def test_completion_rejects_missing_invalid_unsupported_and_oversize_proof(self):
         self.login_unlocked_owner()
@@ -1115,6 +2448,33 @@ class DailySealApiTests(unittest.TestCase):
             self.assertLessEqual(decoded.width, 2400)
             self.assertLessEqual(decoded.height, 2400)
         proof.close()
+
+    def test_highly_compressed_oversized_png_is_rejected_before_pixel_decode(self):
+        self.login_unlocked_owner()
+        task_date = "2026-02-13"
+        self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
+        image = server.Image.new("1", (5000, 4200), 1)
+        output = io.BytesIO()
+        image.save(output, format="PNG", optimize=True)
+        image.close()
+        raw = output.getvalue()
+        self.assertLess(len(raw), server.MAX_ATTACHMENT_BYTES)
+        self.assertGreater(5000 * 4200, server.MAX_NON_JPEG_IMAGE_PIXELS)
+
+        with patch.object(
+            server.ImageOps,
+            "exif_transpose",
+            wraps=server.ImageOps.exif_transpose,
+        ) as transpose:
+            rejected = self.client.post(
+                f"/api/tasks/{task_date}/complete",
+                data={"attachment": (io.BytesIO(raw), "compressed.png")},
+                headers={"X-CSRF-Token": self.csrf()},
+            )
+        self.assertEqual(rejected.status_code, 400, rejected.get_data(as_text=True))
+        self.assertEqual(rejected.get_json()["code"], "invalid_attachment")
+        transpose.assert_not_called()
+        self.assertEqual(list(server.UPLOAD_DIR.iterdir()), [])
 
     def test_attachment_filenames_are_safely_preserved_and_truncated(self):
         self.login_unlocked_owner()
@@ -1332,6 +2692,8 @@ class DailySealApiTests(unittest.TestCase):
         with self.db() as connection:
             connection.executescript(
                 """
+                DROP TABLE task_progress_assets;
+                DROP TABLE task_progress;
                 DROP TABLE tasks;
                 CREATE TABLE tasks (
                     task_date TEXT PRIMARY KEY,
@@ -1342,6 +2704,25 @@ class DailySealApiTests(unittest.TestCase):
                     proof_text TEXT,
                     proof_file TEXT,
                     proof_mime TEXT
+                );
+                CREATE TABLE task_progress (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_date TEXT NOT NULL REFERENCES tasks(task_date) ON DELETE CASCADE,
+                    note TEXT NOT NULL DEFAULT '',
+                    progress_percent INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE task_progress_assets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    progress_id INTEGER NOT NULL REFERENCES task_progress(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    kind TEXT NOT NULL,
+                    proof_url TEXT,
+                    proof_file TEXT,
+                    proof_mime TEXT,
+                    proof_original_name TEXT,
+                    proof_size INTEGER,
+                    created_at INTEGER NOT NULL
                 );
                 DROP TABLE stages;
                 CREATE TABLE stages (
@@ -1380,6 +2761,16 @@ class DailySealApiTests(unittest.TestCase):
                 "VALUES ('legacy stage', 'completed', ?, '2026-01-01', ?, ?, '2026-01-02', 2, ?, 'image/jpeg')",
                 (legacy_created_at, legacy_created_at, legacy_created_at, legacy_stage_file),
             )
+            progress_id = connection.execute(
+                "INSERT INTO task_progress(task_date, note, progress_percent, created_at) "
+                "VALUES ('2026-01-15', 'legacy checkpoint', 35, ?)",
+                (legacy_created_at,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO task_progress_assets(progress_id, position, kind, proof_url, created_at) "
+                "VALUES (?, 0, 'link', 'https://example.test/legacy-progress', ?)",
+                (progress_id, legacy_created_at),
+            )
             connection.execute(
                 "INSERT INTO daily_stats(stat_date, poms, note, updated_at) "
                 "VALUES ('2026-01-15', 5, 'legacy private note', ?)",
@@ -1393,7 +2784,8 @@ class DailySealApiTests(unittest.TestCase):
             }
             row = connection.execute(
                 "SELECT task_date, text, created_at, proof_text, proof_url, "
-                "proof_original_name, proof_size FROM tasks"
+                "proof_original_name, proof_size, result_version, "
+                "result_confirmed_progress_id FROM tasks"
             ).fetchone()
             stage_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(stages)").fetchall()
@@ -1408,9 +2800,34 @@ class DailySealApiTests(unittest.TestCase):
             stat_row = connection.execute(
                 "SELECT stat_date, poms, note, distractions FROM daily_stats"
             ).fetchone()
+            progress_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(task_progress)").fetchall()
+            }
+            asset_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(task_progress_assets)"
+                ).fetchall()
+            }
+            progress_row = connection.execute(
+                "SELECT task_date, note, progress_percent, client_key FROM task_progress"
+            ).fetchone()
+            progress_asset_row = connection.execute(
+                "SELECT kind, proof_url, client_key, source_sha256, source_size "
+                "FROM task_progress_assets"
+            ).fetchone()
+            index_names = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
         self.assertIn("proof_url", columns)
         self.assertIn("proof_original_name", columns)
         self.assertIn("proof_size", columns)
+        self.assertIn("result_version", columns)
+        self.assertIn("result_confirmed_progress_id", columns)
         self.assertIn("proof_original_name", stage_columns)
         self.assertIn("proof_size", stage_columns)
         self.assertIn("distractions", stat_columns)
@@ -1421,12 +2838,32 @@ class DailySealApiTests(unittest.TestCase):
         self.assertIsNone(row["proof_url"])
         self.assertEqual(row["proof_original_name"], "证明图片.jpg")
         self.assertEqual(row["proof_size"], len(legacy_image))
+        self.assertEqual(row["result_version"], 0)
+        self.assertIsNone(row["result_confirmed_progress_id"])
         self.assertEqual(stage_row["proof_original_name"], "证明图片.jpg")
         self.assertEqual(stage_row["proof_size"], len(legacy_image))
         self.assertEqual(stat_row["stat_date"], "2026-01-15")
         self.assertEqual(stat_row["poms"], 5)
         self.assertEqual(stat_row["note"], "legacy private note")
         self.assertEqual(stat_row["distractions"], "")
+        self.assertIn("client_key", progress_columns)
+        self.assertTrue(
+            {"client_key", "source_sha256", "source_size"}.issubset(asset_columns)
+        )
+        self.assertEqual(progress_row["task_date"], "2026-01-15")
+        self.assertEqual(progress_row["note"], "legacy checkpoint")
+        self.assertEqual(progress_row["progress_percent"], 35)
+        self.assertIsNone(progress_row["client_key"])
+        self.assertEqual(progress_asset_row["kind"], "link")
+        self.assertEqual(
+            progress_asset_row["proof_url"], "https://example.test/legacy-progress"
+        )
+        self.assertIsNone(progress_asset_row["client_key"])
+        self.assertIsNone(progress_asset_row["source_sha256"])
+        self.assertIsNone(progress_asset_row["source_size"])
+        self.assertIn("idx_task_progress_client_key", index_names)
+        self.assertIn("idx_task_progress_assets_client_key", index_names)
+        self.assertIn("idx_task_progress_assets_source", index_names)
 
         self.login_unlocked_owner()
         task = self.client.get("/api/data").get_json()["tasks"][0]
@@ -1435,6 +2872,7 @@ class DailySealApiTests(unittest.TestCase):
         self.assertEqual(task["proofFileName"], "证明图片.jpg")
         self.assertEqual(task["proofFileSize"], len(legacy_image))
         self.assertEqual(task["proofImageUrl"], task["proofFileUrl"])
+        self.assertEqual(task["progressEntries"][0]["note"], "legacy checkpoint")
         stats = self.client.get("/api/data").get_json()["stats"]["2026-01-15"]
         self.assertEqual(
             stats,
@@ -1510,7 +2948,8 @@ class DailySealApiTests(unittest.TestCase):
         self.assertNotIn("stats", payload)
         self.assertEqual(payload["publicPoms"], {today: 7})
         raw_viewer_data = viewer_data.get_data(as_text=True)
-        self.assertNotIn('"note"', raw_viewer_data)
+        # Progress-entry `note` is intentionally public; the private daily
+        # note remains absent because viewers never receive the `stats` map.
         self.assertNotIn('"distractions"', raw_viewer_data)
         self.assertNotIn("private owner note", raw_viewer_data)
         self.assertNotIn("private distraction log", raw_viewer_data)
@@ -1581,7 +3020,18 @@ class DailySealApiTests(unittest.TestCase):
             json={
                 "data": {
                     "tasks": {
-                        "2026-07-17": {"text": "must not overwrite", "done": True},
+                        "2026-07-17": {
+                            "text": "must not overwrite",
+                            "done": True,
+                            "progressEntries": [
+                                {
+                                    "note": "must not mix into the existing task",
+                                    "progressPercent": 75,
+                                    "createdAt": "2026-07-17T08:00:00+00:00",
+                                    "assets": [],
+                                }
+                            ],
+                        },
                         "2026-07-18": {"text": "new imported task", "done": True},
                     },
                     "poms": {"2026-07-17": 99, "2026-07-18": 2},
@@ -1599,12 +3049,15 @@ class DailySealApiTests(unittest.TestCase):
         )
         self.assertEqual(imported.status_code, 200, imported.get_data(as_text=True))
         self.assertEqual(imported.get_json()["importedTasks"], 1)
+        self.assertEqual(imported.get_json()["importedProgressEntries"], 0)
+        self.assertEqual(imported.get_json()["skippedMismatchedProgressEntries"], 1)
         payload = self.client.get("/api/data").get_json()
         tasks = {item["date"]: item for item in payload["tasks"]}
         self.assertEqual(tasks["2026-07-17"]["text"], "keep this task")
         self.assertFalse(tasks["2026-07-17"]["done"])
         self.assertEqual(tasks["2026-07-18"]["text"], "new imported task")
         self.assertTrue(tasks["2026-07-18"]["done"])
+        self.assertEqual(tasks["2026-07-17"]["progressEntries"], [])
         self.assertEqual(
             payload["stats"]["2026-07-17"],
             {

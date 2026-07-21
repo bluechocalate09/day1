@@ -10,8 +10,8 @@ WorkingDirectory=/opt/daily-seal
 Environment=PYTHONUNBUFFERED=1
 Environment=DAILY_SEAL_DATA_DIR=/var/lib/daily-seal
 Environment=DAILY_SEAL_COOKIE_SECURE=1
-Environment=DAILY_SEAL_REGISTRATION_ENABLED=0
-ExecStart=/usr/bin/gunicorn --workers 2 --threads 2 --timeout 30 --bind 127.0.0.1:8766 app:app
+Environment=DAILY_SEAL_REGISTRATION_ENABLED=1
+ExecStart=/usr/bin/gunicorn --workers 1 --threads 2 --timeout 30 --max-requests 1000 --max-requests-jitter 50 --bind 127.0.0.1:8766 app:app
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15

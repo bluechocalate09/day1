@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
@@ -33,11 +34,12 @@ REGISTRATION_ENABLED = os.environ.get("DAILY_SEAL_REGISTRATION_ENABLED", "1") !=
 SESSION_COOKIE = "ds_session"
 CSRF_COOKIE = "ds_csrf"
 SESSION_SECONDS = 7 * 24 * 60 * 60
-MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 # Retain the old public constant for older clients and maintenance scripts.
 MAX_IMAGE_BYTES = MAX_ATTACHMENT_BYTES
-MAX_IMPORT_BYTES = 1024 * 1024
+MAX_IMPORT_BYTES = 10 * 1024 * 1024
 EMAIL_RE = re.compile(r"^[^\s@]{1,64}@[^\s@]{1,189}\.[^\s@]{2,63}$")
+CLIENT_RECORD_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{16,100}$")
 PROOF_FILE_RE = re.compile(
     r"^[a-f0-9]{32}\.(?:jpg|pdf|txt|csv|docx|xlsx|pptx)$"
 )
@@ -85,15 +87,18 @@ MAX_STAGE_DESCRIPTION_LENGTH = 5000
 MAX_STAGE_PROOF_TEXT_LENGTH = 1000
 MAX_STAGE_PROOF_URL_LENGTH = 2048
 MAX_TASK_RESULT_NOTE_LENGTH = 1000
+MAX_TASK_PROGRESS_NOTE_LENGTH = 1000
 MAX_ORIGINAL_FILENAME_BYTES = 240
 MAX_PROOF_IMAGE_PIXELS = 60_000_000
+MAX_NON_JPEG_IMAGE_PIXELS = 20_000_000
 Image.MAX_IMAGE_PIXELS = MAX_PROOF_IMAGE_PIXELS
 RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
+IMAGE_PROCESS_LOCK = threading.Lock()
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
-app.config.update(MAX_CONTENT_LENGTH=32 * 1024 * 1024, JSON_AS_ASCII=False)
+app.config.update(MAX_CONTENT_LENGTH=12 * 1024 * 1024, JSON_AS_ASCII=False)
 
 
 SCHEMA = """
@@ -137,6 +142,9 @@ CREATE TABLE IF NOT EXISTS tasks (
         CHECK (completion_percent >= 0 AND completion_percent <= 100),
     result_note TEXT NOT NULL DEFAULT '',
     result_recorded_at INTEGER,
+    result_version INTEGER NOT NULL DEFAULT 0 CHECK (result_version >= 0),
+    result_confirmed_progress_id INTEGER
+        CHECK (result_confirmed_progress_id IS NULL OR result_confirmed_progress_id >= 0),
     created_at INTEGER NOT NULL,
     completed_at INTEGER,
     proof_text TEXT,
@@ -146,6 +154,56 @@ CREATE TABLE IF NOT EXISTS tasks (
     proof_original_name TEXT,
     proof_size INTEGER CHECK (proof_size IS NULL OR proof_size >= 0)
 );
+CREATE TABLE IF NOT EXISTS task_progress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_date TEXT NOT NULL REFERENCES tasks(task_date) ON DELETE CASCADE,
+    client_key TEXT CHECK (client_key IS NULL OR length(client_key) BETWEEN 16 AND 100),
+    note TEXT NOT NULL DEFAULT '' CHECK (length(note) <= 1000),
+    progress_percent INTEGER NOT NULL
+        CHECK (progress_percent >= 0 AND progress_percent <= 100),
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_progress_date
+    ON task_progress(task_date, created_at, id);
+CREATE TABLE IF NOT EXISTS task_progress_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    progress_id INTEGER NOT NULL REFERENCES task_progress(id) ON DELETE CASCADE,
+    client_key TEXT CHECK (client_key IS NULL OR length(client_key) BETWEEN 16 AND 100),
+    position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
+    kind TEXT NOT NULL CHECK (kind IN ('link', 'file')),
+    proof_url TEXT,
+    proof_file TEXT,
+    proof_mime TEXT,
+    proof_original_name TEXT,
+    proof_size INTEGER CHECK (proof_size IS NULL OR proof_size >= 0),
+    source_sha256 TEXT CHECK (source_sha256 IS NULL OR length(source_sha256) = 64),
+    source_size INTEGER CHECK (source_size IS NULL OR source_size >= 0),
+    created_at INTEGER NOT NULL,
+    CHECK (
+        (
+            kind = 'link'
+            AND proof_url IS NOT NULL
+            AND length(trim(proof_url)) BETWEEN 1 AND 2048
+            AND proof_file IS NULL
+            AND proof_mime IS NULL
+            AND proof_original_name IS NULL
+            AND proof_size IS NULL
+        )
+        OR
+        (
+            kind = 'file'
+            AND proof_url IS NULL
+            AND proof_file IS NOT NULL
+            AND proof_mime IS NOT NULL
+            AND proof_original_name IS NOT NULL
+            AND proof_size IS NOT NULL
+        )
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_task_progress_assets_progress
+    ON task_progress_assets(progress_id, position, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_progress_assets_position
+    ON task_progress_assets(progress_id, position);
 CREATE TABLE IF NOT EXISTS daily_stats (
     stat_date TEXT PRIMARY KEY,
     poms INTEGER NOT NULL DEFAULT 0 CHECK (poms >= 0),
@@ -267,6 +325,7 @@ def init_db():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(DB_PATH), timeout=15)
     try:
+        connection.execute("PRAGMA busy_timeout = 15000")
         connection.executescript(SCHEMA)
         ensure_column(connection, "tasks", "proof_url", "TEXT")
         ensure_column(
@@ -285,6 +344,24 @@ def init_db():
         )
         ensure_column(connection, "tasks", "result_note", "TEXT NOT NULL DEFAULT ''")
         ensure_column(connection, "tasks", "result_recorded_at", "INTEGER")
+        ensure_column(
+            connection,
+            "tasks",
+            "result_version",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        # Keep legacy rows NULL so serialization can use their historical
+        # timestamp relationship. Every new result confirmation stores an
+        # exact progress-id snapshot (0 means there was no progress yet).
+        ensure_column(
+            connection,
+            "tasks",
+            "result_confirmed_progress_id",
+            "INTEGER",
+        )
+        connection.execute(
+            "UPDATE tasks SET result_version = 0 WHERE result_version IS NULL"
+        )
         ensure_column(connection, "tasks", "proof_original_name", "TEXT")
         ensure_column(
             connection,
@@ -305,6 +382,26 @@ def init_db():
             "distractions",
             "TEXT NOT NULL DEFAULT ''",
         )
+        # These columns were added after the timeline tables first shipped.
+        # Build their indexes only after additive migration so an older live
+        # database can start without SCHEMA referring to a missing column.
+        ensure_column(connection, "task_progress", "client_key", "TEXT")
+        ensure_column(connection, "task_progress_assets", "client_key", "TEXT")
+        ensure_column(connection, "task_progress_assets", "source_sha256", "TEXT")
+        ensure_column(connection, "task_progress_assets", "source_size", "INTEGER")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_progress_client_key "
+            "ON task_progress(task_date, client_key) WHERE client_key IS NOT NULL"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_progress_assets_client_key "
+            "ON task_progress_assets(progress_id, client_key) WHERE client_key IS NOT NULL"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_progress_assets_source "
+            "ON task_progress_assets(source_sha256, source_size) "
+            "WHERE kind = 'file' AND source_sha256 IS NOT NULL"
+        )
         connection.execute(
             "UPDATE tasks SET result_status = 'completed', completion_percent = 100, "
             "result_note = CASE WHEN result_note = '' THEN COALESCE(proof_text, '') "
@@ -315,6 +412,7 @@ def init_db():
         backfill_legacy_attachment_metadata(connection, "tasks", "task_date")
         backfill_legacy_attachment_metadata(connection, "stages", "id")
         connection.commit()
+        cleanup_orphaned_uploads(connection)
         connection.execute("PRAGMA journal_mode = WAL")
         connection.commit()
     finally:
@@ -574,7 +672,106 @@ def proof_file_fields(row):
     }
 
 
-def serialize_task(row):
+def serialize_progress_asset(row):
+    if row["kind"] == "link":
+        return {
+            "id": row["id"],
+            "kind": "link",
+            "url": row["proof_url"],
+            "createdAt": utc_iso(row["created_at"]),
+        }
+    payload = {
+        "id": row["id"],
+        "kind": "file",
+        "createdAt": utc_iso(row["created_at"]),
+    }
+    payload.update(proof_file_fields(row))
+    return payload
+
+
+def serialize_progress_entry(row, assets):
+    return {
+        "id": row["id"],
+        "note": row["note"] or "",
+        "progressPercent": row["progress_percent"],
+        "createdAt": utc_iso(row["created_at"]),
+        "assets": [serialize_progress_asset(asset) for asset in assets],
+        "legacy": False,
+    }
+
+
+def legacy_progress_entry(row):
+    assets = []
+    created_at = row["result_recorded_at"] or row["completed_at"] or row["created_at"]
+    if row["proof_url"]:
+        assets.append({
+            "id": f"legacy-link-{row['task_date']}",
+            "kind": "link",
+            "url": row["proof_url"],
+            "createdAt": utc_iso(created_at),
+        })
+    if row["proof_file"]:
+        file_asset = {
+            "id": f"legacy-file-{row['task_date']}",
+            "kind": "file",
+            "createdAt": utc_iso(created_at),
+        }
+        file_asset.update(proof_file_fields(row))
+        assets.append(file_asset)
+    if not assets:
+        return None
+    percent = row["completion_percent"]
+    if not isinstance(percent, int) or isinstance(percent, bool):
+        percent = 100 if row["done"] else 0
+    return {
+        "id": f"legacy-{row['task_date']}",
+        "note": "",
+        "progressPercent": min(100, max(0, percent)),
+        "createdAt": utc_iso(created_at),
+        "assets": assets,
+        "legacy": True,
+    }
+
+
+def task_progress_map(database, task_date=None, cutoff=None):
+    where = []
+    parameters = []
+    if task_date is not None:
+        where.append("progress.task_date = ?")
+        parameters.append(task_date)
+    if cutoff is not None:
+        where.append("progress.task_date <= ?")
+        parameters.append(cutoff)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    progress_rows = database.execute(
+        "SELECT progress.* FROM task_progress AS progress "
+        f"{clause} ORDER BY progress.task_date, progress.created_at, progress.id",
+        parameters,
+    ).fetchall()
+    asset_rows = database.execute(
+        "SELECT assets.* FROM task_progress_assets AS assets "
+        "JOIN task_progress AS progress ON progress.id = assets.progress_id "
+        f"{clause} ORDER BY progress.task_date, progress.created_at, progress.id, "
+        "assets.position, assets.id",
+        parameters,
+    ).fetchall()
+    assets_by_progress = {}
+    for asset in asset_rows:
+        assets_by_progress.setdefault(asset["progress_id"], []).append(asset)
+    result = {}
+    for progress in progress_rows:
+        result.setdefault(progress["task_date"], []).append(
+            serialize_progress_entry(progress, assets_by_progress.get(progress["id"], []))
+        )
+    return result
+
+
+def serialize_task_with_progress(database, row):
+    progress_by_date = task_progress_map(database, task_date=row["task_date"])
+    return serialize_task(row, progress_by_date.get(row["task_date"], []))
+
+
+def serialize_task(row, progress_entries=None):
     result_status = row["result_status"]
     if result_status not in {"pending", "completed", "incomplete"}:
         result_status = "completed" if row["done"] else "pending"
@@ -585,6 +782,44 @@ def serialize_task(row):
     if result_status == "completed":
         completion_percent = 100
     result_note = row["result_note"] or row["proof_text"] or ""
+    result_recorded_at = row["result_recorded_at"] or row["completed_at"]
+    recorded_iso = utc_iso(result_recorded_at)
+    entries = list(progress_entries or [])
+    actual_entries = [
+        entry
+        for entry in entries
+        if not entry.get("legacy") and isinstance(entry.get("id"), int)
+    ]
+    confirmed_progress_id = row["result_confirmed_progress_id"]
+    if result_status == "pending":
+        result_is_stale = False
+        confirmed_progress_count = 0
+    elif isinstance(confirmed_progress_id, int):
+        result_is_stale = any(
+            entry["id"] > confirmed_progress_id for entry in actual_entries
+        )
+        confirmed_progress_count = sum(
+            entry["id"] <= confirmed_progress_id for entry in actual_entries
+        )
+    else:
+        # Rows created before exact progress snapshots were introduced retain
+        # NULL and use their historical timestamp relationship as a fallback.
+        confirmed_progress_count = sum(
+            bool(
+                recorded_iso
+                and isinstance(entry.get("createdAt"), str)
+                and entry["createdAt"] <= recorded_iso
+            )
+            for entry in actual_entries
+        )
+        result_is_stale = bool(
+            recorded_iso
+            and any(
+                isinstance(entry.get("createdAt"), str)
+                and entry["createdAt"] > recorded_iso
+                for entry in actual_entries
+            )
+        )
     payload = {
         "date": row["task_date"],
         "text": row["text"],
@@ -592,13 +827,24 @@ def serialize_task(row):
         "resultStatus": result_status,
         "completionPercent": completion_percent,
         "resultNote": result_note,
-        "resultRecordedAt": utc_iso(row["result_recorded_at"] or row["completed_at"]),
+        "resultRecordedAt": recorded_iso,
+        "resultIsStale": result_is_stale,
+        "resultConfirmedProgressCount": confirmed_progress_count,
         "createdAt": utc_iso(row["created_at"]),
         "completedAt": utc_iso(row["completed_at"]),
         "proofText": row["proof_text"] or "",
         "proofUrl": row["proof_url"] or "",
     }
     payload.update(proof_file_fields(row))
+    legacy_entry = legacy_progress_entry(row)
+    if legacy_entry:
+        entries.append(legacy_entry)
+    entries.sort(key=lambda item: (
+        item.get("createdAt") or "",
+        1 if item.get("legacy") else 0,
+        item.get("id") if isinstance(item.get("id"), int) else 0,
+    ))
+    payload["progressEntries"] = entries
     return payload
 
 
@@ -641,6 +887,14 @@ def validate_proof_url(value):
         return None
     if parsed.username is not None or parsed.password is not None:
         return None
+    return value
+
+
+def validate_client_record_key(value):
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not CLIENT_RECORD_KEY_RE.fullmatch(value):
+        return False
     return value
 
 
@@ -718,7 +972,7 @@ def security_headers(response):
 
 @app.errorhandler(413)
 def request_too_large(_error):
-    return api_error("附件不能超过 30 MB。", 413, "attachment_too_large")
+    return api_error("单个附件不能超过 10 MB。", 413, "attachment_too_large")
 
 
 @app.errorhandler(404)
@@ -876,12 +1130,18 @@ def get_data():
     database = get_db()
     if g.current_user["role"] == "owner":
         task_rows = database.execute("SELECT * FROM tasks ORDER BY task_date").fetchall()
+        progress_by_date = task_progress_map(database)
     else:
+        public_cutoff = business_today_key()
         task_rows = database.execute(
             "SELECT * FROM tasks WHERE task_date <= ? ORDER BY task_date",
-            (business_today_key(),),
+            (public_cutoff,),
         ).fetchall()
-    tasks = [serialize_task(row) for row in task_rows]
+        progress_by_date = task_progress_map(database, cutoff=public_cutoff)
+    tasks = [
+        serialize_task(row, progress_by_date.get(row["task_date"], []))
+        for row in task_rows
+    ]
     payload = {
         "ok": True,
         "tasks": tasks,
@@ -1120,19 +1380,20 @@ def set_task(task_date):
     if not task_date or not text or len(text) > 1000:
         return api_error("任务日期或内容无效，内容不能超过 1000 字。")
     database = get_db()
-    existing = database.execute(
-        "SELECT done, result_status FROM tasks WHERE task_date = ?", (task_date,)
-    ).fetchone()
-    if existing and (existing["done"] or existing["result_status"] != "pending"):
-        return api_error("已记录最终结果的任务不能直接修改。", 409, "task_recorded")
-    database.execute(
+    cursor = database.execute(
         "INSERT INTO tasks(task_date, text, done, created_at) VALUES (?, ?, 0, ?) "
-        "ON CONFLICT(task_date) DO UPDATE SET text = excluded.text",
+        "ON CONFLICT(task_date) DO UPDATE SET text = excluded.text "
+        "WHERE tasks.done = 0 AND tasks.result_status = 'pending'",
         (task_date, text, now_ts())
     )
+    if cursor.rowcount != 1:
+        database.rollback()
+        return api_error(
+            "已记录最终结果的任务不能直接修改。", 409, "task_recorded"
+        )
     database.commit()
     row = database.execute("SELECT * FROM tasks WHERE task_date = ?", (task_date,)).fetchone()
-    return jsonify({"ok": True, "task": serialize_task(row)})
+    return jsonify({"ok": True, "task": serialize_task_with_progress(database, row)})
 
 
 @app.delete("/api/tasks/<task_date>")
@@ -1143,13 +1404,38 @@ def delete_task(task_date):
     if not task_date:
         return api_error("任务日期无效。")
     database = get_db()
+    # Keep attachment discovery and the cascading task delete in the same
+    # write-locked transaction as concurrent progress-file inserts.
+    database.execute("BEGIN IMMEDIATE")
     row = database.execute(
-        "SELECT done, result_status FROM tasks WHERE task_date = ?", (task_date,)
+        "SELECT done, result_status, proof_file FROM tasks WHERE task_date = ?", (task_date,)
     ).fetchone()
     if row and (row["done"] or row["result_status"] != "pending"):
+        database.rollback()
         return api_error("已记录最终结果的任务不能删除。", 409, "task_recorded")
-    database.execute("DELETE FROM tasks WHERE task_date = ?", (task_date,))
+    progress_files = database.execute(
+        "SELECT assets.proof_file FROM task_progress_assets AS assets "
+        "JOIN task_progress AS progress ON progress.id = assets.progress_id "
+        "WHERE progress.task_date = ? AND assets.kind = 'file'",
+        (task_date,),
+    ).fetchall()
+    stored_files = [item["proof_file"] for item in progress_files]
+    if row and row["proof_file"]:
+        stored_files.append(row["proof_file"])
+    cursor = database.execute(
+        "DELETE FROM tasks WHERE task_date = ? AND done = 0 AND result_status = 'pending'",
+        (task_date,),
+    )
+    if row and cursor.rowcount != 1:
+        database.rollback()
+        return api_error(
+            "该任务刚刚记录了最终结果，请刷新后重试。",
+            409,
+            "task_recorded",
+        )
     database.commit()
+    for filename in stored_files:
+        delete_stored_proof_if_unreferenced(database, filename)
     return jsonify({"ok": True})
 
 
@@ -1254,16 +1540,30 @@ def validate_ooxml_attachment(raw, extension):
 
 def transcode_proof_image(raw, extension):
     try:
-        with warnings.catch_warnings():
+        # Only one large image is decoded at a time on the small VPS. JPEG's
+        # draft mode also asks libjpeg to downsample during decoding, before a
+        # full-resolution RGB buffer would otherwise be allocated.
+        with IMAGE_PROCESS_LOCK, warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(raw)) as candidate:
                 source_format = candidate.format
+                source_pixels = candidate.width * candidate.height
+                if (
+                    source_format != "JPEG"
+                    and source_pixels > MAX_NON_JPEG_IMAGE_PIXELS
+                ):
+                    # PNG/WebP do not support JPEG-style draft decoding. A
+                    # highly compressed image can otherwise expand to a large
+                    # in-memory bitmap before thumbnailing on the small VPS.
+                    raise ValueError("invalid_attachment")
                 candidate.verify()
             if source_format not in IMAGE_FORMAT_EXTENSIONS:
                 raise ValueError("invalid_attachment")
             if extension not in IMAGE_FORMAT_EXTENSIONS[source_format]:
                 raise ValueError("invalid_attachment")
             with Image.open(io.BytesIO(raw)) as source:
+                if source_format == "JPEG":
+                    source.draft("RGB", (2400, 2400))
                 image = ImageOps.exif_transpose(source)
                 image.thumbnail((2400, 2400), RESAMPLE_LANCZOS)
                 if image.mode in ("RGBA", "LA"):
@@ -1320,6 +1620,50 @@ def delete_stored_proof(filename):
         pass
 
 
+def delete_stored_proof_if_unreferenced(database, filename):
+    """Delete an attachment only after its final database reference is gone."""
+    if not isinstance(filename, str) or not PROOF_FILE_RE.fullmatch(filename):
+        return
+    referenced = any((
+        database.execute(
+            "SELECT 1 FROM tasks WHERE proof_file = ? LIMIT 1", (filename,)
+        ).fetchone(),
+        database.execute(
+            "SELECT 1 FROM stages WHERE proof_file = ? LIMIT 1", (filename,)
+        ).fetchone(),
+        database.execute(
+            "SELECT 1 FROM task_progress_assets WHERE proof_file = ? LIMIT 1",
+            (filename,),
+        ).fetchone(),
+    ))
+    if not referenced:
+        delete_stored_proof(filename)
+
+
+def cleanup_orphaned_uploads(database):
+    """Remove interrupted temporary files and attachment files with no DB row."""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    referenced = {
+        row[0]
+        for table in ("tasks", "stages", "task_progress_assets")
+        for row in database.execute(
+            f"SELECT proof_file FROM {table} WHERE proof_file IS NOT NULL"
+        ).fetchall()
+    }
+    for path in UPLOAD_DIR.iterdir():
+        if not path.is_file():
+            continue
+        is_interrupted_temporary = path.name.startswith(".") and path.name.endswith(".tmp")
+        is_unreferenced_attachment = (
+            PROOF_FILE_RE.fullmatch(path.name) and path.name not in referenced
+        )
+        if is_interrupted_temporary or is_unreferenced_attachment:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def process_proof_attachment(upload):
     if not upload or not upload.filename:
         return None
@@ -1365,6 +1709,8 @@ def process_proof_attachment(upload):
         "original_name": original_name,
         "mime": mime,
         "size": len(stored),
+        "source_sha256": hashlib.sha256(raw).hexdigest(),
+        "source_size": len(raw),
     }
 
 
@@ -1383,7 +1729,7 @@ def get_proof_upload():
 def attachment_api_error(error):
     code = str(error)
     if code == "attachment_too_large":
-        return api_error("附件不能超过 30 MB。", 413, code)
+        return api_error("单个附件不能超过 10 MB。", 413, code)
     if code == "multiple_attachments":
         return api_error("一次只能上传一个附件。", 400, code)
     return api_error(
@@ -1391,6 +1737,408 @@ def attachment_api_error(error):
         400,
         "invalid_attachment",
     )
+
+
+def serialized_progress_by_id(database, task_date, progress_id):
+    entries = task_progress_map(database, task_date=task_date).get(task_date, [])
+    return next((entry for entry in entries if entry["id"] == progress_id), None)
+
+
+@app.post("/api/tasks/<task_date>/progress")
+@require_owner
+@require_csrf
+def create_task_progress(task_date):
+    task_date = validate_date_key(task_date)
+    payload = parse_json()
+    if not task_date or not isinstance(payload, dict):
+        return api_error("进度记录无效。")
+
+    note_value = payload.get("note", "")
+    progress_percent = payload.get("progressPercent")
+    links_value = payload.get("links", [])
+    has_pending_files = payload.get("hasPendingFiles", False)
+    client_key = validate_client_record_key(payload.get("clientRecordId"))
+    if not isinstance(note_value, str):
+        return api_error("备注内容无效。")
+    note = note_value.strip()
+    if len(note) > MAX_TASK_PROGRESS_NOTE_LENGTH:
+        return api_error("备注不能超过 1000 字。")
+    if (
+        not isinstance(progress_percent, int)
+        or isinstance(progress_percent, bool)
+        or not 0 <= progress_percent <= 100
+    ):
+        return api_error(
+            "当前进度必须是 0 到 100 的整数。",
+            400,
+            "invalid_progress_percent",
+        )
+    if not isinstance(links_value, list):
+        return api_error("证据链接格式无效。")
+    if not isinstance(has_pending_files, bool):
+        return api_error(
+            "待上传附件标记无效。", 400, "invalid_pending_files"
+        )
+    if client_key is False:
+        return api_error("进度请求标识无效。", 400, "invalid_client_record_id")
+
+    links = []
+    seen_links = set()
+    for value in links_value:
+        normalized = validate_proof_url(value)
+        if normalized is None:
+            return api_error("证据链接必须是有效的 http 或 https 地址。")
+        if normalized and normalized not in seen_links:
+            seen_links.add(normalized)
+            links.append(normalized)
+
+    database = get_db()
+    created_at = now_ts()
+    try:
+        # Serialize the idempotency recheck and insert. Without this write
+        # lock, two workers can both miss the token and one would surface a
+        # UNIQUE violation instead of returning the already-created record.
+        database.execute("BEGIN IMMEDIATE")
+        task_row = database.execute(
+            "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
+        ).fetchone()
+        if not task_row:
+            database.rollback()
+            return api_error("未找到该任务。", 404, "not_found")
+        if client_key:
+            existing_progress = database.execute(
+                "SELECT id FROM task_progress WHERE task_date = ? AND client_key = ?",
+                (task_date, client_key),
+            ).fetchone()
+            if existing_progress:
+                progress_id = existing_progress["id"]
+                response_payload = {
+                    "ok": True,
+                    "idempotent": True,
+                    "progress": serialized_progress_by_id(
+                        database, task_date, progress_id
+                    ),
+                    "task": serialize_task_with_progress(database, task_row),
+                }
+                database.rollback()
+                return jsonify(response_payload)
+        latest_progress = database.execute(
+            "SELECT progress_percent FROM task_progress WHERE task_date = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (task_date,),
+        ).fetchone()
+        baseline_percent = (
+            latest_progress["progress_percent"]
+            if latest_progress
+            else (
+                task_row["completion_percent"]
+                if task_row["result_status"] != "pending"
+                else 0
+            )
+        )
+        if (
+            not note
+            and not links
+            and not has_pending_files
+            and progress_percent == baseline_percent
+        ):
+            database.rollback()
+            return api_error(
+                "这次没有新的进度、备注或链接。",
+                400,
+                "no_progress_change",
+            )
+        cursor = database.execute(
+            "INSERT INTO task_progress("
+            "task_date, client_key, note, progress_percent, created_at"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (task_date, client_key, note, progress_percent, created_at),
+        )
+        progress_id = cursor.lastrowid
+        for position, proof_url in enumerate(links):
+            database.execute(
+                "INSERT INTO task_progress_assets("
+                "progress_id, position, kind, proof_url, created_at"
+                ") VALUES (?, ?, 'link', ?, ?)",
+                (progress_id, position, proof_url, created_at),
+            )
+        progress = serialized_progress_by_id(database, task_date, progress_id)
+        task_payload = serialize_task_with_progress(database, task_row)
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        # Defensive fallback for a request written by an older worker that
+        # does not participate in BEGIN IMMEDIATE serialization.
+        database.execute("BEGIN IMMEDIATE")
+        existing_progress = (
+            database.execute(
+                "SELECT id FROM task_progress WHERE task_date = ? AND client_key = ?",
+                (task_date, client_key),
+            ).fetchone()
+            if client_key
+            else None
+        )
+        if existing_progress:
+            task_row = database.execute(
+                "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
+            ).fetchone()
+            response_payload = {
+                "ok": True,
+                "idempotent": True,
+                "progress": serialized_progress_by_id(
+                    database, task_date, existing_progress["id"]
+                ),
+                "task": serialize_task_with_progress(database, task_row),
+            }
+            database.rollback()
+            return jsonify(response_payload)
+        database.rollback()
+        raise
+    except Exception:
+        database.rollback()
+        raise
+
+    return jsonify({
+        "ok": True,
+        "idempotent": False,
+        "progress": progress,
+        "task": task_payload,
+    }), 201
+
+
+@app.post("/api/tasks/<task_date>/progress/<int:progress_id>/files")
+@require_owner
+@require_csrf
+def add_task_progress_file(task_date, progress_id):
+    task_date = validate_date_key(task_date)
+    if not task_date:
+        return api_error("任务日期无效。")
+    try:
+        upload = get_proof_upload()
+    except ValueError as error:
+        return attachment_api_error(error)
+    if not upload or not upload.filename:
+        return api_error("请选择一个附件。")
+    client_key = validate_client_record_key(request.form.get("clientUploadId"))
+    if client_key is False:
+        return api_error("附件请求标识无效。", 400, "invalid_client_upload_id")
+
+    database = get_db()
+    progress_row = database.execute(
+        "SELECT progress.* FROM task_progress AS progress "
+        "JOIN tasks ON tasks.task_date = progress.task_date "
+        "WHERE progress.id = ? AND progress.task_date = ?",
+        (progress_id, task_date),
+    ).fetchone()
+    if not progress_row:
+        return api_error("未找到该进度记录。", 404, "not_found")
+    if client_key:
+        existing_asset = database.execute(
+            "SELECT * FROM task_progress_assets "
+            "WHERE progress_id = ? AND client_key = ? AND kind = 'file'",
+            (progress_id, client_key),
+        ).fetchone()
+        if existing_asset:
+            task_row = database.execute(
+                "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
+            ).fetchone()
+            return jsonify({
+                "ok": True,
+                "idempotent": True,
+                "asset": serialize_progress_asset(existing_asset),
+                "progress": serialized_progress_by_id(database, task_date, progress_id),
+                "task": serialize_task_with_progress(database, task_row),
+            })
+
+    try:
+        attachment = process_proof_attachment(upload)
+    except ValueError as error:
+        return attachment_api_error(error)
+    new_file = attachment["filename"]
+    created_at = now_ts()
+    try:
+        # File validation/transcoding happens outside SQLite's write lock. The
+        # lock covers the second token check, content-dedup lookup, position
+        # allocation, and insert so concurrent workers cannot create duplicate
+        # rows or collide on MAX(position) + 1.
+        database.execute("BEGIN IMMEDIATE")
+        progress_row = database.execute(
+            "SELECT progress.* FROM task_progress AS progress "
+            "JOIN tasks ON tasks.task_date = progress.task_date "
+            "WHERE progress.id = ? AND progress.task_date = ?",
+            (progress_id, task_date),
+        ).fetchone()
+        if not progress_row:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error("未找到该进度记录。", 404, "not_found")
+        if client_key:
+            existing_asset = database.execute(
+                "SELECT * FROM task_progress_assets "
+                "WHERE progress_id = ? AND client_key = ? AND kind = 'file'",
+                (progress_id, client_key),
+            ).fetchone()
+            if existing_asset:
+                task_row = database.execute(
+                    "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
+                ).fetchone()
+                response_payload = {
+                    "ok": True,
+                    "idempotent": True,
+                    "asset": serialize_progress_asset(existing_asset),
+                    "progress": serialized_progress_by_id(
+                        database, task_date, progress_id
+                    ),
+                    "task": serialize_task_with_progress(database, task_row),
+                }
+                database.rollback()
+                delete_stored_proof_if_unreferenced(database, new_file)
+                return jsonify(response_payload)
+
+        reusable_asset = None
+        for candidate in database.execute(
+            "SELECT * FROM task_progress_assets "
+            "WHERE kind = 'file' AND source_sha256 = ? AND source_size = ? "
+            "AND proof_mime = ? "
+            "ORDER BY id",
+            (
+                attachment["source_sha256"],
+                attachment["source_size"],
+                attachment["mime"],
+            ),
+        ).fetchall():
+            filename = candidate["proof_file"]
+            if (
+                not isinstance(filename, str)
+                or not PROOF_FILE_RE.fullmatch(filename)
+                or canonical_mime_for_internal_file(filename) != attachment["mime"]
+            ):
+                continue
+            target = UPLOAD_DIR / filename
+            try:
+                valid_stored_size = (
+                    isinstance(candidate["proof_size"], int)
+                    and target.stat().st_size == candidate["proof_size"]
+                )
+            except OSError:
+                valid_stored_size = False
+            if valid_stored_size:
+                reusable_asset = candidate
+                break
+
+        stored_file = reusable_asset["proof_file"] if reusable_asset else new_file
+        stored_mime = reusable_asset["proof_mime"] if reusable_asset else attachment["mime"]
+        stored_size = reusable_asset["proof_size"] if reusable_asset else attachment["size"]
+        position_row = database.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS next_position "
+            "FROM task_progress_assets WHERE progress_id = ?",
+            (progress_id,),
+        ).fetchone()
+        cursor = database.execute(
+            "INSERT INTO task_progress_assets("
+            "progress_id, client_key, position, kind, proof_file, proof_mime, "
+            "proof_original_name, proof_size, source_sha256, source_size, created_at"
+            ") VALUES (?, ?, ?, 'file', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                progress_id,
+                client_key,
+                position_row["next_position"],
+                stored_file,
+                stored_mime,
+                attachment["original_name"],
+                stored_size,
+                attachment["source_sha256"],
+                attachment["source_size"],
+                created_at,
+            ),
+        )
+        asset_id = cursor.lastrowid
+        asset_row = database.execute(
+            "SELECT * FROM task_progress_assets WHERE id = ?", (asset_id,)
+        ).fetchone()
+        task_row = database.execute(
+            "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
+        ).fetchone()
+        response_payload = {
+            "ok": True,
+            "idempotent": False,
+            "asset": serialize_progress_asset(asset_row),
+            "progress": serialized_progress_by_id(database, task_date, progress_id),
+            "task": serialize_task_with_progress(database, task_row),
+        }
+        database.commit()
+        if reusable_asset:
+            # The duplicate was only a staging result. The committed row now
+            # references the earlier immutable file, so remove the unreferenced
+            # newly processed bytes immediately.
+            delete_stored_proof_if_unreferenced(database, new_file)
+    except sqlite3.IntegrityError:
+        database.rollback()
+        delete_stored_proof_if_unreferenced(database, new_file)
+        database.execute("BEGIN IMMEDIATE")
+        existing_asset = (
+            database.execute(
+                "SELECT * FROM task_progress_assets "
+                "WHERE progress_id = ? AND client_key = ? AND kind = 'file'",
+                (progress_id, client_key),
+            ).fetchone()
+            if client_key
+            else None
+        )
+        if existing_asset:
+            task_row = database.execute(
+                "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
+            ).fetchone()
+            response_payload = {
+                "ok": True,
+                "idempotent": True,
+                "asset": serialize_progress_asset(existing_asset),
+                "progress": serialized_progress_by_id(database, task_date, progress_id),
+                "task": serialize_task_with_progress(database, task_row),
+            }
+            database.rollback()
+            return jsonify(response_payload)
+        database.rollback()
+        raise
+    except Exception:
+        database.rollback()
+        delete_stored_proof_if_unreferenced(database, new_file)
+        raise
+    return jsonify(response_payload), 201
+
+
+@app.delete(
+    "/api/tasks/<task_date>/progress/<int:progress_id>/assets/<int:asset_id>"
+)
+@require_owner
+@require_csrf
+def delete_task_progress_asset(task_date, progress_id, asset_id):
+    task_date = validate_date_key(task_date)
+    if not task_date:
+        return api_error("任务日期无效。")
+    database = get_db()
+    asset_row = database.execute(
+        "SELECT assets.* FROM task_progress_assets AS assets "
+        "JOIN task_progress AS progress ON progress.id = assets.progress_id "
+        "WHERE assets.id = ? AND progress.id = ? AND progress.task_date = ?",
+        (asset_id, progress_id, task_date),
+    ).fetchone()
+    if not asset_row:
+        return api_error("未找到该附件或链接。", 404, "not_found")
+    stored_file = asset_row["proof_file"]
+    database.execute("DELETE FROM task_progress_assets WHERE id = ?", (asset_id,))
+    database.commit()
+    if stored_file:
+        delete_stored_proof_if_unreferenced(database, stored_file)
+    task_row = database.execute(
+        "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
+    ).fetchone()
+    return jsonify({
+        "ok": True,
+        "removedAssetId": asset_id,
+        "progress": serialized_progress_by_id(database, task_date, progress_id),
+        "task": serialize_task_with_progress(database, task_row),
+    })
 
 
 @app.post("/api/tasks/<task_date>/complete")
@@ -1427,10 +2175,9 @@ def record_task_result(task_date):
         return api_error("反馈内容无效。")
     result_note = result_note_value.strip()
     if len(result_note) > MAX_TASK_RESULT_NOTE_LENGTH:
-        return api_error("反馈不能超过 1000 字。")
+        return api_error("备注不能超过 1000 字。")
     if not legacy_completion and not result_note:
-        label = "完成备注" if result_status == "completed" else "未完成原因"
-        return api_error(f"请填写{label}。", 400, "result_note_required")
+        return api_error("请填写备注。", 400, "result_note_required")
 
     proof_url_input = request.form.get("proofUrl")
     proof_url = validate_proof_url(proof_url_input)
@@ -1458,31 +2205,64 @@ def record_task_result(task_date):
     except ValueError as error:
         return attachment_api_error(error)
     new_file = attachment["filename"] if attachment else None
+    initial_result_version = row["result_version"]
     old_file = row["proof_file"]
-    recorded_at = now_ts()
-    completed_at = None
-    if result_status == "completed":
-        completed_at = (
-            row["completed_at"]
-            if row["result_status"] == "completed" and row["completed_at"]
-            else recorded_at
-        )
     try:
+        # Serialize the confirmation snapshot with progress inserts and use a
+        # monotonic result version for true compare-and-swap semantics even
+        # when two writes arrive within the same second.
+        database.execute("BEGIN IMMEDIATE")
+        current_row = database.execute(
+            "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
+        ).fetchone()
+        if not current_row:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error("未找到该任务。", 404, "not_found")
+        if current_row["result_version"] != initial_result_version:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error(
+                "这条结果刚刚被更新，请刷新后重试。",
+                409,
+                "proof_conflict",
+            )
+        old_file = current_row["proof_file"]
+        effective_proof_url = (
+            current_row["proof_url"] if proof_url_input is None else proof_url
+        )
+        recorded_at = now_ts()
+        completed_at = None
+        if result_status == "completed":
+            completed_at = (
+                current_row["completed_at"]
+                if current_row["result_status"] == "completed"
+                and current_row["completed_at"]
+                else recorded_at
+            )
+        latest_progress = database.execute(
+            "SELECT COALESCE(MAX(id), 0) AS latest_id FROM task_progress "
+            "WHERE task_date = ?",
+            (task_date,),
+        ).fetchone()
+        confirmed_progress_id = latest_progress["latest_id"]
         cursor = database.execute(
             "UPDATE tasks SET done = ?, result_status = ?, completion_percent = ?, "
-            "result_note = ?, result_recorded_at = ?, completed_at = ?, "
+            "result_note = ?, result_recorded_at = ?, result_version = result_version + 1, "
+            "result_confirmed_progress_id = ?, completed_at = ?, "
             "proof_text = ?, proof_url = ?, "
             "proof_file = COALESCE(?, proof_file), "
             "proof_mime = COALESCE(?, proof_mime), "
             "proof_original_name = COALESCE(?, proof_original_name), "
             "proof_size = COALESCE(?, proof_size) "
-            "WHERE task_date = ? AND proof_file IS ? AND result_recorded_at IS ?",
+            "WHERE task_date = ? AND result_version = ?",
             (
                 1 if result_status == "completed" else 0,
                 result_status,
                 completion_percent,
                 result_note,
                 recorded_at,
+                confirmed_progress_id,
                 completed_at,
                 result_note,
                 effective_proof_url or None,
@@ -1491,27 +2271,29 @@ def record_task_result(task_date):
                 attachment["original_name"] if attachment else None,
                 attachment["size"] if attachment else None,
                 task_date,
-                old_file,
-                row["result_recorded_at"],
+                initial_result_version,
             ),
         )
         if cursor.rowcount != 1:
             database.rollback()
-            delete_stored_proof(new_file)
+            delete_stored_proof_if_unreferenced(database, new_file)
             return api_error(
                 "这条结果刚刚被更新，请刷新后重试。",
                 409,
                 "proof_conflict",
             )
+        updated = database.execute(
+            "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
+        ).fetchone()
+        task_payload = serialize_task_with_progress(database, updated)
         database.commit()
     except Exception:
         database.rollback()
-        delete_stored_proof(new_file)
+        delete_stored_proof_if_unreferenced(database, new_file)
         raise
     if new_file and old_file and old_file != new_file:
-        delete_stored_proof(old_file)
-    updated = database.execute("SELECT * FROM tasks WHERE task_date = ?", (task_date,)).fetchone()
-    return jsonify({"ok": True, "task": serialize_task(updated)})
+        delete_stored_proof_if_unreferenced(database, old_file)
+    return jsonify({"ok": True, "task": task_payload})
 
 
 @app.put("/api/stats/<stat_date>")
@@ -1552,6 +2334,39 @@ def set_stats(stat_date):
     })
 
 
+def parse_import_progress_timestamp(value):
+    if not isinstance(value, str) or not 10 <= len(value) <= 64:
+        raise ValueError("invalid")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError as error:
+        raise ValueError("invalid") from error
+    if parsed.tzinfo is None:
+        raise ValueError("invalid")
+    parsed = parsed.astimezone(timezone.utc)
+    if not 2020 <= parsed.year <= 2100:
+        raise ValueError("invalid")
+    timestamp = int(parsed.timestamp())
+    return timestamp, utc_iso(timestamp)
+
+
+def imported_progress_client_key(task_date, index, note, progress_percent, created_iso, links):
+    canonical = json.dumps(
+        {
+            "taskDate": task_date,
+            "index": index,
+            "note": note,
+            "progressPercent": progress_percent,
+            "createdAt": created_iso,
+            "links": links,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def validate_legacy_import(value):
     if not isinstance(value, dict) or not isinstance(value.get("tasks"), dict):
         raise ValueError("invalid")
@@ -1578,6 +2393,8 @@ def validate_legacy_import(value):
     ):
         raise ValueError("too_many")
     tasks = []
+    progress_entries = []
+    skipped_attachments = 0
     for key, item in value["tasks"].items():
         key = validate_date_key(key)
         if not key or not isinstance(item, dict) or not isinstance(item.get("text"), str):
@@ -1607,7 +2424,116 @@ def validate_legacy_import(value):
             raise ValueError("invalid")
         if result_status == "incomplete" and not result_note.strip():
             raise ValueError("invalid")
-        tasks.append((key, text, result_status, completion_percent, result_note.strip()))
+        raw_progress_entries = item.get("progressEntries", [])
+        if not isinstance(raw_progress_entries, list):
+            raise ValueError("invalid")
+        nonlegacy_progress_index = 0
+        for entry in raw_progress_entries:
+            if not isinstance(entry, dict):
+                raise ValueError("invalid")
+            raw_assets = entry.get("assets", [])
+            if not isinstance(raw_assets, list):
+                raise ValueError("invalid")
+            links = []
+            seen_links = set()
+            for asset in raw_assets:
+                if not isinstance(asset, dict):
+                    raise ValueError("invalid")
+                kind = asset.get("kind")
+                if kind == "file":
+                    # JSON exports contain only the file index/metadata. The
+                    # binary bytes remain on the source server and therefore
+                    # cannot be recreated by a JSON import.
+                    skipped_attachments += 1
+                    continue
+                if kind != "link":
+                    raise ValueError("invalid")
+                normalized = validate_proof_url(asset.get("url"))
+                if not normalized:
+                    raise ValueError("invalid")
+                if normalized not in seen_links:
+                    seen_links.add(normalized)
+                    links.append(normalized)
+
+            # Legacy virtual entries mirror the task's old flat proof fields;
+            # importing them as new timeline nodes would duplicate history.
+            if entry.get("legacy") is True:
+                continue
+            note_value = entry.get("note", "")
+            progress_percent = entry.get("progressPercent")
+            if (
+                not isinstance(note_value, str)
+                or len(note_value) > MAX_TASK_PROGRESS_NOTE_LENGTH
+                or not isinstance(progress_percent, int)
+                or isinstance(progress_percent, bool)
+                or not 0 <= progress_percent <= 100
+            ):
+                raise ValueError("invalid")
+            note = note_value.strip()
+            created_at, created_iso = parse_import_progress_timestamp(
+                entry.get("createdAt")
+            )
+            client_key = imported_progress_client_key(
+                key,
+                nonlegacy_progress_index,
+                note,
+                progress_percent,
+                created_iso,
+                links,
+            )
+            progress_entries.append(
+                (key, client_key, note, progress_percent, created_at, links)
+            )
+            nonlegacy_progress_index += 1
+        result_recorded_value = item.get("resultRecordedAt")
+        if result_status == "pending":
+            if (
+                result_recorded_value is not None
+                or item.get("resultIsStale") not in (None, False)
+                or item.get("resultConfirmedProgressCount") not in (None, 0)
+            ):
+                raise ValueError("invalid")
+            result_recorded_at = None
+            confirmed_progress_count = 0
+        else:
+            result_recorded_at = (
+                parse_import_progress_timestamp(result_recorded_value)[0]
+                if result_recorded_value is not None
+                else None
+            )
+            confirmed_progress_count = item.get("resultConfirmedProgressCount")
+            stale_value = item.get("resultIsStale")
+            if stale_value is not None and not isinstance(stale_value, bool):
+                raise ValueError("invalid")
+            if confirmed_progress_count is None:
+                confirmed_progress_count = (
+                    max(0, nonlegacy_progress_index - 1)
+                    if stale_value is True
+                    else nonlegacy_progress_index
+                )
+            if (
+                not isinstance(confirmed_progress_count, int)
+                or isinstance(confirmed_progress_count, bool)
+                or not 0 <= confirmed_progress_count <= nonlegacy_progress_index
+            ):
+                raise ValueError("invalid")
+            if (
+                stale_value is not None
+                and stale_value
+                != (confirmed_progress_count < nonlegacy_progress_index)
+            ):
+                raise ValueError("invalid")
+        tasks.append(
+            (
+                key,
+                text,
+                result_status,
+                completion_percent,
+                result_note.strip(),
+                result_recorded_at,
+                confirmed_progress_count,
+            )
+        )
     clean_poms = {}
     for key, count in poms.items():
         key = validate_date_key(key)
@@ -1626,7 +2552,14 @@ def validate_legacy_import(value):
         if not key or not isinstance(distraction, str) or len(distraction) > 10000:
             raise ValueError("invalid")
         clean_distractions[key] = distraction
-    return tasks, clean_poms, clean_notes, clean_distractions
+    return (
+        tasks,
+        clean_poms,
+        clean_notes,
+        clean_distractions,
+        progress_entries,
+        skipped_attachments,
+    )
 
 
 @app.post("/api/import")
@@ -1634,25 +2567,50 @@ def validate_legacy_import(value):
 @require_csrf
 def import_data():
     if request.content_length and request.content_length > MAX_IMPORT_BYTES:
-        return api_error("导入数据不能超过 1 MB。", 413, "too_large")
+        return api_error("导入数据不能超过 10 MB。", 413, "too_large")
+    if len(request.get_data(cache=True)) > MAX_IMPORT_BYTES:
+        return api_error("导入数据不能超过 10 MB。", 413, "too_large")
     payload = parse_json()
     try:
-        tasks, poms, notes, distractions = validate_legacy_import(
-            payload.get("data") if payload else None
-        )
+        (
+            tasks,
+            poms,
+            notes,
+            distractions,
+            progress_entries,
+            skipped_attachments,
+        ) = validate_legacy_import(payload.get("data") if payload else None)
     except ValueError:
         return api_error("导入数据格式不正确。")
     database = get_db()
     imported_tasks = 0
+    imported_progress_entries = 0
+    imported_links = 0
+    skipped_mismatched_progress_entries = 0
+    eligible_progress_dates = set()
+    newly_imported_dates = set()
+    imported_progress_ids = {}
+    task_import_metadata = {
+        task[0]: {"status": task[2], "confirmedCount": task[6]}
+        for task in tasks
+    }
     with database:
-        for key, text, result_status, completion_percent, result_note in tasks:
+        for (
+            key,
+            text,
+            result_status,
+            completion_percent,
+            result_note,
+            result_recorded_at,
+            _confirmed_progress_count,
+        ) in tasks:
             recorded = result_status != "pending"
             imported_at = now_ts()
             cursor = database.execute(
                 "INSERT OR IGNORE INTO tasks("
                 "task_date, text, done, result_status, completion_percent, result_note, "
-                "result_recorded_at, created_at, completed_at, proof_text"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "result_recorded_at, result_version, created_at, completed_at, proof_text"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     key,
                     text,
@@ -1660,13 +2618,69 @@ def import_data():
                     result_status,
                     completion_percent,
                     result_note,
-                    imported_at if recorded else None,
+                    (result_recorded_at or imported_at) if recorded else None,
+                    1 if recorded else 0,
                     imported_at,
-                    imported_at if result_status == "completed" else None,
+                    (result_recorded_at or imported_at)
+                    if result_status == "completed"
+                    else None,
                     result_note or None,
                 ),
             )
             imported_tasks += cursor.rowcount
+            if cursor.rowcount == 1:
+                eligible_progress_dates.add(key)
+                newly_imported_dates.add(key)
+            else:
+                existing_task = database.execute(
+                    "SELECT text FROM tasks WHERE task_date = ?", (key,)
+                ).fetchone()
+                if existing_task and existing_task["text"] == text:
+                    eligible_progress_dates.add(key)
+        for (
+            task_date,
+            client_key,
+            note,
+            progress_percent,
+            created_at,
+            links,
+        ) in progress_entries:
+            if task_date not in eligible_progress_dates:
+                skipped_mismatched_progress_entries += 1
+                continue
+            cursor = database.execute(
+                "INSERT OR IGNORE INTO task_progress("
+                "task_date, client_key, note, progress_percent, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (task_date, client_key, note, progress_percent, created_at),
+            )
+            if cursor.rowcount == 0:
+                continue
+            imported_progress_entries += 1
+            progress_id = cursor.lastrowid
+            imported_progress_ids.setdefault(task_date, []).append(progress_id)
+            for position, proof_url in enumerate(links):
+                database.execute(
+                    "INSERT INTO task_progress_assets("
+                    "progress_id, position, kind, proof_url, created_at"
+                    ") VALUES (?, ?, 'link', ?, ?)",
+                    (progress_id, position, proof_url, created_at),
+                )
+                imported_links += 1
+        for task_date in newly_imported_dates:
+            metadata = task_import_metadata[task_date]
+            if metadata["status"] == "pending":
+                continue
+            progress_ids = imported_progress_ids.get(task_date, [])
+            confirmed_count = metadata["confirmedCount"]
+            confirmed_progress_id = (
+                progress_ids[confirmed_count - 1] if confirmed_count else 0
+            )
+            database.execute(
+                "UPDATE tasks SET result_confirmed_progress_id = ? "
+                "WHERE task_date = ?",
+                (confirmed_progress_id, task_date),
+            )
         for key in set(poms) | set(notes) | set(distractions):
             database.execute(
                 "INSERT INTO daily_stats(stat_date, poms, note, distractions, updated_at) "
@@ -1685,7 +2699,14 @@ def import_data():
                     now_ts(),
                 )
             )
-    return jsonify({"ok": True, "importedTasks": imported_tasks})
+    return jsonify({
+        "ok": True,
+        "importedTasks": imported_tasks,
+        "importedProgressEntries": imported_progress_entries,
+        "importedLinks": imported_links,
+        "skippedAttachments": skipped_attachments,
+        "skippedMismatchedProgressEntries": skipped_mismatched_progress_entries,
+    })
 
 
 @app.get("/api/export")
@@ -1693,8 +2714,10 @@ def import_data():
 def export_data():
     database = get_db()
     tasks = {}
+    progress_by_date = task_progress_map(database)
     for row in database.execute("SELECT * FROM tasks ORDER BY task_date").fetchall():
-        serialized = serialize_task(row)
+        progress_entries = progress_by_date.get(row["task_date"], [])
+        serialized = serialize_task(row, progress_entries)
         tasks[row["task_date"]] = {
             "text": row["text"],
             "done": bool(row["done"]),
@@ -1702,10 +2725,15 @@ def export_data():
             "completionPercent": serialized["completionPercent"],
             "resultNote": serialized["resultNote"],
             "resultRecordedAt": serialized["resultRecordedAt"],
+            "resultIsStale": serialized["resultIsStale"],
+            "resultConfirmedProgressCount": serialized[
+                "resultConfirmedProgressCount"
+            ],
             "createdAt": utc_iso(row["created_at"]),
             "doneAt": utc_iso(row["completed_at"]),
             "proofText": row["proof_text"] or "",
             "proofUrl": row["proof_url"] or "",
+            "progressEntries": progress_entries,
             **proof_file_fields(row),
         }
     stats = database.execute("SELECT * FROM daily_stats ORDER BY stat_date").fetchall()
@@ -1714,13 +2742,15 @@ def export_data():
         for row in database.execute("SELECT * FROM stages ORDER BY started_at, id").fetchall()
     ]
     body = json.dumps({
+        "formatVersion": 2,
+        "attachmentsIncluded": False,
         "tasks": tasks,
         "poms": {row["stat_date"]: row["poms"] for row in stats},
         "notes": {row["stat_date"]: row["note"] for row in stats},
         "distractions": {row["stat_date"]: row["distractions"] for row in stats},
         "stages": stages,
     }, ensure_ascii=False, indent=2)
-    filename = f"daily-seal-{business_today_key()}.json"
+    filename = f"blue-{business_today_key()}.json"
     return Response(
         body,
         mimetype="application/json",
@@ -1734,24 +2764,44 @@ def proof_image(filename):
     if not PROOF_FILE_RE.fullmatch(filename):
         return api_error("未找到证明附件。", 404, "not_found")
     database = get_db()
-    row = database.execute(
+    task_rows = database.execute(
         "SELECT task_date, proof_file, proof_mime, proof_original_name, proof_size "
-        "FROM tasks WHERE proof_file = ?",
+        "FROM tasks WHERE proof_file = ? ORDER BY task_date",
+        (filename,),
+    ).fetchall()
+    progress_asset_rows = database.execute(
+        "SELECT progress.task_date, assets.proof_file, assets.proof_mime, "
+        "assets.proof_original_name, assets.proof_size "
+        "FROM task_progress_assets AS assets "
+        "JOIN task_progress AS progress ON progress.id = assets.progress_id "
+        "WHERE assets.proof_file = ? AND assets.kind = 'file' "
+        "ORDER BY progress.task_date, assets.id",
+        (filename,),
+    ).fetchall()
+    stage_row = database.execute(
+        "SELECT id, proof_file, proof_mime, proof_original_name, proof_size "
+        "FROM stages WHERE proof_file = ? AND status = 'completed' ORDER BY id LIMIT 1",
         (filename,),
     ).fetchone()
-    stage_row = None
-    if not row:
-        stage_row = database.execute(
-            "SELECT id, proof_file, proof_mime, proof_original_name, proof_size "
-            "FROM stages WHERE proof_file = ? AND status = 'completed'",
-            (filename,),
-        ).fetchone()
+    dated_rows = [*task_rows, *progress_asset_rows]
+    metadata_row = (
+        task_rows[0]
+        if task_rows
+        else (progress_asset_rows[0] if progress_asset_rows else stage_row)
+    )
     target = UPLOAD_DIR / filename
-    if (not row and not stage_row) or not target.is_file():
+    if not metadata_row or not target.is_file():
         return api_error("未找到证明附件。", 404, "not_found")
-    if row and g.current_user["role"] != "owner" and row["task_date"] > business_today_key():
+    if (
+        g.current_user["role"] != "owner"
+        and not stage_row
+        and not any(
+            dated_row["task_date"] <= business_today_key()
+            for dated_row in dated_rows
+        )
+    ):
         return api_error("未找到证明附件。", 404, "not_found")
-    metadata = proof_file_fields(row or stage_row)
+    metadata = proof_file_fields(metadata_row)
     mime = metadata["proofFileMime"]
     download_name = metadata["proofFileName"]
     is_image = mime == "image/jpeg"
