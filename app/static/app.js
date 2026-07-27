@@ -3,7 +3,9 @@
 
   const LEGACY_KEY = "daily-seal-v1";
   const PREVIEW_KEY = "daily-seal-owner-view";
+  const ACTIVE_SPACE_KEY = "day1-active-space";
   const SHANGHAI_TZ = "Asia/Shanghai";
+  const VIEWER_CODE_REFRESH_CONFIRMATION = "我确认刷新并知道会断开所有访客端连接";
   const MAX_PROOF_FILE_BYTES = 10 * 1024 * 1024;
   const PROOF_FILE_RULES = Object.freeze({
     jpg: { label: "JPG", image: true },
@@ -36,12 +38,32 @@
     csrfToken: "",
     registrationOpen: false,
     user: null,
+    spaces: [],
+    defaultSpaceId: "",
+    activeSpaceId: "",
+    workspace: null,
+    access: "",
     tasks: [],
     stats: {},
     publicPoms: {},
     activeStage: null,
     stageYears: {},
     mode: "visitor",
+    returnToPlatform: false,
+    connectionLostReason: "",
+    connectionLostKind: "",
+    viewerCode: "",
+    viewerCodeConnections: 0,
+    platformOverview: null,
+    platformIpAccess: null,
+    platformTab: "spaces",
+    deleteSpaceTarget: null,
+    messagesPayload: null,
+    selectedConversationId: "",
+    messageRefreshTimer: null,
+    privateRequestEpoch: 0,
+    messageRequestEpoch: 0,
+    lastAccessCheckAt: 0,
     historyYear: Number(dateKeyInShanghai().slice(0, 4)),
     visitorHistoryYear: Number(dateKeyInShanghai().slice(0, 4)),
     ownerHistoryExpanded: false,
@@ -65,6 +87,59 @@
 
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+
+  function textValue(value, fallback) {
+    return typeof value === "string" && value.trim() ? value.trim() : (fallback || "");
+  }
+
+  function normalizeSpace(space) {
+    if (!space || typeof space !== "object") return null;
+    const publicId = textValue(space.publicId || space.id);
+    if (!publicId) return null;
+    return {
+      publicId,
+      name: textValue(space.name, "未命名 Day1"),
+      access: space.access === "owner" ? "owner" : "viewer",
+      connectionStatus: ["revoked", "blocked"].includes(space.connectionStatus) ? space.connectionStatus : "active",
+      revokedReason: textValue(space.revokedReason),
+      appearance: {
+        mascotEnabled: Boolean(space.appearance && space.appearance.mascotEnabled),
+      },
+      ownerEmail: textValue(space.ownerEmail),
+      ownerDisplayName: textValue(space.ownerDisplayName || space.ownerName),
+      activeConnections: Number.isFinite(Number(space.activeConnections)) ? Number(space.activeConnections) : 0,
+      isBlueSpace: Boolean(space.isBlueSpace),
+    };
+  }
+
+  function spaceById(publicId) {
+    return state.spaces.find((space) => space.publicId === publicId) || null;
+  }
+
+  function activeSpace() {
+    return state.workspace || spaceById(state.activeSpaceId);
+  }
+
+  function canManageActiveWorkspace() {
+    return Boolean(state.user && state.activeSpaceId && state.access === "owner" && state.mode === "owner");
+  }
+
+  function isPlatformAdmin() {
+    return Boolean(state.user && state.user.isPlatformAdmin);
+  }
+
+  function isSpaceScopedApi(path) {
+    return [
+      "/api/data",
+      "/api/tasks",
+      "/api/stats",
+      "/api/stages",
+      "/api/import",
+      "/api/export",
+      "/api/messages",
+      "/api/spaces/current",
+    ].some((prefix) => path === prefix || path.startsWith(prefix));
+  }
 
   function uniqueToken(prefix) {
     if (window.crypto && typeof window.crypto.randomUUID === "function") return `${prefix}-${window.crypto.randomUUID()}`;
@@ -138,11 +213,12 @@
   }
 
   class ApiError extends Error {
-    constructor(message, status, code) {
+    constructor(message, status, code, payload) {
       super(message);
       this.name = "ApiError";
       this.status = status;
       this.code = code;
+      this.payload = payload || null;
     }
   }
 
@@ -299,7 +375,7 @@
   }
 
   function canBuildPrivateRecords(scope) {
-    return Boolean(scope === "owner" && state.user && state.user.role === "owner");
+    return Boolean(scope === "owner" && state.user && state.access === "owner");
   }
 
   function canViewPrivateRecordDetails(scope) {
@@ -495,6 +571,9 @@
     const method = (init.method || "GET").toUpperCase();
     const headers = new Headers(init.headers || {});
     headers.set("Accept", "application/json");
+    if (state.activeSpaceId && isSpaceScopedApi(path)) {
+      headers.set("X-Day1-Space", state.activeSpaceId);
+    }
     if (!["GET", "HEAD"].includes(method)) {
       headers.set("X-CSRF-Token", state.csrfToken);
     }
@@ -514,11 +593,32 @@
     const isJson = (response.headers.get("content-type") || "").includes("application/json");
     const payload = isJson ? await response.json().catch(() => ({})) : null;
     if (!response.ok) {
-      throw new ApiError(
+      const error = new ApiError(
         payload && payload.error ? payload.error : "请求没有成功，请稍后重试。",
         response.status,
         payload && payload.code ? payload.code : "request_failed",
+        payload,
       );
+      if (response.status === 410 && error.code === "preview_access_revoked") {
+        handleRevokedConnection(payload);
+      } else if (
+        response.status === 403
+        && error.code === "visitor_ip_blocked"
+        && state.activeSpaceId
+        && isSpaceScopedApi(path)
+      ) {
+        handleBlockedConnection(payload);
+      } else if (response.status === 410 && error.code === "space_deleted" && !path.startsWith("/api/platform/")) {
+        handleDeletedSpace(payload);
+      } else if (
+        response.status === 403
+        && error.code === "space_access_required"
+        && state.activeSpaceId
+        && isSpaceScopedApi(path)
+      ) {
+        await reconcileMissingSpaceAccess(payload);
+      }
+      throw error;
     }
     return payload;
   }
@@ -549,13 +649,41 @@
     $$('[data-auth-panel]').forEach((panel) => {
       panel.hidden = panel.dataset.authPanel !== name;
     });
-    $("#auth-title").textContent = name === "login" ? "欢迎回来" : "创建只读账号";
+    $("#auth-title").textContent = name === "login" ? "欢迎回来" : "注册 Blue Day1";
     $("#auth-description").textContent = name === "login"
       ? "登录后继续查看今天的记录。"
-      : "注册后可查看 Blue 的任务、阶段与完成记录。";
+      : "用识别码预览一个端，或用 Blue 的邀请创建自己的管理端。";
     setMessage($("#auth-message"), "");
-    const focusTarget = name === "login" ? $("#login-email") : $("#register-email");
+    const focusTarget = name === "login"
+      ? $("#login-email")
+      : (selectedRegistrationKind() === "manager" ? $("#register-manager-invite") : $("#register-viewer-code"));
     window.setTimeout(() => focusTarget.focus(), 0);
+  }
+
+  function selectedRegistrationKind() {
+    const selected = document.querySelector('input[name="registrationKind"]:checked');
+    return selected && selected.value === "manager" ? "manager" : "viewer";
+  }
+
+  function switchRegistrationKind(kind) {
+    const manager = kind === "manager";
+    $("#viewer-registration-fields").hidden = manager;
+    $("#manager-registration-fields").hidden = !manager;
+    $("#register-viewer-code").required = !manager;
+    $("#register-manager-invite").required = manager;
+    $("#register-space-name").required = manager;
+    $$(".registration-kind-option").forEach((option) => {
+      const input = option.querySelector('input[name="registrationKind"]');
+      option.classList.toggle("is-active", Boolean(input && input.checked));
+    });
+    $("#register-notice-title").textContent = manager
+      ? "用 Blue 的邀请创建独立管理端"
+      : "用识别码加入一个 Day1";
+    $("#register-notice-copy").textContent = manager
+      ? "创建后只管理自己的记录，不能操作其他管理端。"
+      : "注册后只能查看对方公开的记录，并给管理者留言。";
+    $("#register-submit").textContent = manager ? "创建我的管理端" : "创建访客账号";
+    setMessage($("#auth-message"), "");
   }
 
   function configureRegistration(open) {
@@ -580,26 +708,94 @@
 
   function accountDetails() {
     const email = state.user ? state.user.email : "";
-    const initial = (email.charAt(0) || "Q").toUpperCase();
+    const displayName = state.user ? textValue(state.user.displayName) : "";
+    const initial = (displayName.charAt(0) || email.charAt(0) || "Q").toUpperCase();
     $("#account-email").textContent = email || "—";
-    $("#account-email-short").textContent = email ? email.split("@")[0] : "账户";
+    $("#account-email-short").textContent = displayName || (email ? email.split("@")[0] : "账户");
     $("#account-avatar").textContent = initial;
     $("#account-avatar-large").textContent = initial;
-    const owner = state.user && state.user.role === "owner";
-    $("#account-role-label").textContent = owner ? "管理者" : "只读访客";
-    $("#role-badge").textContent = owner && state.mode === "owner" ? "管理者" : "只读";
+    const roleLabel = isPlatformAdmin()
+      ? "Blue 平台管理员"
+      : (state.user && ["owner", "manager"].includes(state.user.role) ? "管理者" : "只读访客");
+    $("#account-role-label").textContent = roleLabel;
+    const badge = $("#role-badge");
+    badge.textContent = state.mode === "platform"
+      ? "平台"
+      : (canManageActiveWorkspace() ? "管理者" : "只读");
+    badge.classList.toggle("is-owner", canManageActiveWorkspace() || state.mode === "platform");
+    $("#account-platform-overview").hidden = !isPlatformAdmin();
+    $("#platform-entry-wrap").hidden = !isPlatformAdmin();
   }
 
   async function loadSession() {
     const payload = await api("/api/session");
     state.csrfToken = payload.csrfToken;
     state.user = payload.user;
+    state.spaces = (Array.isArray(payload.spaces) ? payload.spaces : []).map(normalizeSpace).filter(Boolean);
+    state.defaultSpaceId = textValue(payload.defaultSpaceId);
     configureRegistration(Boolean(payload.registrationOpen));
+    const storedSpaceId = sessionStorage.getItem(ACTIVE_SPACE_KEY) || "";
+    const currentIsKnown = Boolean(state.activeSpaceId && spaceById(state.activeSpaceId));
+    if (!currentIsKnown) {
+      state.activeSpaceId = [storedSpaceId, state.defaultSpaceId]
+        .find((publicId) => Boolean(publicId && spaceById(publicId)))
+        || (state.spaces[0] ? state.spaces[0].publicId : "");
+    }
     return payload;
   }
 
+  async function refreshSpaceAccess() {
+    if (!state.user || !state.activeSpaceId || state.returnToPlatform || ["platform", "connection-lost"].includes(state.mode)) return;
+    const payload = await api("/api/session");
+    if (!payload.authenticated || !payload.user) {
+      showAuth();
+      return;
+    }
+    state.csrfToken = payload.csrfToken || state.csrfToken;
+    state.user = payload.user;
+    const spaces = (Array.isArray(payload.spaces) ? payload.spaces : []).map(normalizeSpace).filter(Boolean);
+    const current = spaces.find((space) => space.publicId === state.activeSpaceId);
+    state.spaces = spaces;
+    if (!current) {
+      handleDeletedSpace({
+        error: "这个管理端已被删除，相关记录与访客连接已不再保留。",
+      });
+      return;
+    }
+    if (current.connectionStatus === "revoked") {
+      state.workspace = current;
+      state.access = current.access;
+      handleRevokedConnection({
+        revokedReason: current.revokedReason,
+      });
+      return;
+    }
+    if (current.connectionStatus === "blocked") {
+      state.workspace = current;
+      state.access = current.access;
+      handleBlockedConnection({ error: current.revokedReason });
+      return;
+    }
+    state.workspace = Object.assign({}, state.workspace || {}, current);
+    state.access = current.access;
+    renderWorkspaceChrome();
+    configureMessageWidget();
+  }
+
   async function loadData() {
+    if (!state.activeSpaceId) throw new ApiError("请先连接或选择一个 Day1。", 400, "space_required");
     const payload = await api("/api/data");
+    const workspace = normalizeSpace(Object.assign({}, payload.workspace || {}, {
+      access: payload.access || (payload.workspace && payload.workspace.access),
+    })) || spaceById(state.activeSpaceId);
+    state.workspace = workspace;
+    state.access = payload.access === "owner" || (workspace && workspace.access === "owner") ? "owner" : "viewer";
+    if (workspace) {
+      workspace.access = state.access;
+      const existingIndex = state.spaces.findIndex((space) => space.publicId === workspace.publicId);
+      if (existingIndex >= 0) state.spaces.splice(existingIndex, 1, workspace);
+      else state.spaces.push(workspace);
+    }
     state.tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
     state.stats = payload.stats && typeof payload.stats === "object" ? payload.stats : {};
     state.publicPoms = payload.publicPoms && typeof payload.publicPoms === "object" ? payload.publicPoms : {};
@@ -608,17 +804,43 @@
     const years = Array.from(new Set([currentYear, state.historyYear, state.visitorHistoryYear]));
     await Promise.all(years.map((year) => loadStageYear(year)));
     renderAll();
+    renderWorkspaceChrome();
   }
 
   async function enterApp() {
-    showPrimaryView("app");
-    const owner = state.user && state.user.role === "owner";
-    if (!owner) clearPrivateClientState();
-    $("#view-switcher").hidden = !owner;
-    state.mode = owner && sessionStorage.getItem(PREVIEW_KEY) !== "visitor" ? "owner" : "visitor";
     accountDetails();
-    await loadData();
-    setMode(state.mode);
+    renderWorkspaceMenu();
+    const selectedSpace = spaceById(state.activeSpaceId);
+    if (!selectedSpace) {
+      showPrimaryView("app");
+      showConnectionLost("你还没有连接任何预览端。输入识别码后，就能在这里查看对应的 Day1。", true, "empty");
+      return;
+    }
+    if (selectedSpace.connectionStatus === "revoked") {
+      showPrimaryView("app");
+      state.workspace = selectedSpace;
+      state.access = selectedSpace.access;
+      showConnectionLost(selectedSpace.revokedReason, false, "revoked");
+      return;
+    }
+    if (selectedSpace.connectionStatus === "blocked") {
+      showPrimaryView("app");
+      state.workspace = selectedSpace;
+      state.access = selectedSpace.access;
+      showConnectionLost(selectedSpace.revokedReason, false, "blocked");
+      return;
+    }
+    const preferredMode = selectedSpace.access === "owner" && sessionStorage.getItem(PREVIEW_KEY) !== "visitor"
+      ? "owner"
+      : "visitor";
+    try {
+      await loadData();
+    } catch (error) {
+      if (["preview_access_revoked", "visitor_ip_blocked", "space_deleted", "space_access_required"].includes(error.code)) return;
+      throw error;
+    }
+    showPrimaryView("app");
+    setMode(preferredMode);
     checkLegacyData();
     if (state.user.mustChangePassword) openPasswordDialog(true);
   }
@@ -629,20 +851,35 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.spaces = [];
+    state.defaultSpaceId = "";
+    state.activeSpaceId = "";
+    state.workspace = null;
+    state.access = "";
+    state.platformOverview = null;
+    state.platformIpAccess = null;
+    state.deleteSpaceTarget = null;
+    state.connectionLostKind = "";
+    state.connectionLostReason = "";
+    state.messagesPayload = null;
+    state.lastAccessCheckAt = 0;
     state.selectedOwnerDate = "";
     state.selectedVisitorDate = "";
     state.activeStage = null;
     state.stageYears = {};
     state.forcedPasswordChange = false;
     sessionStorage.removeItem(PREVIEW_KEY);
+    sessionStorage.removeItem(ACTIVE_SPACE_KEY);
     $("#login-form").reset();
     $("#register-form").reset();
     resetPasswordVisibility();
+    switchRegistrationKind("viewer");
     showPrimaryView("auth");
     switchAuthTab("login");
   }
 
   function clearPrivateClientState() {
+    state.privateRequestEpoch += 1;
     window.clearTimeout(state.focusSaveTimer);
     state.focusSaveTimer = null;
     state.stats = {};
@@ -688,12 +925,57 @@
     $("#stage-form").reset();
     $("#stage-complete-form").reset();
     $("#password-form").reset();
+    $("#message-form").reset();
+    $("#message-panel").hidden = true;
+    $("#message-toggle").setAttribute("aria-expanded", "false");
+    clearMessageContent();
+    state.viewerCode = "";
+    state.viewerCodeConnections = 0;
+    $("#viewer-code-value").textContent = "展开后载入";
+    $("#viewer-code-connections").textContent = "—";
+    $("#copy-viewer-code").disabled = true;
+    $("#open-refresh-viewer-code").disabled = true;
+    state.platformOverview = null;
+    state.platformIpAccess = null;
+    state.deleteSpaceTarget = null;
+    $("#platform-space-count").textContent = "—";
+    $("#platform-user-count").textContent = "—";
+    $("#platform-connection-count").textContent = "—";
+    $("#platform-spaces-list").replaceChildren();
+    $("#platform-users-list").replaceChildren();
+    $("#platform-visitor-ip-list").replaceChildren();
+    $("#platform-ip-block-list").replaceChildren();
+    $("#platform-blacklist-count").textContent = "0 条";
+    setMessage($("#platform-message"), "");
+    $("#manager-invite-code").textContent = "—";
+    $("#manager-invite-result").hidden = true;
+    $("#manager-invite-empty").hidden = false;
+    setMessage($("#manager-invite-message"), "");
+    $("#delete-space-form").reset();
+    $("#delete-space-submit").disabled = true;
+    setMessage($("#delete-space-message"), "");
+    $("#ip-block-form").reset();
+    setMessage($("#ip-block-message"), "");
+    $("#workspace-danger-zone").hidden = true;
+    $("#workspace-danger-zone").open = false;
     clearProgressFiles();
     clearStageImagePreview();
-    ["#task-dialog", "#progress-dialog", "#proof-dialog", "#stage-dialog", "#stage-complete-dialog", "#proof-view-dialog", "#password-dialog", "#confirm-dialog"].forEach((selector) => {
+    ["#task-dialog", "#progress-dialog", "#proof-dialog", "#stage-dialog", "#stage-complete-dialog", "#proof-view-dialog", "#password-dialog", "#confirm-dialog", "#connect-space-dialog", "#refresh-viewer-code-dialog", "#delete-space-dialog", "#ip-block-dialog", "#manager-invite-dialog"].forEach((selector) => {
       const dialog = $(selector);
       if (dialog.open) closeDialog(dialog);
     });
+  }
+
+  function clearWorkspaceState() {
+    state.tasks = [];
+    state.stats = {};
+    state.publicPoms = {};
+    state.activeStage = null;
+    state.stageYears = {};
+    state.workspace = null;
+    state.access = "";
+    clearPrivateClientState();
+    accountDetails();
   }
 
   async function bootstrap() {
@@ -711,20 +993,322 @@
     }
   }
 
+  function workspaceOption(space) {
+    const button = document.createElement("button");
+    button.className = "workspace-option";
+    button.type = "button";
+    button.dataset.workspaceId = space.publicId;
+    if (space.publicId === state.activeSpaceId && state.mode !== "platform") {
+      button.classList.add("is-current");
+      button.setAttribute("aria-current", "page");
+    }
+    if (space.connectionStatus === "revoked") button.classList.add("is-revoked");
+    if (space.connectionStatus === "blocked") button.classList.add("is-blocked");
+
+    const mark = document.createElement("span");
+    mark.className = "workspace-option-mark";
+    mark.setAttribute("aria-hidden", "true");
+    mark.textContent = (space.name.charAt(0) || "D").toUpperCase();
+
+    const copy = document.createElement("span");
+    const name = document.createElement("strong");
+    name.textContent = space.name;
+    const meta = document.createElement("small");
+    meta.textContent = space.connectionStatus === "revoked"
+      ? "连接已失效"
+      : (space.connectionStatus === "blocked"
+        ? "当前网络受限"
+        : (space.access === "owner" ? "我的管理端" : "只读预览"));
+    copy.append(name, meta);
+
+    const indicator = document.createElement("span");
+    indicator.className = "workspace-option-indicator";
+    indicator.setAttribute("aria-hidden", "true");
+    indicator.textContent = space.publicId === state.activeSpaceId && state.mode !== "platform" ? "✓" : "›";
+    button.append(mark, copy, indicator);
+    button.addEventListener("click", () => switchWorkspace(space.publicId));
+    return button;
+  }
+
+  function renderWorkspaceMenu() {
+    const list = $("#workspace-list");
+    list.replaceChildren();
+    if (!state.spaces.length) {
+      const empty = document.createElement("p");
+      empty.className = "workspace-list-empty";
+      empty.textContent = "还没有可切换的端。";
+      list.appendChild(empty);
+    } else {
+      const ordered = state.spaces.slice().sort((a, b) => {
+        if (a.access !== b.access) return a.access === "owner" ? -1 : 1;
+        return a.name.localeCompare(b.name, "zh-CN");
+      });
+      ordered.forEach((space) => list.appendChild(workspaceOption(space)));
+    }
+    $("#platform-entry-wrap").hidden = !isPlatformAdmin();
+  }
+
+  function renderWorkspaceChrome() {
+    const space = activeSpace();
+    const name = space ? space.name : "未连接端";
+    $("#active-workspace-name").textContent = state.mode === "platform" ? "平台概览" : name;
+    $("#active-workspace-access").textContent = state.mode === "platform"
+      ? "Blue 平台"
+      : (space && ["revoked", "blocked"].includes(space.connectionStatus)
+        ? (space.connectionStatus === "blocked" ? "访问受限" : "连接已失效")
+        : (state.access === "owner" ? "我的管理端" : "只读预览"));
+    $("#workspace-mark").textContent = state.mode === "platform" ? "P" : ((name.charAt(0) || "D").toUpperCase());
+    $("#footer-workspace-name").textContent = state.mode === "platform"
+      ? "Blue 平台"
+      : (space ? space.name : "BlueDay1");
+    $("#view-switcher").hidden = !(state.access === "owner" && ["owner", "visitor"].includes(state.mode));
+    $("#workspace-view-actions-mobile").hidden = !(state.access === "owner" && ["owner", "visitor"].includes(state.mode));
+    const canDeleteOwnSpace = Boolean(
+      space
+      && state.access === "owner"
+      && !space.isBlueSpace
+      && !isPlatformAdmin(),
+    );
+    $("#workspace-danger-zone").hidden = !canDeleteOwnSpace;
+    if (!canDeleteOwnSpace) $("#workspace-danger-zone").open = false;
+    renderWorkspaceMenu();
+    accountDetails();
+  }
+
+  function showDashboardView(name) {
+    ["owner", "visitor", "platform", "connection-lost"].forEach((view) => {
+      const element = $(`#${view}-view`);
+      if (element) element.hidden = view !== name;
+    });
+  }
+
+  function showConnectionLost(reason, noSpaces, kind) {
+    const nextKind = noSpaces ? "empty" : (kind || state.connectionLostKind || "revoked");
+    state.mode = "connection-lost";
+    state.connectionLostKind = nextKind;
+    state.connectionLostReason = textValue(reason, "管理者已经刷新识别码，请向管理者获取新的识别码。");
+    showDashboardView("connection-lost");
+    const title = nextKind === "blocked"
+      ? "当前网络暂时无法访问预览"
+      : (nextKind === "deleted"
+        ? "这个管理端已被删除"
+        : (noSpaces ? "还没有连接的预览端" : "这个预览连接已失效"));
+    $("#connection-lost-title").textContent = title;
+    $("#connection-lost-reason").textContent = state.connectionLostReason;
+    $("#connection-lost-kicker").textContent = nextKind === "blocked"
+      ? "BlueDay1 · 访问安全"
+      : "BlueDay1 · 预览连接";
+    const mark = $("#connection-lost-mark");
+    mark.textContent = nextKind === "blocked" ? "!" : (nextKind === "deleted" ? "—" : "×");
+    mark.classList.toggle("is-blocked", nextKind === "blocked");
+    mark.classList.toggle("is-deleted", nextKind === "deleted");
+    const primary = $("#connection-lost-primary");
+    primary.textContent = nextKind === "blocked" ? "重新检查" : (nextKind === "deleted" ? "连接其他端" : "输入新识别码");
+    primary.dataset.connectionAction = nextKind === "blocked" ? "retry" : "connect";
+    const alternatives = state.spaces.filter((space) => space.publicId !== state.activeSpaceId && space.connectionStatus === "active");
+    $("#switch-after-connection-lost").hidden = alternatives.length === 0;
+    $("#preview-banner").hidden = true;
+    $("#message-widget").hidden = true;
+    renderWorkspaceChrome();
+  }
+
+  function handleRevokedConnection(payload) {
+    const reason = textValue(payload && (payload.revokedReason || payload.error), "管理者已经刷新识别码，请向管理者获取新的识别码。");
+    const current = spaceById(state.activeSpaceId);
+    if (current) {
+      current.connectionStatus = "revoked";
+      current.revokedReason = reason;
+    }
+    state.tasks = [];
+    state.stats = {};
+    state.publicPoms = {};
+    state.activeStage = null;
+    state.stageYears = {};
+    state.messagesPayload = null;
+    clearPrivateClientState();
+    showPrimaryView("app");
+    showConnectionLost(reason, false, "revoked");
+  }
+
+  function handleBlockedConnection(payload) {
+    const reason = textValue(
+      payload && (payload.revokedReason || payload.error),
+      "当前网络地址已被 Blue 平台加入访客黑名单，暂时无法访问预览端。如有疑问请联系 Blue。",
+    );
+    const current = spaceById(state.activeSpaceId);
+    if (current) {
+      current.connectionStatus = "blocked";
+      current.revokedReason = reason;
+      state.workspace = current;
+      state.access = current.access;
+    }
+    state.tasks = [];
+    state.stats = {};
+    state.publicPoms = {};
+    state.activeStage = null;
+    state.stageYears = {};
+    state.messagesPayload = null;
+    clearPrivateClientState();
+    showPrimaryView("app");
+    showConnectionLost(reason, false, "blocked");
+  }
+
+  function handleDeletedSpace(payload, deletedSpaceId) {
+    const deletedId = deletedSpaceId || state.activeSpaceId;
+    const reason = textValue(
+      payload && (payload.deletedReason || payload.error),
+      "这个管理端已被删除，相关记录、附件与访客连接已不再保留。",
+    );
+    state.spaces = state.spaces.filter((space) => space.publicId !== deletedId);
+    state.tasks = [];
+    state.stats = {};
+    state.publicPoms = {};
+    state.activeStage = null;
+    state.stageYears = {};
+    state.workspace = null;
+    state.access = "";
+    state.messagesPayload = null;
+    state.activeSpaceId = "";
+    sessionStorage.removeItem(ACTIVE_SPACE_KEY);
+    sessionStorage.removeItem(PREVIEW_KEY);
+    clearPrivateClientState();
+    showPrimaryView("app");
+    if (isPlatformAdmin() && state.returnToPlatform) {
+      state.returnToPlatform = false;
+      setMode("platform");
+      toast("这个管理端已被删除，已返回平台概览。", "success");
+      void loadPlatformOverview();
+      return;
+    }
+    showConnectionLost(reason, false, "deleted");
+  }
+
+  async function reconcileMissingSpaceAccess(payload) {
+    const missingSpaceId = state.activeSpaceId;
+    try {
+      await loadSession();
+    } catch (_error) {
+      return;
+    }
+    const current = spaceById(missingSpaceId);
+    if (!current) {
+      handleDeletedSpace(payload, missingSpaceId);
+      return;
+    }
+    state.activeSpaceId = missingSpaceId;
+    state.workspace = current;
+    state.access = current.access;
+    if (current.connectionStatus === "blocked") handleBlockedConnection({ error: current.revokedReason });
+    else if (current.connectionStatus === "revoked") handleRevokedConnection({ error: current.revokedReason });
+  }
+
+  async function handleConnectionLostPrimary() {
+    if (state.connectionLostKind !== "blocked") {
+      openConnectSpaceDialog();
+      return;
+    }
+    const button = $("#connection-lost-primary");
+    const blockedSpaceId = state.activeSpaceId;
+    setLoading(button, true);
+    try {
+      await loadSession();
+      const current = spaceById(blockedSpaceId);
+      if (!current) {
+        handleDeletedSpace({ error: "这个管理端已被删除，相关记录与访客连接已不再保留。" });
+        return;
+      }
+      if (current.connectionStatus === "blocked") {
+        state.workspace = current;
+        state.access = current.access;
+        showConnectionLost(current.revokedReason, false, "blocked");
+        toast("当前网络仍处于访客访问限制中。", "error");
+        return;
+      }
+      await switchWorkspace(current.publicId);
+      toast("访问限制已解除。", "success");
+    } catch (error) {
+      if (!["visitor_ip_blocked", "space_deleted"].includes(error.code)) toast(error.message, "error");
+    } finally {
+      setLoading(button, false);
+    }
+  }
+
+  async function switchWorkspace(publicId, preferredMode, fromPlatform) {
+    const selected = spaceById(publicId) || normalizeSpace({
+      publicId,
+      name: "Day1",
+      access: "viewer",
+      connectionStatus: "active",
+    });
+    if (!selected) return;
+    $("#workspace-menu").open = false;
+    clearWorkspaceState();
+    state.activeSpaceId = selected.publicId;
+    state.workspace = selected;
+    state.access = selected.access;
+    state.returnToPlatform = Boolean(fromPlatform);
+    sessionStorage.setItem(ACTIVE_SPACE_KEY, selected.publicId);
+    if (selected.connectionStatus === "revoked") {
+      showPrimaryView("app");
+      showConnectionLost(selected.revokedReason, false, "revoked");
+      return;
+    }
+    if (selected.connectionStatus === "blocked") {
+      showPrimaryView("app");
+      showConnectionLost(selected.revokedReason, false, "blocked");
+      return;
+    }
+    showPrimaryView("boot");
+    try {
+      await loadData();
+      showPrimaryView("app");
+      const nextMode = preferredMode || (state.access === "owner" && sessionStorage.getItem(PREVIEW_KEY) !== "visitor" ? "owner" : "visitor");
+      setMode(nextMode);
+      checkLegacyData();
+    } catch (error) {
+      if (["preview_access_revoked", "visitor_ip_blocked", "space_deleted", "space_access_required"].includes(error.code)) return;
+      showPrimaryView("app");
+      showConnectionLost(error.message || "暂时无法打开这个端。", false, "revoked");
+    }
+  }
+
   function setMode(mode) {
-    const owner = state.user && state.user.role === "owner";
-    state.mode = owner && mode === "owner" ? "owner" : "visitor";
-    if (owner) sessionStorage.setItem(PREVIEW_KEY, state.mode);
-    $("#owner-view").hidden = state.mode !== "owner";
-    $("#visitor-view").hidden = state.mode !== "visitor";
-    $("#preview-banner").hidden = !(owner && state.mode === "visitor");
+    if (mode === "platform" && isPlatformAdmin()) {
+      state.mode = "platform";
+      showDashboardView("platform");
+      $("#preview-banner").hidden = true;
+      $("#message-widget").hidden = true;
+      clearMessageContent();
+      renderWorkspaceChrome();
+      switchPlatformTab(state.platformTab);
+      return;
+    }
+    if (mode === "connection-lost") {
+      showConnectionLost(state.connectionLostReason, !state.spaces.length, state.connectionLostKind);
+      return;
+    }
+    const ownerMode = mode === "owner" && state.access === "owner";
+    state.mode = ownerMode ? "owner" : "visitor";
+    if (state.access === "owner") sessionStorage.setItem(PREVIEW_KEY, state.mode);
+    showDashboardView(state.mode);
+    const ownPreview = state.access === "owner" && state.mode === "visitor";
+    const platformPreview = state.returnToPlatform && state.mode === "visitor";
+    $("#preview-banner").hidden = !(ownPreview || platformPreview);
+    $("#preview-banner-title").textContent = platformPreview ? "平台只读预览" : "访客预览";
+    $("#preview-banner-copy").textContent = platformPreview
+      ? "你可以检查这个端的公开页面，但不能修改记录或查看私密留言。"
+      : "这是其他账号看到的只读页面。";
+    $("#exit-preview-button").textContent = platformPreview ? "返回平台" : "返回管理";
+    $("#exit-preview-button").dataset.switchView = platformPreview ? "platform" : "owner";
     $$('[data-switch-view]').forEach((button) => {
       const active = button.dataset.switchView === state.mode;
       button.classList.toggle("is-active", active);
       button.setAttribute("aria-pressed", String(active));
     });
-    accountDetails();
+    renderWorkspaceChrome();
     if (state.mode === "visitor") renderVisitor();
+    configureMessageWidget();
+    if (state.mode === "owner" && $("#access-tools").open && !state.viewerCode) loadViewerCode();
   }
 
   function updateStatus(element, task, emptyText, pendingText) {
@@ -824,7 +1408,7 @@
   }
 
   function renderOwner() {
-    if (!state.user || state.user.role !== "owner") return;
+    if (!state.user || state.access !== "owner") return;
     const today = dateKeyInShanghai();
     const tomorrow = shiftDate(today, 1);
     const todayTask = taskFor(today);
@@ -874,6 +1458,15 @@
   function renderVisitor() {
     const today = dateKeyInShanghai();
     const task = taskFor(today);
+    const workspace = activeSpace();
+    const workspaceName = workspace ? workspace.name : "Day1";
+    const mascotEnabled = Boolean(workspace && workspace.appearance && workspace.appearance.mascotEnabled);
+    $("#visitor-page-title").textContent = `${workspaceName} 的每日记录`;
+    $("#visitor-record-kicker").hidden = false;
+    $("#visitor-mascot").hidden = !mascotEnabled;
+    $("#visitor-day1-seal").hidden = mascotEnabled;
+    $("#visitor-heading").classList.toggle("visitor-heading-with-mascot", mascotEnabled);
+    $("#visitor-heading").classList.toggle("visitor-heading-with-seal", !mascotEnabled);
     $("#visitor-context-line").textContent = contextualCopy(task, true);
     $("#visitor-mascot").classList.toggle("is-resting", Boolean(task && taskHasResult(task)));
     $("#visitor-mascot").classList.toggle("is-following", Boolean(task && taskHasProgress(task) && !taskHasResult(task)));
@@ -1182,7 +1775,7 @@
   }
 
   function openTaskEditor(key) {
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    if (!canManageActiveWorkspace()) return;
     const task = taskFor(key);
     if (task && taskHasResult(task)) {
       toast("已记录最终结果的任务不能直接修改。", "error");
@@ -1201,6 +1794,7 @@
 
   async function saveTask(event) {
     event.preventDefault();
+    if (!canManageActiveWorkspace()) return;
     const button = $("#save-task-button");
     const key = $("#task-date-input").value;
     const text = $("#task-text-input").value.trim();
@@ -1242,6 +1836,7 @@
   }
 
   async function deleteTask() {
+    if (!canManageActiveWorkspace()) return;
     const key = $("#task-date-input").value;
     const confirmed = await confirmAction(`确定删除 ${key} 的任务吗？`, "删除任务");
     if (!confirmed) return;
@@ -1453,7 +2048,7 @@
   }
 
   function openProgressEditor(key) {
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    if (!canManageActiveWorkspace()) return;
     const task = taskFor(key);
     if (!task) return;
     clearProgressFiles();
@@ -1492,7 +2087,7 @@
 
   async function submitProgress(event) {
     event.preventDefault();
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    if (!canManageActiveWorkspace()) return;
     const key = $("#progress-date-input").value;
     const button = $("#submit-progress-button");
     const rawLinks = $("#progress-links-input").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
@@ -1617,7 +2212,7 @@
   }
 
   function openProofEditor(key) {
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    if (!canManageActiveWorkspace()) return;
     const task = taskFor(key);
     if (!task) return;
     $("#proof-date-input").value = key;
@@ -1638,6 +2233,7 @@
 
   async function submitProof(event) {
     event.preventDefault();
+    if (!canManageActiveWorkspace()) return;
     const key = $("#proof-date-input").value;
     const task = taskFor(key);
     const resultStatus = selectedResultStatus();
@@ -1723,7 +2319,7 @@
   }
 
   function isRemovableProgressAsset(entry, asset) {
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return false;
+    if (!canManageActiveWorkspace()) return false;
     if (!entry || entry.legacy || !asset) return false;
     return /^\d+$/.test(String(entry.id)) && /^\d+$/.test(String(asset.id));
   }
@@ -2007,7 +2603,7 @@
     if (task) renderDailyRecord(task);
     const hasFocus = renderFocusRecord(key);
     const hasPrivate = renderPrivateRecord(key, scope);
-    const canAddProgress = Boolean(task && scope === "owner" && state.user && state.user.role === "owner" && state.mode === "owner");
+    const canAddProgress = Boolean(task && scope === "owner" && canManageActiveWorkspace());
     $("#record-add-progress").hidden = !canAddProgress;
     $("#record-add-progress").dataset.taskDate = canAddProgress ? key : "";
     const sectionCount = Number(Boolean(stage)) + Number(Boolean(task)) + Number(hasFocus) + Number(hasPrivate);
@@ -2026,7 +2622,7 @@
   }
 
   function openStageEditor() {
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    if (!canManageActiveWorkspace()) return;
     const stage = state.activeStage;
     $("#stage-form").reset();
     $("#stage-id-input").value = stage ? String(stage.id) : "";
@@ -2043,7 +2639,7 @@
 
   async function saveStage(event) {
     event.preventDefault();
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    if (!canManageActiveWorkspace()) return;
     const id = $("#stage-id-input").value;
     const title = $("#stage-title-input").value.trim();
     const description = $("#stage-description-input").value.trim();
@@ -2071,7 +2667,7 @@
   }
 
   function openStageCompletion() {
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner" || !state.activeStage) return;
+    if (!canManageActiveWorkspace() || !state.activeStage) return;
     clearStageImagePreview();
     $("#stage-complete-form").reset();
     $("#stage-complete-id").value = String(state.activeStage.id);
@@ -2084,7 +2680,7 @@
 
   async function completeStage(event) {
     event.preventDefault();
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    if (!canManageActiveWorkspace()) return;
     const id = $("#stage-complete-id").value;
     const proofText = $("#stage-proof-text").value.trim();
     const proofUrlRaw = $("#stage-proof-url").value.trim();
@@ -2137,7 +2733,7 @@
   }
 
   async function saveFocus(showFeedback) {
-    if (!state.user || state.user.role !== "owner" || state.mode !== "owner") return;
+    if (!canManageActiveWorkspace()) return;
     window.clearTimeout(state.focusSaveTimer);
     const poms = Number.parseInt($("#focus-poms").value, 10);
     const note = $("#focus-note").value;
@@ -2175,7 +2771,13 @@
     const status = $("#legacy-data-status");
     const label = $("#legacy-data-label");
     const button = $("#import-legacy-data");
-    if (!state.user || state.user.role !== "owner") return;
+    if (!state.user || state.access !== "owner" || !isPlatformAdmin()) {
+      status.classList.remove("has-data");
+      status.hidden = true;
+      button.hidden = true;
+      return;
+    }
+    status.hidden = false;
     let valid = false;
     try {
       const value = JSON.parse(localStorage.getItem(LEGACY_KEY) || "null");
@@ -2189,6 +2791,7 @@
   }
 
   async function importLegacyData() {
+    if (!isPlatformAdmin() || state.access !== "owner") return;
     let data;
     try {
       data = JSON.parse(localStorage.getItem(LEGACY_KEY) || "null");
@@ -2215,6 +2818,1078 @@
       toast(error.message, "error");
     } finally {
       if (!button.disabled) setLoading(button, false);
+    }
+  }
+
+  async function copyText(value, successMessage) {
+    const text = textValue(value);
+    if (!text) return false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const input = document.createElement("textarea");
+        input.value = text;
+        input.setAttribute("readonly", "");
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        const copied = document.execCommand("copy");
+        input.remove();
+        if (!copied) throw new Error("copy_failed");
+      }
+      toast(successMessage || "已复制。", "success");
+      return true;
+    } catch (_error) {
+      toast("无法自动复制，请长按代码手动复制。", "error");
+      return false;
+    }
+  }
+
+  async function loadViewerCode() {
+    if (state.access !== "owner" || !state.activeSpaceId) return;
+    const requestEpoch = state.privateRequestEpoch;
+    const requestedSpaceId = state.activeSpaceId;
+    const requestedUserEmail = state.user && state.user.email;
+    setMessage($("#viewer-code-message"), "");
+    $("#viewer-code-value").textContent = "正在载入…";
+    try {
+      const payload = await api("/api/spaces/current/viewer-code");
+      if (
+        state.privateRequestEpoch !== requestEpoch
+        || !state.user
+        || state.user.email !== requestedUserEmail
+        || state.activeSpaceId !== requestedSpaceId
+        || state.access !== "owner"
+      ) return;
+      state.viewerCode = textValue(payload.viewerCode || payload.code);
+      state.viewerCodeConnections = Number.isFinite(Number(payload.activeConnections))
+        ? Number(payload.activeConnections)
+        : 0;
+      $("#viewer-code-value").textContent = state.viewerCode || "尚未生成";
+      $("#viewer-code-connections").textContent = `${state.viewerCodeConnections} 个有效访客连接`;
+      $("#copy-viewer-code").disabled = !state.viewerCode;
+      $("#open-refresh-viewer-code").disabled = !state.viewerCode;
+    } catch (error) {
+      if (
+        state.privateRequestEpoch !== requestEpoch
+        || !state.user
+        || state.user.email !== requestedUserEmail
+        || state.activeSpaceId !== requestedSpaceId
+        || state.access !== "owner"
+      ) return;
+      $("#viewer-code-value").textContent = "暂时无法载入";
+      $("#copy-viewer-code").disabled = true;
+      $("#open-refresh-viewer-code").disabled = true;
+      setMessage($("#viewer-code-message"), error.message);
+    }
+  }
+
+  function openRefreshViewerCodeDialog() {
+    if (!state.viewerCode || state.access !== "owner") return;
+    $("#refresh-viewer-code-form").reset();
+    $("#refresh-viewer-code-submit").disabled = true;
+    $("#refresh-viewer-code-impact").textContent = state.viewerCodeConnections > 0
+      ? `将断开 ${state.viewerCodeConnections} 个现有访客连接`
+      : "将让当前识别码立即失效";
+    setMessage($("#refresh-viewer-code-message"), "");
+    showDialog($("#refresh-viewer-code-dialog"));
+    window.setTimeout(() => $("#refresh-viewer-code-confirmation").focus(), 0);
+  }
+
+  function validateViewerCodeRefresh() {
+    const matches = $("#refresh-viewer-code-confirmation").value.trim() === VIEWER_CODE_REFRESH_CONFIRMATION;
+    $("#refresh-viewer-code-submit").disabled = !matches;
+    return matches;
+  }
+
+  async function refreshViewerCode(event) {
+    event.preventDefault();
+    if (!validateViewerCodeRefresh() || state.access !== "owner") return;
+    const button = $("#refresh-viewer-code-submit");
+    setLoading(button, true);
+    setMessage($("#refresh-viewer-code-message"), "");
+    try {
+      const payload = await api("/api/spaces/current/viewer-code/refresh", {
+        method: "POST",
+        body: { confirmation: VIEWER_CODE_REFRESH_CONFIRMATION },
+      });
+      state.viewerCode = textValue(payload.viewerCode || payload.code);
+      state.viewerCodeConnections = Number.isFinite(Number(payload.activeConnections)) ? Number(payload.activeConnections) : 0;
+      $("#viewer-code-value").textContent = state.viewerCode || "已刷新";
+      $("#viewer-code-connections").textContent = `${state.viewerCodeConnections} 个有效访客连接`;
+      $("#copy-viewer-code").disabled = !state.viewerCode;
+      closeDialog($("#refresh-viewer-code-dialog"));
+      toast("识别码已刷新，旧连接已经失效。", "success");
+    } catch (error) {
+      setMessage($("#refresh-viewer-code-message"), error.message);
+    } finally {
+      setLoading(button, false);
+      validateViewerCodeRefresh();
+    }
+  }
+
+  function openConnectSpaceDialog() {
+    $("#workspace-menu").open = false;
+    $("#connect-space-form").reset();
+    setMessage($("#connect-space-message"), "");
+    showDialog($("#connect-space-dialog"));
+    window.setTimeout(() => $("#connect-space-code").focus(), 0);
+  }
+
+  async function connectSpace(event) {
+    event.preventDefault();
+    const viewerCode = $("#connect-space-code").value.trim();
+    if (!viewerCode) {
+      setMessage($("#connect-space-message"), "请输入预览识别码。");
+      return;
+    }
+    const previousIds = new Set(state.spaces.map((space) => space.publicId));
+    const button = $("#connect-space-submit");
+    setLoading(button, true);
+    setMessage($("#connect-space-message"), "");
+    try {
+      const payload = await api("/api/spaces/connect", { method: "POST", body: { viewerCode } });
+      const returnedSpace = normalizeSpace(payload && (payload.space || payload.workspace));
+      await loadSession();
+      if (returnedSpace) {
+        const index = state.spaces.findIndex((space) => space.publicId === returnedSpace.publicId);
+        if (index >= 0) state.spaces.splice(index, 1, returnedSpace);
+        else state.spaces.push(returnedSpace);
+      }
+      const publicId = textValue(
+        payload && (payload.publicId || payload.spaceId || (payload.space && payload.space.publicId)),
+      ) || (returnedSpace && returnedSpace.publicId)
+        || (state.spaces.find((space) => !previousIds.has(space.publicId) && space.connectionStatus === "active") || {}).publicId
+        || state.activeSpaceId;
+      closeDialog($("#connect-space-dialog"));
+      toast("预览端已连接。", "success");
+      if (publicId) await switchWorkspace(publicId, "visitor");
+      else renderWorkspaceMenu();
+    } catch (error) {
+      setMessage($("#connect-space-message"), error.message);
+    } finally {
+      setLoading(button, false);
+    }
+  }
+
+  function platformSpaces(payload) {
+    const values = payload && (payload.spaces || payload.managers || payload.workspaces);
+    return Array.isArray(values) ? values : [];
+  }
+
+  function platformUsers(payload) {
+    const values = payload && (payload.users || payload.sessions || payload.loggedInUsers);
+    return Array.isArray(values) ? values : [];
+  }
+
+  function platformCount(payload, keys, fallback) {
+    for (const key of keys) {
+      const direct = payload && payload[key];
+      const nested = payload && payload.counts && payload.counts[key];
+      const value = direct !== undefined ? direct : nested;
+      if (Number.isFinite(Number(value))) return Number(value);
+    }
+    return fallback;
+  }
+
+  function platformSpaceRow(rawSpace) {
+    const space = normalizeSpace(Object.assign({}, rawSpace, {
+      access: rawSpace && rawSpace.access ? rawSpace.access : "viewer",
+    }));
+    if (!space) return null;
+    const row = document.createElement("article");
+    row.className = "platform-list-row";
+
+    const identity = document.createElement("div");
+    identity.className = "platform-list-identity";
+    const mark = document.createElement("span");
+    mark.className = "workspace-option-mark";
+    mark.setAttribute("aria-hidden", "true");
+    mark.textContent = (space.name.charAt(0) || "D").toUpperCase();
+    const copy = document.createElement("p");
+    const title = document.createElement("strong");
+    title.textContent = space.name;
+    const owner = document.createElement("span");
+    owner.textContent = textValue(
+      rawSpace && (
+        rawSpace.ownerDisplayName
+        || rawSpace.ownerName
+        || rawSpace.ownerEmail
+        || (rawSpace.owner && (rawSpace.owner.displayName || rawSpace.owner.email))
+      ),
+      "独立管理端",
+    );
+    copy.append(title, owner);
+    identity.append(mark, copy);
+
+    const meta = document.createElement("div");
+    meta.className = "platform-list-meta";
+    const connections = Number(rawSpace && (rawSpace.activeConnections ?? rawSpace.viewerCount ?? rawSpace.visitorCount ?? rawSpace.connectionCount));
+    const users = Number(rawSpace && (rawSpace.loggedInUsers ?? rawSpace.activeUsers));
+    const connectionLabel = document.createElement("span");
+    connectionLabel.textContent = `${Number.isFinite(connections) ? connections : 0} 个访客连接`;
+    const userLabel = document.createElement("span");
+    userLabel.textContent = Number.isFinite(users) ? `${users} 个登录用户` : "只读预览权限";
+    meta.append(connectionLabel, userLabel);
+
+    const actions = document.createElement("div");
+    actions.className = "platform-list-actions";
+    const preview = document.createElement("button");
+    preview.className = "button button-quiet button-small";
+    preview.type = "button";
+    preview.textContent = "预览";
+    preview.addEventListener("click", async () => {
+      if (!spaceById(space.publicId)) state.spaces.push(space);
+      await switchWorkspace(space.publicId, "visitor", true);
+    });
+    const mascot = document.createElement("button");
+    mascot.className = "menu-button";
+    mascot.type = "button";
+    const mascotEnabled = Boolean(rawSpace && rawSpace.appearance && rawSpace.appearance.mascotEnabled);
+    mascot.textContent = mascotEnabled ? "移除小精灵" : "添加小精灵";
+    mascot.addEventListener("click", async () => {
+      more.open = false;
+      setLoading(mascot, true);
+      try {
+        await api(`/api/platform/spaces/${encodeURIComponent(space.publicId)}/mascot`, {
+          method: "POST",
+          body: { enabled: !mascotEnabled },
+        });
+        await loadPlatformOverview();
+        toast(mascotEnabled ? "已移除这个端的小精灵。" : "已为这个端添加小精灵。", "success");
+      } catch (error) {
+        toast(error.message, "error");
+      } finally {
+        setLoading(mascot, false);
+      }
+    });
+    const more = document.createElement("details");
+    more.className = "platform-more-menu";
+    const moreTrigger = document.createElement("summary");
+    moreTrigger.className = "button button-quiet button-small platform-more-trigger";
+    moreTrigger.textContent = "更多";
+    moreTrigger.setAttribute("aria-label", `${space.name} 的更多操作`);
+    const morePanel = document.createElement("div");
+    morePanel.className = "platform-more-panel";
+    morePanel.appendChild(mascot);
+    if (!space.isBlueSpace) {
+      const remove = document.createElement("button");
+      remove.className = "menu-button menu-button-danger";
+      remove.type = "button";
+      remove.textContent = "删除管理端…";
+      remove.addEventListener("click", () => {
+        more.open = false;
+        openDeleteSpaceDialog({
+          publicId: space.publicId,
+          name: space.name,
+          source: "platform",
+        });
+      });
+      morePanel.appendChild(remove);
+    }
+    more.append(moreTrigger, morePanel);
+    actions.append(preview, more);
+    row.append(identity, meta, actions);
+    return row;
+  }
+
+  function platformUserRow(user) {
+    const row = document.createElement("article");
+    row.className = "platform-list-row platform-user-row";
+    const identity = document.createElement("div");
+    identity.className = "platform-list-identity";
+    const mark = document.createElement("span");
+    mark.className = "workspace-option-mark";
+    mark.setAttribute("aria-hidden", "true");
+    const name = textValue(user && (user.displayName || user.name || user.email), "用户");
+    mark.textContent = (name.charAt(0) || "U").toUpperCase();
+    const copy = document.createElement("p");
+    const title = document.createElement("strong");
+    title.textContent = name;
+    const email = document.createElement("span");
+    email.textContent = textValue(user && user.email, "未提供邮箱");
+    copy.append(title, email);
+    identity.append(mark, copy);
+    const meta = document.createElement("div");
+    meta.className = "platform-list-meta";
+    const role = document.createElement("span");
+    role.textContent = user && (user.isPlatformAdmin || user.role === "blue")
+      ? "Blue 平台管理员"
+      : (user && ["owner", "manager"].includes(user.role) ? "管理者" : "访客");
+    const current = document.createElement("span");
+    const previewSpaces = user && Array.isArray(user.previewSpaces) ? user.previewSpaces : [];
+    const ownedSpaceName = user && user.ownedSpace
+      ? textValue(typeof user.ownedSpace === "string" ? user.ownedSpace : (user.ownedSpace.name || user.ownedSpace.publicId))
+      : "";
+    current.textContent = textValue(
+      user && (
+        user.spaceName
+        || user.currentSpaceName
+        || ownedSpaceName
+        || (previewSpaces.length ? `已连接 ${previewSpaces.length} 个预览端` : "")
+      ),
+      "当前未进入管理端",
+    );
+    meta.append(role, current);
+    row.append(identity, meta);
+    return row;
+  }
+
+  function spaceDeleteConfirmation(spaceName) {
+    return `我确认删除${spaceName}并知道会清除全部内容`;
+  }
+
+  function openDeleteSpaceDialog(target) {
+    if (!target || !target.publicId || !target.name) return;
+    if (target.source === "owner" && (isPlatformAdmin() || (activeSpace() && activeSpace().isBlueSpace))) return;
+    state.deleteSpaceTarget = {
+      publicId: target.publicId,
+      name: target.name,
+      source: target.source === "platform" ? "platform" : "owner",
+    };
+    const phrase = spaceDeleteConfirmation(target.name);
+    $("#delete-space-name").textContent = target.name;
+    $("#delete-space-phrase").textContent = phrase;
+    $("#delete-space-confirmation").value = "";
+    $("#delete-space-submit").disabled = true;
+    setMessage($("#delete-space-message"), "");
+    showDialog($("#delete-space-dialog"));
+    window.setTimeout(() => $("#delete-space-confirmation").focus(), 0);
+  }
+
+  function openOwnSpaceDeleteDialog() {
+    const space = activeSpace();
+    if (!space || state.access !== "owner" || space.isBlueSpace || isPlatformAdmin()) return;
+    openDeleteSpaceDialog({
+      publicId: space.publicId,
+      name: space.name,
+      source: "owner",
+    });
+  }
+
+  function validateSpaceDeletion() {
+    const target = state.deleteSpaceTarget;
+    const valid = Boolean(
+      target
+      && $("#delete-space-confirmation").value === spaceDeleteConfirmation(target.name),
+    );
+    $("#delete-space-submit").disabled = !valid;
+  }
+
+  async function deleteSpace(event) {
+    event.preventDefault();
+    const target = state.deleteSpaceTarget;
+    if (!target) return;
+    const confirmation = $("#delete-space-confirmation").value;
+    if (confirmation !== spaceDeleteConfirmation(target.name)) {
+      validateSpaceDeletion();
+      setMessage($("#delete-space-message"), "请完整输入上方确认句。");
+      return;
+    }
+    const button = $("#delete-space-submit");
+    setLoading(button, true);
+    setMessage($("#delete-space-message"), "");
+    try {
+      const path = target.source === "platform"
+        ? `/api/platform/spaces/${encodeURIComponent(target.publicId)}`
+        : "/api/spaces/current";
+      await api(path, {
+        method: "DELETE",
+        body: { confirmation },
+      });
+      closeDialog($("#delete-space-dialog"));
+      state.deleteSpaceTarget = null;
+      if (target.source === "owner") {
+        try {
+          await loadSession();
+        } catch (_error) {
+          window.location.reload();
+          return;
+        }
+        showAuth();
+        toast(`${target.name} 已永久删除。`, "success");
+        return;
+      }
+      state.spaces = state.spaces.filter((space) => space.publicId !== target.publicId);
+      if (state.activeSpaceId === target.publicId) {
+        state.activeSpaceId = "";
+        state.workspace = null;
+        state.access = "";
+        sessionStorage.removeItem(ACTIVE_SPACE_KEY);
+      }
+      await loadPlatformOverview();
+      toast(`${target.name} 已永久删除。`, "success");
+    } catch (error) {
+      setMessage($("#delete-space-message"), error.message);
+    } finally {
+      setLoading(button, false);
+      validateSpaceDeletion();
+    }
+  }
+
+  function securityStatusLabel(status) {
+    if (status === "blocked") return "已拉黑";
+    if (status === "revoked") return "连接失效";
+    return "最近活跃";
+  }
+
+  function platformVisitorIpRow(item) {
+    const row = document.createElement("article");
+    row.className = "platform-security-row";
+    const copy = document.createElement("div");
+    copy.className = "platform-security-copy";
+    const heading = document.createElement("div");
+    heading.className = "platform-security-line";
+    const ip = document.createElement("code");
+    ip.textContent = textValue(item && item.ip, "未知地址");
+    const status = document.createElement("span");
+    const statusValue = textValue(item && item.status, "active");
+    status.className = `platform-security-status is-${statusValue}`;
+    status.textContent = securityStatusLabel(statusValue);
+    heading.append(ip, status);
+    const visitor = item && item.visitor ? item.visitor : {};
+    const space = item && item.space ? item.space : {};
+    const identity = textValue(visitor.displayName || visitor.email, "访客");
+    const detail = document.createElement("p");
+    detail.textContent = `${identity} · ${textValue(space.name, "未知端")} · ${completionTime(item && item.lastSeenAt) || "时间未知"}`;
+    copy.append(heading, detail);
+    const action = document.createElement("button");
+    action.className = "button button-danger-quiet button-small";
+    action.type = "button";
+    action.textContent = statusValue === "blocked" ? "已拉黑" : "拉黑";
+    action.disabled = statusValue === "blocked" || !textValue(item && item.ip);
+    action.addEventListener("click", () => openIpBlockDialog(item.ip));
+    row.append(copy, action);
+    return row;
+  }
+
+  function platformIpBlockRow(block) {
+    const row = document.createElement("article");
+    row.className = "platform-security-row";
+    const copy = document.createElement("div");
+    copy.className = "platform-security-copy";
+    const heading = document.createElement("div");
+    heading.className = "platform-security-line";
+    const ip = document.createElement("code");
+    ip.textContent = textValue(block && block.ip, "未知地址");
+    const status = document.createElement("span");
+    status.className = "platform-security-status is-blocked";
+    status.textContent = "已拉黑";
+    heading.append(ip, status);
+    const detail = document.createElement("p");
+    const note = textValue(block && block.note, "无备注");
+    const affected = Number(block && block.affectedConnections);
+    detail.textContent = `${note} · ${Number.isFinite(affected) ? affected : 0} 个现有连接 · ${completionTime(block && block.createdAt) || "时间未知"}`;
+    copy.append(heading, detail);
+    const action = document.createElement("button");
+    action.className = "button button-quiet button-small";
+    action.type = "button";
+    action.textContent = "解除";
+    action.addEventListener("click", () => removeIpBlock(block, action));
+    row.append(copy, action);
+    return row;
+  }
+
+  function renderPlatformIpAccess() {
+    const payload = state.platformIpAccess || {};
+    const visitors = Array.isArray(payload.visitors) ? payload.visitors : [];
+    const blocks = Array.isArray(payload.blocks) ? payload.blocks : [];
+    const visitorList = $("#platform-visitor-ip-list");
+    const blockList = $("#platform-ip-block-list");
+    visitorList.replaceChildren();
+    blockList.replaceChildren();
+    if (!visitors.length) {
+      const empty = document.createElement("p");
+      empty.className = "history-empty";
+      empty.textContent = "还没有可显示的访客地址。";
+      visitorList.appendChild(empty);
+    } else {
+      visitors.forEach((item) => visitorList.appendChild(platformVisitorIpRow(item)));
+    }
+    if (!blocks.length) {
+      const empty = document.createElement("p");
+      empty.className = "history-empty";
+      empty.textContent = "黑名单为空。";
+      blockList.appendChild(empty);
+    } else {
+      blocks.forEach((block) => blockList.appendChild(platformIpBlockRow(block)));
+    }
+    $("#platform-blacklist-count").textContent = `${blocks.length} 条`;
+  }
+
+  async function loadPlatformIpAccess() {
+    if (!isPlatformAdmin()) return;
+    const requestEpoch = state.privateRequestEpoch;
+    const requestedUserEmail = state.user && state.user.email;
+    if (!state.platformIpAccess) {
+      $("#platform-visitor-ip-list").innerHTML = '<p class="history-empty">正在载入访客地址…</p>';
+      $("#platform-ip-block-list").innerHTML = '<p class="history-empty">正在载入黑名单…</p>';
+    }
+    setMessage($("#platform-message"), "");
+    try {
+      const payload = await api("/api/platform/ip-access");
+      if (
+        requestEpoch !== state.privateRequestEpoch
+        || !isPlatformAdmin()
+        || !state.user
+        || state.user.email !== requestedUserEmail
+      ) return;
+      state.platformIpAccess = payload;
+      renderPlatformIpAccess();
+    } catch (error) {
+      if (requestEpoch !== state.privateRequestEpoch) return;
+      setMessage($("#platform-message"), error.message);
+    }
+  }
+
+  function openIpBlockDialog(ip) {
+    if (!isPlatformAdmin()) return;
+    $("#ip-block-form").reset();
+    $("#ip-block-address").value = textValue(ip);
+    setMessage($("#ip-block-message"), "");
+    showDialog($("#ip-block-dialog"));
+    window.setTimeout(() => {
+      const field = $("#ip-block-address");
+      field.focus();
+      if (field.value) field.select();
+    }, 0);
+  }
+
+  async function createIpBlock(event) {
+    event.preventDefault();
+    if (!isPlatformAdmin()) return;
+    const button = $("#ip-block-submit");
+    setLoading(button, true);
+    setMessage($("#ip-block-message"), "");
+    try {
+      const payload = await api("/api/platform/ip-blocks", {
+        method: "POST",
+        body: {
+          ip: $("#ip-block-address").value.trim(),
+          note: $("#ip-block-note").value.trim(),
+        },
+      });
+      closeDialog($("#ip-block-dialog"));
+      state.platformIpAccess = null;
+      await loadPlatformIpAccess();
+      const affected = Number(payload && payload.block && payload.block.affectedConnections);
+      toast(`已加入黑名单${Number.isFinite(affected) && affected > 0 ? `，限制 ${affected} 个现有连接` : ""}。`, "success");
+    } catch (error) {
+      setMessage($("#ip-block-message"), error.message);
+    } finally {
+      setLoading(button, false);
+    }
+  }
+
+  async function removeIpBlock(block, button) {
+    if (!isPlatformAdmin() || !block || !block.id) return;
+    const confirmed = await confirmAction(`解除 ${textValue(block.ip, "这个地址")} 的访客访问限制吗？`, "确认解除");
+    if (!confirmed) return;
+    setLoading(button, true);
+    try {
+      await api(`/api/platform/ip-blocks/${encodeURIComponent(String(block.id))}`, {
+        method: "DELETE",
+      });
+      state.platformIpAccess = null;
+      await loadPlatformIpAccess();
+      toast(`${textValue(block.ip, "该地址")} 已从黑名单移除。`, "success");
+    } catch (error) {
+      if (error.code === "not_found") {
+        state.platformIpAccess = null;
+        await loadPlatformIpAccess();
+        toast("这条黑名单已经被移除。", "success");
+      } else {
+        toast(error.message, "error");
+      }
+    } finally {
+      setLoading(button, false);
+    }
+  }
+
+  function renderPlatformOverview() {
+    const payload = state.platformOverview || {};
+    const spaces = platformSpaces(payload);
+    const users = platformUsers(payload);
+    $("#platform-space-count").textContent = String(platformCount(payload, ["spaceCount", "managerCount"], spaces.length));
+    $("#platform-user-count").textContent = String(platformCount(payload, ["userCount", "loggedInUserCount", "signedInUserCount", "activeSessionCount"], users.length));
+    const fallbackConnections = spaces.reduce((total, space) => {
+      const value = Number(space && (space.activeConnections ?? space.viewerCount ?? space.visitorCount ?? space.connectionCount));
+      return total + (Number.isFinite(value) ? value : 0);
+    }, 0);
+    $("#platform-connection-count").textContent = String(platformCount(payload, ["connectionCount", "activeConnectionCount", "connectedViewerCount"], fallbackConnections));
+
+    const spacesList = $("#platform-spaces-list");
+    spacesList.replaceChildren();
+    if (!spaces.length) {
+      const empty = document.createElement("p");
+      empty.className = "history-empty";
+      empty.textContent = "还没有可查看的管理端。";
+      spacesList.appendChild(empty);
+    } else {
+      spaces.forEach((space) => {
+        const row = platformSpaceRow(space);
+        if (row) spacesList.appendChild(row);
+      });
+    }
+
+    const usersList = $("#platform-users-list");
+    usersList.replaceChildren();
+    if (!users.length) {
+      const empty = document.createElement("p");
+      empty.className = "history-empty";
+      empty.textContent = "当前没有登录用户。";
+      usersList.appendChild(empty);
+    } else {
+      users.forEach((user) => usersList.appendChild(platformUserRow(user)));
+    }
+  }
+
+  async function loadPlatformOverview() {
+    if (!isPlatformAdmin()) return;
+    const requestEpoch = state.privateRequestEpoch;
+    const requestedUserEmail = state.user && state.user.email;
+    setMessage($("#platform-message"), "");
+    try {
+      const payload = await api("/api/platform/overview");
+      if (
+        state.privateRequestEpoch !== requestEpoch
+        || !isPlatformAdmin()
+        || !state.user
+        || state.user.email !== requestedUserEmail
+      ) return;
+      state.platformOverview = payload;
+      renderPlatformOverview();
+    } catch (error) {
+      if (
+        state.privateRequestEpoch !== requestEpoch
+        || !isPlatformAdmin()
+        || !state.user
+        || state.user.email !== requestedUserEmail
+      ) return;
+      setMessage($("#platform-message"), error.message);
+    }
+  }
+
+  async function openPlatformOverview() {
+    if (!isPlatformAdmin()) return;
+    $("#workspace-menu").open = false;
+    $("#account-menu").open = false;
+    state.returnToPlatform = false;
+    setMode("platform");
+    await loadPlatformOverview();
+  }
+
+  function switchPlatformTab(name) {
+    state.platformTab = ["spaces", "users", "access"].includes(name) ? name : "spaces";
+    $$("[data-platform-tab]").forEach((button) => {
+      const active = button.dataset.platformTab === state.platformTab;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+      button.tabIndex = active ? 0 : -1;
+    });
+    $("#platform-spaces-panel").hidden = state.platformTab !== "spaces";
+    $("#platform-users-panel").hidden = state.platformTab !== "users";
+    $("#platform-access-panel").hidden = state.platformTab !== "access";
+    if (state.platformTab === "access") void loadPlatformIpAccess();
+  }
+
+  function handlePlatformTabKeydown(event) {
+    const tabs = $$("[data-platform-tab]");
+    const currentIndex = tabs.indexOf(event.currentTarget);
+    if (currentIndex < 0) return;
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    const next = tabs[nextIndex];
+    switchPlatformTab(next.dataset.platformTab);
+    next.focus();
+  }
+
+  function openManagerInviteDialog() {
+    if (!isPlatformAdmin()) return;
+    $("#manager-invite-result").hidden = true;
+    $("#manager-invite-empty").hidden = false;
+    $("#manager-invite-code").textContent = "—";
+    $("#generate-manager-invite").textContent = "生成邀请码";
+    setMessage($("#manager-invite-message"), "");
+    showDialog($("#manager-invite-dialog"));
+  }
+
+  async function generateManagerInvite(event) {
+    event.preventDefault();
+    if (!isPlatformAdmin()) return;
+    const button = $("#generate-manager-invite");
+    let generated = false;
+    setLoading(button, true);
+    setMessage($("#manager-invite-message"), "");
+    try {
+      const payload = await api("/api/platform/manager-invites", { method: "POST", body: {} });
+      const code = textValue(payload.managerInviteCode || payload.inviteCode || payload.code);
+      if (!code) throw new ApiError("邀请码已生成，但响应中没有可复制的代码。", 500, "missing_invite_code");
+      $("#manager-invite-code").textContent = code;
+      $("#manager-invite-result").hidden = false;
+      $("#manager-invite-empty").hidden = true;
+      generated = true;
+    } catch (error) {
+      setMessage($("#manager-invite-message"), error.message);
+    } finally {
+      setLoading(button, false);
+      if (generated) button.textContent = "再生成一个";
+    }
+  }
+
+  function messageWindow() {
+    const payload = state.messagesPayload || {};
+    return payload.window && typeof payload.window === "object" ? payload.window : {};
+  }
+
+  function messageMode() {
+    if (state.messagesPayload && state.messagesPayload.mode === "owner") return "owner";
+    if (state.messagesPayload && state.messagesPayload.mode === "viewer") return "viewer";
+    return state.access === "owner" && state.mode === "owner" ? "owner" : "viewer";
+  }
+
+  function clearMessageRefreshTimer() {
+    window.clearTimeout(state.messageRefreshTimer);
+    state.messageRefreshTimer = null;
+  }
+
+  function clearMessageContent(placeholder) {
+    state.messageRequestEpoch += 1;
+    clearMessageRefreshTimer();
+    state.messagesPayload = null;
+    state.selectedConversationId = "";
+    $("#message-conversation-list").replaceChildren();
+    $("#message-conversation-list").hidden = true;
+    $("#message-thread").replaceChildren();
+    $("#message-form").hidden = true;
+    $("#message-unread-count").hidden = true;
+    $("#message-unread-count").textContent = "0";
+    if (placeholder) {
+      const empty = document.createElement("p");
+      empty.className = "message-empty";
+      empty.textContent = placeholder;
+      $("#message-thread").appendChild(empty);
+    }
+  }
+
+  function closedOwnerMessagePayload(windowState) {
+    return {
+      mode: "owner",
+      contentAvailable: false,
+      conversations: [],
+      window: Object.assign({}, windowState || {}, {
+        isOpen: false,
+        label: "每天 20:00–21:00 开放查看与回复",
+      }),
+    };
+  }
+
+  function messageWindowRemainingMs(windowState, requestElapsedMs) {
+    const closesAt = Date.parse(windowState && windowState.closesAt);
+    const serverNow = Date.parse(windowState && windowState.serverNow);
+    if (Number.isFinite(closesAt) && Number.isFinite(serverNow)) {
+      return closesAt - serverNow - Math.max(0, Number(requestElapsedMs) || 0);
+    }
+    if (Number.isFinite(closesAt)) return closesAt - Date.now();
+    return null;
+  }
+
+  function scheduleOwnerMessageExpiry(payload, requestElapsedMs) {
+    clearMessageRefreshTimer();
+    if (!payload || payload.mode !== "owner" || !payload.window || !payload.window.isOpen) return;
+    const remaining = messageWindowRemainingMs(payload.window, requestElapsedMs);
+    if (!Number.isFinite(remaining)) return;
+    const expectedSpaceId = state.activeSpaceId;
+    state.messageRefreshTimer = window.setTimeout(() => {
+      state.messageRefreshTimer = null;
+      if (state.activeSpaceId !== expectedSpaceId || state.messagesPayload !== payload) return;
+      state.messagesPayload = closedOwnerMessagePayload(payload.window);
+      state.selectedConversationId = "";
+      renderMessages();
+      if (!$("#message-panel").hidden && !$("#message-widget").hidden) loadMessages(true);
+    }, Math.max(0, Math.min(remaining + 25, 2147483000)));
+  }
+
+  function messageTimestamp(value) {
+    if (!value) return "";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return "";
+    return new Intl.DateTimeFormat("zh-CN", {
+      timeZone: SHANGHAI_TZ,
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(parsed);
+  }
+
+  function messageBubble(message, mode) {
+    const item = document.createElement("article");
+    const senderRole = textValue(message && (message.senderRole || message.senderKind || message.role || message.authorRole));
+    const ownerMessage = senderRole === "owner" || senderRole === "manager" || Boolean(message && message.isOwnerReply);
+    const own = mode === "owner" ? ownerMessage : !ownerMessage;
+    item.className = `message-bubble${own ? " is-own" : ""}`;
+    const body = document.createElement("p");
+    body.textContent = textValue(message && (message.body || message.text), "—");
+    const meta = document.createElement("small");
+    meta.textContent = `${ownerMessage ? "管理端" : "访客"}${messageTimestamp(message && (message.createdAt || message.sentAt)) ? ` · ${messageTimestamp(message.createdAt || message.sentAt)}` : ""}`;
+    item.append(body, meta);
+    return item;
+  }
+
+  function ownerConversations() {
+    const payload = state.messagesPayload || {};
+    return Array.isArray(payload.conversations) ? payload.conversations : [];
+  }
+
+  function conversationId(conversation) {
+    return String(conversation && (conversation.visitorUserId || conversation.userId || conversation.id || ""));
+  }
+
+  function selectedConversation() {
+    return ownerConversations().find((conversation) => conversationId(conversation) === state.selectedConversationId) || null;
+  }
+
+  function renderMessageWindowStatus() {
+    const windowState = messageWindow();
+    const mode = messageMode();
+    const open = Boolean(windowState.isOpen);
+    $("#message-window-label").textContent = textValue(
+      windowState.label,
+      open ? "回复时段 · 20:00–21:00" : (mode === "owner" ? "留言暂未开放查看" : "留言会在今晚送达"),
+    );
+    $("#message-window-copy").textContent = open
+      ? (mode === "owner" ? "现在可以查看并回复今天的留言。" : "管理端现在可以看到并回复留言。")
+      : (mode === "owner"
+        ? "回复时段外无法查看新留言；下一时段由服务器安排。"
+        : "你可以随时留言，管理端只会在规定时段看到。");
+    $("#message-window-status").classList.toggle("is-open", open);
+  }
+
+  function renderMessages() {
+    const payload = state.messagesPayload || {};
+    const mode = messageMode();
+    renderMessageWindowStatus();
+    const conversationList = $("#message-conversation-list");
+    const thread = $("#message-thread");
+    const form = $("#message-form");
+    const input = $("#message-input");
+    conversationList.replaceChildren();
+    thread.replaceChildren();
+
+    if (mode === "owner") {
+      const conversations = ownerConversations();
+      conversationList.hidden = false;
+      if (!state.selectedConversationId && conversations.length) {
+        state.selectedConversationId = conversationId(conversations[0]);
+      }
+      if (!conversations.length) {
+        const empty = document.createElement("p");
+        empty.className = "message-empty";
+        empty.textContent = messageWindow().isOpen ? "今天还没有访客留言。" : "留言会在回复时段开放查看。";
+        thread.appendChild(empty);
+      } else {
+        conversations.forEach((conversation) => {
+          const id = conversationId(conversation);
+          const button = document.createElement("button");
+          button.className = `message-conversation-option${id === state.selectedConversationId ? " is-active" : ""}`;
+          button.type = "button";
+          const title = document.createElement("strong");
+          title.textContent = textValue(conversation.displayName || conversation.visitorDisplayName || conversation.email, "访客");
+          const summary = document.createElement("span");
+          summary.textContent = textValue(conversation.preview || conversation.lastMessage, "查看留言");
+          button.append(title, summary);
+          button.addEventListener("click", () => {
+            state.selectedConversationId = id;
+            renderMessages();
+          });
+          conversationList.appendChild(button);
+        });
+        const conversation = selectedConversation();
+        const messages = conversation && Array.isArray(conversation.messages) ? conversation.messages : [];
+        messages.forEach((message) => thread.appendChild(messageBubble(message, mode)));
+      }
+      const canReply = Boolean(messageWindow().isOpen && selectedConversation());
+      form.hidden = !canReply;
+      input.placeholder = "回复这位访客…";
+      $("#send-message-button").textContent = "回复";
+      $("#message-compose-label").textContent = "回复访客";
+    } else {
+      conversationList.hidden = true;
+      const messages = Array.isArray(payload.messages)
+        ? payload.messages
+        : (payload.conversation && Array.isArray(payload.conversation.messages) ? payload.conversation.messages : []);
+      if (!messages.length) {
+        const empty = document.createElement("p");
+        empty.className = "message-empty";
+        empty.textContent = "这里会安静地保存你与管理端之间的留言。";
+        thread.appendChild(empty);
+      } else {
+        messages.forEach((message) => thread.appendChild(messageBubble(message, mode)));
+      }
+      form.hidden = false;
+      input.placeholder = "写下一句话…";
+      $("#send-message-button").textContent = "发送";
+      $("#message-compose-label").textContent = "写下留言";
+    }
+    thread.scrollTop = thread.scrollHeight;
+    const unread = Number(payload.unreadCount);
+    $("#message-unread-count").hidden = !(Number.isFinite(unread) && unread > 0);
+    $("#message-unread-count").textContent = Number.isFinite(unread) && unread > 99 ? "99+" : String(unread || 0);
+  }
+
+  function configureMessageWidget() {
+    const blockedPlatformPreview = isPlatformAdmin() && state.access !== "owner";
+    const supportedSurface = (state.access === "owner" && state.mode === "owner")
+      || (state.access === "viewer" && state.mode === "visitor");
+    const visible = Boolean(
+      state.user
+      && state.activeSpaceId
+      && supportedSurface
+      && !blockedPlatformPreview
+      && (!activeSpace() || activeSpace().connectionStatus !== "revoked"),
+    );
+    $("#message-widget").hidden = !visible;
+    if (!visible) {
+      $("#message-panel").hidden = true;
+      $("#message-toggle").setAttribute("aria-expanded", "false");
+      clearMessageContent();
+    }
+  }
+
+  async function loadMessages(silent) {
+    if ($("#message-widget").hidden || $("#message-panel").hidden || !state.activeSpaceId) return;
+    const requestEpoch = ++state.messageRequestEpoch;
+    const requestedSpaceId = state.activeSpaceId;
+    const requestedMode = state.mode;
+    const requestedAt = Date.now();
+    if (!silent) setMessage($("#message-panel-message"), "");
+    try {
+      const payload = await api("/api/messages");
+      if (
+        state.messageRequestEpoch !== requestEpoch
+        || $("#message-panel").hidden
+        || $("#message-widget").hidden
+        || state.activeSpaceId !== requestedSpaceId
+        || state.mode !== requestedMode
+      ) return;
+      const elapsed = Date.now() - requestedAt;
+      const expiredOwnerPayload = payload
+        && payload.mode === "owner"
+        && payload.window
+        && payload.window.isOpen
+        && messageWindowRemainingMs(payload.window, elapsed) <= 0;
+      state.messagesPayload = expiredOwnerPayload
+        ? closedOwnerMessagePayload(payload.window)
+        : payload;
+      renderMessages();
+      scheduleOwnerMessageExpiry(state.messagesPayload, elapsed);
+    } catch (error) {
+      if (error.code === "preview_access_revoked") return;
+      if (
+        state.messageRequestEpoch !== requestEpoch
+        || $("#message-panel").hidden
+        || $("#message-widget").hidden
+        || state.activeSpaceId !== requestedSpaceId
+        || state.mode !== requestedMode
+      ) return;
+      clearMessageContent("暂时无法读取留言。");
+      setMessage($("#message-panel-message"), error.message);
+    }
+  }
+
+  async function toggleMessagePanel(open) {
+    const nextOpen = typeof open === "boolean" ? open : $("#message-panel").hidden;
+    if (nextOpen) clearMessageContent("正在读取留言…");
+    $("#message-panel").hidden = !nextOpen;
+    $("#message-toggle").setAttribute("aria-expanded", String(nextOpen));
+    if (nextOpen) {
+      await loadMessages(false);
+      if ($("#message-panel").hidden) return;
+      window.setTimeout(() => {
+        const target = $("#message-form").hidden ? $("#close-message-panel") : $("#message-input");
+        target.focus();
+      }, 0);
+    } else {
+      clearMessageContent();
+      $("#message-toggle").focus();
+    }
+  }
+
+  async function submitMessage(event) {
+    event.preventDefault();
+    const body = $("#message-input").value.trim();
+    if (!body) {
+      setMessage($("#message-panel-message"), "请先写下留言。");
+      return;
+    }
+    const mode = messageMode();
+    const button = $("#send-message-button");
+    setLoading(button, true);
+    setMessage($("#message-panel-message"), "");
+    try {
+      if (mode === "owner") {
+        const conversation = selectedConversation();
+        if (!conversation || !messageWindow().isOpen) throw new ApiError("当前不在回复时段。", 403, "reply_window_closed");
+        const visitorUserId = conversationId(conversation);
+        await api(`/api/messages/${encodeURIComponent(visitorUserId)}/reply`, { method: "POST", body: { body } });
+      } else {
+        await api("/api/messages", { method: "POST", body: { body } });
+      }
+      $("#message-input").value = "";
+      await loadMessages(true);
+      toast(mode === "owner" ? "回复已发送。" : "留言已送出。", "success");
+    } catch (error) {
+      setMessage($("#message-panel-message"), error.message);
+    } finally {
+      setLoading(button, false);
+    }
+  }
+
+  async function exportData(event) {
+    event.preventDefault();
+    if (!canManageActiveWorkspace()) return;
+    const link = $("#export-data");
+    link.setAttribute("aria-busy", "true");
+    link.classList.add("is-loading");
+    try {
+      const response = await fetch("/api/export", {
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "X-Day1-Space": state.activeSpaceId,
+        },
+      });
+      if (!response.ok) {
+        const payload = (response.headers.get("content-type") || "").includes("application/json")
+          ? await response.json().catch(() => ({}))
+          : {};
+        if (response.status === 410 && payload.code === "preview_access_revoked") handleRevokedConnection(payload);
+        throw new ApiError(payload.error || "导出没有成功，请稍后重试。", response.status, payload.code, payload);
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const download = document.createElement("a");
+      download.href = url;
+      download.download = `blue-day1-${dateKeyInShanghai()}.json`;
+      document.body.appendChild(download);
+      download.click();
+      download.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      toast("备份已开始下载。", "success");
+    } catch (error) {
+      if (error.code !== "preview_access_revoked") toast(error.message, "error");
+    } finally {
+      link.removeAttribute("aria-busy");
+      link.classList.remove("is-loading");
     }
   }
 
@@ -2290,11 +3965,24 @@
 
   async function register(event) {
     event.preventDefault();
+    const registrationKind = selectedRegistrationKind();
+    const displayName = $("#register-display-name").value.trim();
     const email = $("#register-email").value.trim();
     const password = $("#register-password").value;
     const confirmation = $("#register-password-confirm").value;
-    if (!email || password.length < 10) {
-      setMessage($("#auth-message"), "请输入有效邮箱，密码至少 10 个字符。");
+    const viewerCode = $("#register-viewer-code").value.trim();
+    const managerInviteCode = $("#register-manager-invite").value.trim();
+    const spaceName = $("#register-space-name").value.trim();
+    if (!displayName || !email || password.length < 10) {
+      setMessage($("#auth-message"), "请填写名称和有效邮箱，密码至少 10 个字符。");
+      return;
+    }
+    if (registrationKind === "viewer" && !viewerCode) {
+      setMessage($("#auth-message"), "请输入预览识别码。");
+      return;
+    }
+    if (registrationKind === "manager" && (!managerInviteCode || !spaceName)) {
+      setMessage($("#auth-message"), "请输入管理邀请码和管理端名称。");
       return;
     }
     if (password !== confirmation) {
@@ -2305,12 +3993,20 @@
     setLoading(button, true);
     setMessage($("#auth-message"), "");
     try {
-      const result = await api("/api/register", { method: "POST", body: { email, password } });
+      const body = { registrationKind, displayName, email, password };
+      if (registrationKind === "manager") {
+        body.managerInviteCode = managerInviteCode;
+        body.spaceName = spaceName;
+      } else {
+        body.viewerCode = viewerCode;
+      }
+      const result = await api("/api/register", { method: "POST", body });
       state.user = result.user;
       await loadSession();
       await enterApp();
       $("#register-form").reset();
-      toast("只读账号已创建。", "success");
+      switchRegistrationKind("viewer");
+      toast(registrationKind === "manager" ? "你的管理端已创建。" : "访客账号已创建。", "success");
     } catch (error) {
       setMessage($("#auth-message"), error.message);
     } finally {
@@ -2400,6 +4096,7 @@
     });
     $("#login-form").addEventListener("submit", login);
     $("#register-form").addEventListener("submit", register);
+    $$('input[name="registrationKind"]').forEach((input) => input.addEventListener("change", () => switchRegistrationKind(selectedRegistrationKind())));
     $$('[data-toggle-password]').forEach((button) => {
       button.addEventListener("click", () => {
         const input = document.getElementById(button.dataset.togglePassword);
@@ -2407,7 +4104,19 @@
         setPasswordVisibility(button, input.type === "password");
       });
     });
-    $$('[data-switch-view]').forEach((button) => button.addEventListener("click", () => setMode(button.dataset.switchView)));
+    $$('[data-switch-view]').forEach((button) => button.addEventListener("click", () => {
+      $("#workspace-menu").open = false;
+      setMode(button.dataset.switchView);
+    }));
+    $("#workspace-menu").addEventListener("toggle", () => {
+      if ($("#workspace-menu").open) {
+        $("#account-menu").open = false;
+        renderWorkspaceMenu();
+      }
+    });
+    $("#account-menu").addEventListener("toggle", () => {
+      if ($("#account-menu").open) $("#workspace-menu").open = false;
+    });
     $("#edit-today-task").addEventListener("click", () => openTaskEditor($("#edit-today-task").dataset.taskDate));
     $("#edit-tomorrow-task").addEventListener("click", () => openTaskEditor($("#edit-tomorrow-task").dataset.taskDate));
     $("#add-today-progress").addEventListener("click", () => openProgressEditor($("#add-today-progress").dataset.taskDate));
@@ -2454,6 +4163,38 @@
     $("#focus-distractions").addEventListener("input", scheduleFocusSave);
     $("#focus-note").addEventListener("input", scheduleFocusSave);
     $("#import-legacy-data").addEventListener("click", importLegacyData);
+    $("#export-data").addEventListener("click", exportData);
+    $("#access-tools").addEventListener("toggle", () => {
+      if ($("#access-tools").open && state.access === "owner" && !state.viewerCode) loadViewerCode();
+    });
+    $("#copy-viewer-code").addEventListener("click", () => copyText(state.viewerCode, "预览识别码已复制。"));
+    $("#open-refresh-viewer-code").addEventListener("click", openRefreshViewerCodeDialog);
+    $("#refresh-viewer-code-confirmation").addEventListener("input", validateViewerCodeRefresh);
+    $("#refresh-viewer-code-form").addEventListener("submit", refreshViewerCode);
+    $("#open-delete-own-space").addEventListener("click", openOwnSpaceDeleteDialog);
+    $("#delete-space-confirmation").addEventListener("input", validateSpaceDeletion);
+    $("#delete-space-form").addEventListener("submit", deleteSpace);
+    $$("[data-open-connect-space]").forEach((button) => button.addEventListener("click", openConnectSpaceDialog));
+    $("#connect-space-form").addEventListener("submit", connectSpace);
+    $("#open-platform-overview").addEventListener("click", openPlatformOverview);
+    $("#account-platform-overview").addEventListener("click", openPlatformOverview);
+    $("#create-manager-invite").addEventListener("click", openManagerInviteDialog);
+    $("#manager-invite-form").addEventListener("submit", generateManagerInvite);
+    $("#copy-manager-invite").addEventListener("click", () => copyText($("#manager-invite-code").textContent, "管理邀请码已复制。"));
+    $("#open-manual-ip-block").addEventListener("click", () => openIpBlockDialog(""));
+    $("#ip-block-form").addEventListener("submit", createIpBlock);
+    $$("[data-platform-tab]").forEach((button) => {
+      button.addEventListener("click", () => switchPlatformTab(button.dataset.platformTab));
+      button.addEventListener("keydown", handlePlatformTabKeydown);
+    });
+    $("#switch-after-connection-lost").addEventListener("click", () => {
+      const alternative = state.spaces.find((space) => space.publicId !== state.activeSpaceId && space.connectionStatus === "active");
+      if (alternative) switchWorkspace(alternative.publicId);
+    });
+    $("#connection-lost-primary").addEventListener("click", handleConnectionLostPrimary);
+    $("#message-toggle").addEventListener("click", () => toggleMessagePanel());
+    $("#close-message-panel").addEventListener("click", () => toggleMessagePanel(false));
+    $("#message-form").addEventListener("submit", submitMessage);
     $("#show-all-history").addEventListener("click", () => {
       state.ownerHistoryExpanded = !state.ownerHistoryExpanded;
       renderHistory("owner");
@@ -2478,6 +4219,12 @@
       if (state.forcedPasswordChange) event.preventDefault();
     });
     $("#logout-button").addEventListener("click", logout);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !$("#message-panel").hidden) {
+        event.preventDefault();
+        toggleMessagePanel(false);
+      }
+    });
     $$('[data-close-dialog]').forEach((button) => button.addEventListener("click", () => {
       const dialog = document.getElementById(button.dataset.closeDialog);
       if (dialog === $("#password-dialog") && state.forcedPasswordChange) return;
@@ -2497,6 +4244,16 @@
       if (dialog === $("#progress-dialog")) clearProgressFiles();
       if (dialog === $("#stage-complete-dialog")) clearStageImagePreview();
     }));
+    $("#delete-space-dialog").addEventListener("close", () => {
+      state.deleteSpaceTarget = null;
+      $("#delete-space-form").reset();
+      $("#delete-space-submit").disabled = true;
+      setMessage($("#delete-space-message"), "");
+    });
+    $("#ip-block-dialog").addEventListener("close", () => {
+      $("#ip-block-form").reset();
+      setMessage($("#ip-block-message"), "");
+    });
     [$("#task-text-input"), $("#progress-note-input"), $("#proof-text-input"), $("#stage-title-input"), $("#stage-description-input"), $("#stage-proof-text")].forEach((input) => {
       input.addEventListener("input", () => updateCharacterCount(input));
     });
@@ -2511,12 +4268,23 @@
       const task = taskFor(current);
       $("#owner-context-line").textContent = contextualCopy(task, false);
       $("#visitor-context-line").textContent = contextualCopy(task, true);
+      if (Date.now() - state.lastAccessCheckAt >= 60000) {
+        state.lastAccessCheckAt = Date.now();
+        try {
+          await refreshSpaceAccess();
+        } catch (_error) {
+          // Access will be checked again on the next content request or interval.
+        }
+      }
+      if (!$("#message-panel").hidden && !$("#message-widget").hidden) {
+        loadMessages(true);
+      }
     }
     if (current !== state.renderedDate) {
       state.renderedDate = current;
       state.historyYear = Number(current.slice(0, 4));
       state.visitorHistoryYear = state.historyYear;
-      if (state.user) {
+      if (state.user && state.activeSpaceId && !["platform", "connection-lost"].includes(state.mode)) {
         try {
           await loadData();
         } catch (_error) {

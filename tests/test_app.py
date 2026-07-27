@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -60,11 +61,17 @@ class DailySealApiTests(unittest.TestCase):
         # Every test begins with one owner using a forced-change temporary
         # password. This keeps test ordering irrelevant.
         connection = sqlite3.connect(str(server.DB_PATH))
+        connection.row_factory = sqlite3.Row
         try:
             connection.executescript(
                 """
+                DELETE FROM messages;
+                DELETE FROM viewer_connections;
+                DELETE FROM manager_invites;
                 DELETE FROM sessions;
                 DELETE FROM auth_events;
+                DELETE FROM spaces;
+                DELETE FROM platform_meta;
                 DELETE FROM stages;
                 DELETE FROM task_progress_assets;
                 DELETE FROM task_progress;
@@ -74,13 +81,24 @@ class DailySealApiTests(unittest.TestCase):
                 """
             )
             connection.execute(
-                "INSERT INTO users(email, password_hash, role, must_change_password, created_at) "
-                "VALUES (?, ?, 'owner', 1, ?)",
+                "INSERT INTO users("
+                "email, password_hash, role, display_name, is_platform_admin, "
+                "must_change_password, created_at"
+                ") VALUES (?, ?, 'owner', 'Blue', 1, 1, ?)",
                 (self.OWNER_EMAIL, self.owner_password_hash, server.now_ts()),
             )
             connection.commit()
+            blue = server.ensure_platform_state(connection)
+            self.blue_public_id = blue["public_id"]
+            self.blue_viewer_code = server.viewer_code_for(
+                blue["viewer_secret"], blue["viewer_code_version"]
+            )
         finally:
             connection.close()
+        if server.SPACES_DIR.is_dir():
+            for path in server.SPACES_DIR.iterdir():
+                if path.is_dir():
+                    shutil.rmtree(path)
         for path in server.UPLOAD_DIR.glob("*"):
             if path.is_file():
                 path.unlink()
@@ -116,8 +134,11 @@ class DailySealApiTests(unittest.TestCase):
         return client.post(
             "/api/register",
             json={
+                "registrationKind": "viewer",
+                "displayName": "Viewer",
                 "email": email or self.VIEWER_EMAIL,
                 "password": password or self.VIEWER_PASSWORD,
+                "viewerCode": self.blue_viewer_code,
             },
             headers={"X-CSRF-Token": token},
         )
@@ -262,6 +283,8 @@ class DailySealApiTests(unittest.TestCase):
                 "ok": True,
                 "authenticated": False,
                 "user": None,
+                "spaces": [],
+                "defaultSpaceId": None,
                 "csrfToken": session.get_json()["csrfToken"],
                 "registrationOpen": True,
             },
@@ -298,8 +321,11 @@ class DailySealApiTests(unittest.TestCase):
         response = self.client.post(
             "/api/register",
             json={
+                "registrationKind": "viewer",
+                "displayName": "Viewer",
                 "email": "  VIEWER@EXAMPLE.TEST  ",
                 "password": self.VIEWER_PASSWORD,
+                "viewerCode": self.blue_viewer_code,
                 "role": "owner",
                 "mustChangePassword": True,
             },
@@ -624,7 +650,10 @@ class DailySealApiTests(unittest.TestCase):
         self.assertTrue(task["done"])
         self.assertEqual(task["proofText"], "All exercises checked")
         self.assertEqual(task["proofUrl"], "")
-        self.assertRegex(task["proofImageUrl"], r"^/api/proofs/[a-f0-9]{32}\.jpg$")
+        self.assertRegex(
+            task["proofImageUrl"],
+            r"^/api/spaces/[A-Za-z0-9_-]+/proofs/[a-f0-9]{32}\.jpg$",
+        )
         self.assertEqual(task["proofFileUrl"], task["proofImageUrl"])
         self.assertEqual(task["proofFileName"], "proof.png")
         self.assertEqual(task["proofFileMime"], "image/jpeg")
@@ -2228,7 +2257,11 @@ class DailySealApiTests(unittest.TestCase):
         self.assertIn('<h1 id="visitor-page-title">Blue 的每日记录</h1>', index_html)
         self.assertIn('id="brand-subtitle">Day1</span>', index_html)
         self.assertIn('id="visitor-context-line">沿着今天留下的轨迹，看看事情正走到哪里。</p>', index_html)
-        self.assertIn("Blue <span aria-hidden=\"true\">·</span> 看清下一步，安静地继续", index_html)
+        self.assertIn(
+            '<span id="footer-workspace-name">Blue</span> '
+            '<span aria-hidden="true">·</span> 看清下一步，安静地继续',
+            index_html,
+        )
 
     def test_progress_and_result_forms_use_unified_remarks_and_multi_file_selection(self):
         index_html = (WORK_DIR / "app" / "static" / "index.html").read_text(encoding="utf-8")
@@ -2326,7 +2359,10 @@ class DailySealApiTests(unittest.TestCase):
             self.assertEqual(task["proofFileName"], name)
             self.assertEqual(task["proofFileMime"], mime)
             self.assertEqual(task["proofFileSize"], len(raw))
-            self.assertRegex(task["proofFileUrl"], rf"^/api/proofs/[a-f0-9]{{32}}\{suffix}$")
+            self.assertRegex(
+                task["proofFileUrl"],
+                rf"^/api/spaces/[A-Za-z0-9_-]+/proofs/[a-f0-9]{{32}}\{suffix}$",
+            )
             downloaded = self.client.get(task["proofFileUrl"])
             self.assertEqual(downloaded.status_code, 200)
             self.assertEqual(downloaded.mimetype, mime)
@@ -3381,7 +3417,10 @@ class DailySealApiTests(unittest.TestCase):
         self.assertEqual(completed.status_code, 200, completed.get_data(as_text=True))
         stage = completed.get_json()["stage"]
         self.assertEqual(stage["durationDays"], 2)
-        self.assertRegex(stage["proofImageUrl"], r"^/api/proofs/[a-f0-9]{32}\.jpg$")
+        self.assertRegex(
+            stage["proofImageUrl"],
+            r"^/api/spaces/[A-Za-z0-9_-]+/proofs/[a-f0-9]{32}\.jpg$",
+        )
         self.assertEqual(stage["proofFileUrl"], stage["proofImageUrl"])
         self.assertEqual(stage["proofFileName"], "proof.png")
         self.assertEqual(stage["proofFileMime"], "image/jpeg")
