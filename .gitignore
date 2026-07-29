@@ -64,3 +64,5 @@ Thumbs.db
 .agents/
 .codex/
 outputs/
+AGENTS.md
+project-memory/

@@ -3,10 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#f5f6f2">
   <meta name="description" content="Blue — 安静、清晰的每日行动记录。">
   <title>Blue Day1</title>
+  <script src="/static/theme.js"></script>
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/app.js" defer></script>
 </head>
@@ -220,6 +221,26 @@
             </div>
           </div>
 
+          <section id="owner-goal-banner" class="goal-banner is-empty" data-goal-color="mist" aria-labelledby="owner-goal-title">
+            <div class="goal-banner-main">
+              <p class="goal-banner-kicker">长期方向</p>
+              <h2 id="owner-goal-title">还没有设定长期目标</h2>
+              <p id="owner-goal-description" class="goal-banner-description">把最终想抵达的位置写清楚，今天会更容易找到方向。</p>
+              <p id="owner-goal-next" class="goal-banner-next" hidden><span>下一步</span><strong>—</strong></p>
+              <div class="goal-banner-actions">
+                <button id="owner-goal-primary" class="button button-primary button-small" type="button">设定长期目标</button>
+                <button id="owner-goal-today" class="button button-quiet button-small" type="button" hidden>安排到今天</button>
+                <button id="owner-goal-route" class="text-button" type="button" hidden>查看路线</button>
+              </div>
+            </div>
+            <div class="goal-banner-progress">
+              <div class="goal-banner-progress-heading"><span>长期进度</span><strong id="owner-goal-percent">0%</strong></div>
+              <div id="owner-goal-progressbar" class="goal-progress-track" role="progressbar" aria-label="长期目标进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+              <p id="owner-goal-stage">完成阶段后，进度会累加到这里。</p>
+            </div>
+            <figure class="goal-banner-mascot" aria-hidden="true"><img src="/static/blue-mascot.png" alt=""></figure>
+          </section>
+
           <div class="owner-layout">
             <div class="owner-primary-column">
               <article id="today-task" class="card task-card task-card-today" data-task-scope="today">
@@ -286,6 +307,7 @@
                   <span class="heatmap-scale"><span class="heatmap-scale-swatches" aria-hidden="true"><i class="progress-0"></i><i class="progress-1"></i><i class="progress-2"></i><i class="progress-3"></i><i class="progress-4"></i><i class="progress-5"></i></span>完成程度</span>
                   <span><i class="is-stage-complete" aria-hidden="true"></i>阶段完成</span>
                   <span><i class="is-focus-record" aria-hidden="true"></i>专注记录</span>
+                  <span><i class="is-supplemented" aria-hidden="true"></i>次日补充</span>
                 </div>
 
                 <div class="history-list-section">
@@ -304,7 +326,7 @@
               <section id="owner-stage-card" class="card stage-card" aria-labelledby="owner-stage-heading">
                 <header class="card-header stage-card-header">
                   <div>
-                    <p class="card-kicker">更长的目标</p>
+                    <p class="card-kicker">阶段目标</p>
                     <h2 id="owner-stage-heading">当前阶段</h2>
                   </div>
                   <span id="owner-stage-status" class="stage-status">未设定</span>
@@ -318,6 +340,7 @@
                     <div><dt>开始</dt><dd id="owner-stage-start">—</dd></div>
                     <div><dt>已进行</dt><dd id="owner-stage-days">—</dd></div>
                   </dl>
+                  <p id="owner-stage-subgoal-summary" class="stage-subgoal-summary">还没有添加子目标</p>
                   <div class="stage-actions">
                     <button id="edit-stage-button" class="button button-quiet button-small" type="button">编辑</button>
                     <button id="complete-stage-button" class="button button-stage button-small" type="button">完成阶段</button>
@@ -451,20 +474,31 @@
         </section>
 
         <section id="visitor-view" class="dashboard-view visitor-view" data-view="visitor" aria-labelledby="visitor-page-title" hidden>
-          <div id="visitor-heading" class="visitor-heading">
+          <div id="visitor-heading" class="visitor-heading visitor-heading-with-mascot">
             <div class="visitor-heading-copy">
               <p id="visitor-date-label" class="eyebrow"><span id="visitor-product-tag" class="product-tag">Blue Day1</span><span id="visitor-record-kicker" hidden>公开轨迹</span><span class="visitor-readonly-label">只读记录</span></p>
               <h1 id="visitor-page-title">Blue 的每日记录</h1>
               <p id="visitor-context-line">沿着今天留下的轨迹，看看事情正走到哪里。</p>
             </div>
-            <span id="visitor-day1-seal" class="visitor-day1-seal" aria-hidden="true" hidden>
-              <strong>Day1</strong>
-              <small>DAILY RECORD</small>
-            </span>
-            <figure id="visitor-mascot" class="visitor-mascot" aria-hidden="true" hidden>
+            <figure id="visitor-mascot" class="visitor-mascot" aria-hidden="true">
               <img src="/static/blue-mascot.png" alt="">
             </figure>
           </div>
+
+          <section id="visitor-goal-banner" class="goal-banner goal-banner-readonly" data-goal-color="mist" aria-labelledby="visitor-goal-title" hidden>
+            <div class="goal-banner-main">
+              <p class="goal-banner-kicker">长期方向</p>
+              <h2 id="visitor-goal-title">—</h2>
+              <p id="visitor-goal-description" class="goal-banner-description"></p>
+              <p id="visitor-goal-next" class="goal-banner-next" hidden><span>下一步</span><strong>—</strong></p>
+              <div class="goal-banner-actions"><button id="visitor-goal-route" class="text-button" type="button">查看路线</button></div>
+            </div>
+            <div class="goal-banner-progress">
+              <div class="goal-banner-progress-heading"><span>长期进度</span><strong id="visitor-goal-percent">0%</strong></div>
+              <div id="visitor-goal-progressbar" class="goal-progress-track" role="progressbar" aria-label="长期目标进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+              <p id="visitor-goal-stage">—</p>
+            </div>
+          </section>
 
           <div class="visitor-layout">
             <article id="visitor-today-task" class="card task-card visitor-task-card" data-task-scope="visitor-today">
@@ -493,7 +527,7 @@
             <section id="visitor-stage-card" class="card stage-card visitor-stage-card" aria-labelledby="visitor-stage-heading">
               <header class="card-header stage-card-header">
                 <div>
-                  <p class="card-kicker">更长的目标</p>
+                  <p class="card-kicker">阶段目标</p>
                   <h2 id="visitor-stage-heading">当前阶段</h2>
                 </div>
                 <span id="visitor-stage-status" class="stage-status">未设定</span>
@@ -506,6 +540,7 @@
                   <div><dt>开始</dt><dd id="visitor-stage-start">—</dd></div>
                   <div><dt>已进行</dt><dd id="visitor-stage-days">—</dd></div>
                 </dl>
+                <p id="visitor-stage-subgoal-summary" class="stage-subgoal-summary">还没有添加子目标</p>
               </div>
               <div id="visitor-stage-empty" class="stage-empty stage-empty-readonly">
                 <p><strong>目前没有进行中的阶段</strong></p>
@@ -544,6 +579,7 @@
                 <span class="heatmap-scale"><span class="heatmap-scale-swatches" aria-hidden="true"><i class="progress-0"></i><i class="progress-1"></i><i class="progress-2"></i><i class="progress-3"></i><i class="progress-4"></i><i class="progress-5"></i></span>完成程度</span>
                 <span><i class="is-stage-complete" aria-hidden="true"></i>阶段完成</span>
                 <span><i class="is-focus-record" aria-hidden="true"></i>专注记录</span>
+                <span><i class="is-supplemented" aria-hidden="true"></i>次日补充</span>
               </div>
 
               <ol id="visitor-history-list" class="history-list visitor-history-list" data-history-list="visitor">
@@ -806,6 +842,71 @@
     </form>
   </dialog>
 
+  <dialog id="goal-route-dialog" class="dialog goal-route-drawer" aria-labelledby="goal-route-title">
+    <article class="goal-route-shell">
+      <header class="dialog-header goal-route-header">
+        <div><p class="card-kicker">长期方向</p><h2 id="goal-route-title">目标路线</h2><p class="dialog-description">从最终方向，走到当前这一小步。</p></div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="goal-route-dialog">×</button>
+      </header>
+      <div class="goal-route-progress">
+        <div><span>长期进度</span><strong id="goal-route-percent">0%</strong></div>
+        <div id="goal-route-progressbar" class="goal-progress-track" role="progressbar" aria-label="长期目标进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+        <p id="goal-route-allocation">—</p>
+      </div>
+      <section class="goal-route-goal" aria-labelledby="goal-route-goal-title">
+        <p class="goal-route-label">长期目标</p>
+        <h3 id="goal-route-goal-title">—</h3>
+        <p id="goal-route-goal-description"></p>
+      </section>
+      <section class="goal-route-stages-section" aria-labelledby="goal-route-stages-title">
+        <div class="goal-route-section-heading"><div><p class="goal-route-label">阶段路线</p><h3 id="goal-route-stages-title">从方向到行动</h3></div><button id="goal-route-stage-button" class="button button-secondary button-small" type="button" hidden>开始新阶段</button></div>
+        <ol id="goal-route-stages" class="goal-route-stages"><li class="goal-route-empty">完成的阶段会依次留在这里。</li></ol>
+      </section>
+      <section id="goal-route-current" class="goal-route-current" aria-labelledby="goal-route-current-title" hidden>
+        <div class="goal-route-section-heading"><div><p class="goal-route-label">当前阶段</p><h3 id="goal-route-current-title">—</h3></div><strong id="goal-route-subgoal-count">0/0</strong></div>
+        <div class="goal-route-current-actions" data-goal-owner-only>
+          <button id="goal-route-edit-stage" class="button button-quiet button-small" type="button">编辑阶段</button>
+          <button id="goal-route-complete-stage" class="button button-stage button-small" type="button">完成阶段</button>
+        </div>
+        <ol id="goal-route-subgoals" class="goal-route-subgoals"></ol>
+        <form id="subgoal-form" class="subgoal-form" novalidate data-goal-owner-only>
+          <label class="visually-hidden" for="subgoal-title-input">新的子目标</label>
+          <input id="subgoal-title-input" type="text" maxlength="60" placeholder="添加一个明确的小目标…" required>
+          <button id="add-subgoal-button" class="button button-secondary button-small" type="submit">添加</button>
+          <button id="cancel-subgoal-edit" class="button button-quiet button-small" type="button" hidden>取消</button>
+        </form>
+        <div id="subgoal-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      </section>
+      <div id="goal-route-owner-actions" class="goal-route-owner-actions" hidden>
+        <button id="edit-goal-button" class="button button-quiet" type="button">编辑长期目标</button>
+        <button id="complete-goal-button" class="button button-primary" type="button">完成长期目标</button>
+      </div>
+    </article>
+  </dialog>
+
+  <dialog id="goal-dialog" class="dialog" aria-labelledby="goal-dialog-title">
+    <form id="goal-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div><p class="card-kicker">长期方向</p><h2 id="goal-dialog-title">设定长期目标</h2><p class="dialog-description">写下最终想抵达的位置，阶段会负责把它拆小。</p></div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="goal-dialog">×</button>
+      </header>
+      <input id="goal-id-input" type="hidden">
+      <div class="field"><label for="goal-title-input">目标名称</label><input id="goal-title-input" type="text" maxlength="30" placeholder="例如：高考达到本科线 450 分" required><p class="field-help field-help-end"><span data-character-count="goal-title-input">0</span> / 30</p></div>
+      <div class="field"><label for="goal-description-input">简短描述 <span class="label-optional">可选</span></label><textarea id="goal-description-input" rows="3" maxlength="120" placeholder="写下为什么重要，以及完成时是什么样子…"></textarea><p class="field-help field-help-end"><span data-character-count="goal-description-input">0</span> / 120</p></div>
+      <fieldset class="goal-color-field"><legend>横幅颜色</legend><div class="goal-color-options">
+        <label><input type="radio" name="goalColor" value="mist" checked><span data-color="mist">雾蓝</span></label>
+        <label><input type="radio" name="goalColor" value="sage"><span data-color="sage">沉静绿</span></label>
+        <label><input type="radio" name="goalColor" value="gold"><span data-color="gold">暖金</span></label>
+        <label><input type="radio" name="goalColor" value="violet"><span data-color="violet">柔紫</span></label>
+        <label><input type="radio" name="goalColor" value="clay"><span data-color="clay">砖红</span></label>
+        <label><input type="radio" name="goalColor" value="slate"><span data-color="slate">中性灰</span></label>
+      </div></fieldset>
+      <div id="goal-adopt-stage-field" class="field" hidden><label for="goal-adopt-stage-weight">当前阶段所占比例</label><div class="percent-input"><input id="goal-adopt-stage-weight" type="number" min="1" max="100" value="25" inputmode="numeric"><span>%</span></div><p class="field-help">现有当前阶段会自动归入这个长期目标。</p></div>
+      <div id="goal-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions"><button class="button button-quiet" type="button" data-close-dialog="goal-dialog">取消</button><button id="save-goal-button" class="button button-primary" type="submit" data-loading-label="正在保存…">保存长期目标</button></footer>
+    </form>
+  </dialog>
+
   <dialog id="stage-dialog" class="dialog" aria-labelledby="stage-dialog-title">
     <form id="stage-form" class="dialog-form" method="dialog" novalidate>
       <header class="dialog-header">
@@ -826,6 +927,11 @@
         <label for="stage-description-input">阶段说明 <span class="label-optional">可选</span></label>
         <textarea id="stage-description-input" name="description" rows="5" maxlength="5000" aria-describedby="stage-description-count" placeholder="写下范围、完成标准或想提醒自己的事…"></textarea>
         <p id="stage-description-count" class="field-help field-help-end"><span data-character-count="stage-description-input">0</span> / 5000</p>
+      </div>
+      <div id="stage-weight-field" class="field" hidden>
+        <label for="stage-weight-input">占长期目标的比例</label>
+        <div class="percent-input"><input id="stage-weight-input" name="weightPercent" type="number" min="1" max="100" value="25" inputmode="numeric" required><span>%</span></div>
+        <p id="stage-weight-help" class="field-help">阶段完成后，这一比例才会计入长期进度。</p>
       </div>
       <div id="stage-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
       <footer class="dialog-actions">
@@ -934,7 +1040,7 @@
           <section id="record-progress-section" class="record-progress-section" aria-labelledby="record-progress-title" hidden>
             <header class="record-progress-heading">
               <div>
-                <p class="card-kicker">当天轨迹</p>
+                <p class="card-kicker">进度轨迹</p>
                 <h4 id="record-progress-title">进度记录</h4>
               </div>
               <span id="record-progress-count" class="record-duration">0 次更新</span>

@@ -94,6 +94,10 @@ MAX_STAGE_TITLE_LENGTH = 200
 MAX_STAGE_DESCRIPTION_LENGTH = 5000
 MAX_STAGE_PROOF_TEXT_LENGTH = 1000
 MAX_STAGE_PROOF_URL_LENGTH = 2048
+MAX_GOAL_TITLE_LENGTH = 30
+MAX_GOAL_DESCRIPTION_LENGTH = 120
+MAX_SUBGOAL_TITLE_LENGTH = 60
+GOAL_COLOR_KEYS = {"mist", "sage", "gold", "violet", "clay", "slate"}
 MAX_TASK_RESULT_NOTE_LENGTH = 1000
 MAX_TASK_PROGRESS_NOTE_LENGTH = 1000
 MAX_DISPLAY_NAME_LENGTH = 40
@@ -244,7 +248,7 @@ CREATE TABLE IF NOT EXISTS spaces (
     viewer_code_version INTEGER NOT NULL DEFAULT 1
         CHECK (viewer_code_version >= 1),
     viewer_code_hash TEXT NOT NULL UNIQUE,
-    mascot_enabled INTEGER NOT NULL DEFAULT 0
+    mascot_enabled INTEGER NOT NULL DEFAULT 1
         CHECK (mascot_enabled IN (0, 1)),
     is_blue_space INTEGER NOT NULL DEFAULT 0
         CHECK (is_blue_space IN (0, 1)),
@@ -331,6 +335,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     result_version INTEGER NOT NULL DEFAULT 0 CHECK (result_version >= 0),
     result_confirmed_progress_id INTEGER
         CHECK (result_confirmed_progress_id IS NULL OR result_confirmed_progress_id >= 0),
+    result_locked_at INTEGER,
+    result_lock_source TEXT
+        CHECK (result_lock_source IS NULL OR result_lock_source IN ('recorded', 'automatic')),
     created_at INTEGER NOT NULL,
     completed_at INTEGER,
     proof_text TEXT,
@@ -347,6 +354,7 @@ CREATE TABLE IF NOT EXISTS task_progress (
     note TEXT NOT NULL DEFAULT '' CHECK (length(note) <= 1000),
     progress_percent INTEGER NOT NULL
         CHECK (progress_percent >= 0 AND progress_percent <= 100),
+    record_date TEXT,
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task_progress_date
@@ -397,8 +405,31 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     distractions TEXT NOT NULL DEFAULT '',
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS long_term_goals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 30),
+    description TEXT NOT NULL DEFAULT '' CHECK (length(description) <= 120),
+    color_key TEXT NOT NULL DEFAULT 'mist'
+        CHECK (color_key IN ('mist', 'sage', 'gold', 'violet', 'clay', 'slate')),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
+    started_at INTEGER NOT NULL,
+    started_date TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    completed_date TEXT,
+    CHECK (
+        (status = 'active' AND completed_at IS NULL AND completed_date IS NULL)
+        OR
+        (status = 'completed' AND completed_at IS NOT NULL AND completed_date IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_long_term_goals_single_active
+    ON long_term_goals(status) WHERE status = 'active';
 CREATE TABLE IF NOT EXISTS stages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id INTEGER REFERENCES long_term_goals(id) ON DELETE SET NULL,
+    weight_percent INTEGER
+        CHECK (weight_percent IS NULL OR (weight_percent >= 1 AND weight_percent <= 100)),
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
@@ -423,6 +454,24 @@ CREATE TABLE IF NOT EXISTS stages (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_stages_single_active
     ON stages(status) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_stages_completed_date ON stages(completed_date);
+CREATE TABLE IF NOT EXISTS stage_subgoals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage_id INTEGER NOT NULL REFERENCES stages(id) ON DELETE CASCADE,
+    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 60),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    CHECK (
+        (status = 'pending' AND completed_at IS NULL)
+        OR
+        (status = 'completed' AND completed_at IS NOT NULL)
+    ),
+    UNIQUE(stage_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_stage_subgoals_stage
+    ON stage_subgoals(stage_id, position, id);
 """
 
 
@@ -439,9 +488,138 @@ def utc_iso(timestamp):
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="seconds")
 
 
-def business_today_key():
-    """Daily Seal follows China Standard Time regardless of server location."""
-    return (datetime.now(timezone.utc) + timedelta(hours=8)).date().isoformat()
+CHINA_STANDARD_TIME = timezone(timedelta(hours=8), "CST")
+
+
+def business_today_key(task_date_hint=None):
+    """Return Day1's date in China Standard Time.
+
+    Tests and maintenance jobs may inject a deterministic date provider through
+    Flask config. Production ignores ``task_date_hint`` and follows Beijing time.
+    """
+    provider = app.config.get("BUSINESS_DATE_PROVIDER")
+    if callable(provider):
+        provided = provider(task_date_hint)
+        try:
+            parsed = date.fromisoformat(provided)
+        except (TypeError, ValueError):
+            raise RuntimeError("BUSINESS_DATE_PROVIDER returned an invalid date")
+        if not 2020 <= parsed.year <= 2100:
+            raise RuntimeError("BUSINESS_DATE_PROVIDER returned an invalid date")
+        return parsed.isoformat()
+    return datetime.fromtimestamp(now_ts(), CHINA_STANDARD_TIME).date().isoformat()
+
+
+def business_date_for_timestamp(timestamp):
+    return datetime.fromtimestamp(timestamp, CHINA_STANDARD_TIME).date().isoformat()
+
+
+def task_deadline_timestamp(task_date):
+    next_date = date.fromisoformat(task_date) + timedelta(days=1)
+    return int(
+        datetime(
+            next_date.year,
+            next_date.month,
+            next_date.day,
+            tzinfo=CHINA_STANDARD_TIME,
+        ).timestamp()
+    )
+
+
+def task_progress_mode(task_date, current_date=None):
+    """Return ``day``, ``supplement`` or ``None`` for a progress write."""
+    current_date = current_date or business_today_key()
+    parsed_task_date = date.fromisoformat(task_date)
+    parsed_current_date = date.fromisoformat(current_date)
+    if parsed_task_date == parsed_current_date:
+        return "day"
+    if parsed_task_date == parsed_current_date - timedelta(days=1):
+        return "supplement"
+    return None
+
+
+def finalize_expired_tasks(database, current_date=None):
+    """Freeze every past task at its Beijing 24:00 snapshot.
+
+    A fresh manually recorded result is retained. If no result was recorded, or
+    same-day progress changed after that result, the latest progress written
+    before midnight determines the frozen percentage. Progress written after
+    midnight is excluded and remains supplemental evidence.
+    """
+    current_date = current_date or business_today_key()
+    rows = database.execute(
+        "SELECT * FROM tasks WHERE task_date < ? AND result_locked_at IS NULL "
+        "ORDER BY task_date",
+        (current_date,),
+    ).fetchall()
+    changed = 0
+    for row in rows:
+        deadline = task_deadline_timestamp(row["task_date"])
+        latest = database.execute(
+            "SELECT id, progress_percent, created_at FROM task_progress "
+            "WHERE task_date = ? "
+            "AND COALESCE(record_date, date(created_at, 'unixepoch', '+8 hours')) <= ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (row["task_date"], row["task_date"]),
+        ).fetchone()
+        latest_id = latest["id"] if latest else 0
+        confirmed_id = row["result_confirmed_progress_id"]
+        result_recorded_at = row["result_recorded_at"]
+        has_recorded_result = row["result_status"] in {"completed", "incomplete"}
+        if isinstance(confirmed_id, int):
+            result_is_stale = bool(latest and latest_id > confirmed_id)
+        else:
+            result_is_stale = bool(
+                latest
+                and result_recorded_at
+                and latest["created_at"] > result_recorded_at
+            )
+
+        if has_recorded_result and not result_is_stale:
+            result_status = row["result_status"]
+            completion_percent = row["completion_percent"]
+            lock_source = "recorded"
+            confirmed_snapshot = confirmed_id if isinstance(confirmed_id, int) else latest_id
+        else:
+            completion_percent = latest["progress_percent"] if latest else 0
+            result_status = "completed" if completion_percent == 100 else "incomplete"
+            lock_source = "automatic"
+            confirmed_snapshot = latest_id
+
+        completion_percent = min(100, max(0, int(completion_percent or 0)))
+        if result_status == "completed":
+            completion_percent = 100
+        elif completion_percent == 100:
+            result_status = "completed"
+        else:
+            result_status = "incomplete"
+        completed_at = row["completed_at"]
+        if result_status == "completed" and not completed_at:
+            completed_at = deadline
+        if result_status != "completed":
+            completed_at = None
+
+        cursor = database.execute(
+            "UPDATE tasks SET done = ?, result_status = ?, completion_percent = ?, "
+            "result_recorded_at = COALESCE(result_recorded_at, ?), "
+            "result_version = result_version + 1, "
+            "result_confirmed_progress_id = ?, result_locked_at = ?, "
+            "result_lock_source = ?, completed_at = ? "
+            "WHERE task_date = ? AND result_locked_at IS NULL",
+            (
+                1 if result_status == "completed" else 0,
+                result_status,
+                completion_percent,
+                deadline,
+                confirmed_snapshot,
+                deadline,
+                lock_source,
+                completed_at,
+                row["task_date"],
+            ),
+        )
+        changed += cursor.rowcount
+    return changed
 
 
 def connect_sqlite(path):
@@ -561,6 +739,14 @@ def migrate_content_schema(connection, upload_dir):
     # Legacy rows remain NULL so serialization can infer their historical
     # result snapshot. New confirmations store an exact progress id.
     ensure_column(connection, "tasks", "result_confirmed_progress_id", "INTEGER")
+    ensure_column(connection, "tasks", "result_locked_at", "INTEGER")
+    ensure_column(
+        connection,
+        "tasks",
+        "result_lock_source",
+        "TEXT CHECK (result_lock_source IS NULL OR "
+        "result_lock_source IN ('recorded', 'automatic'))",
+    )
     connection.execute(
         "UPDATE tasks SET result_version = 0 WHERE result_version IS NULL"
     )
@@ -580,11 +766,34 @@ def migrate_content_schema(connection, upload_dir):
     )
     ensure_column(
         connection,
+        "stages",
+        "goal_id",
+        "INTEGER REFERENCES long_term_goals(id) ON DELETE SET NULL",
+    )
+    ensure_column(
+        connection,
+        "stages",
+        "weight_percent",
+        "INTEGER CHECK (weight_percent IS NULL OR "
+        "(weight_percent >= 1 AND weight_percent <= 100))",
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stages_goal "
+        "ON stages(goal_id, started_at, id)"
+    )
+    ensure_column(
+        connection,
         "daily_stats",
         "distractions",
         "TEXT NOT NULL DEFAULT ''",
     )
     ensure_column(connection, "task_progress", "client_key", "TEXT")
+    ensure_column(connection, "task_progress", "record_date", "TEXT")
+    connection.execute(
+        "UPDATE task_progress "
+        "SET record_date = date(created_at, 'unixepoch', '+8 hours') "
+        "WHERE record_date IS NULL"
+    )
     ensure_column(connection, "task_progress_assets", "client_key", "TEXT")
     ensure_column(connection, "task_progress_assets", "source_sha256", "TEXT")
     ensure_column(connection, "task_progress_assets", "source_size", "INTEGER")
@@ -612,6 +821,7 @@ def migrate_content_schema(connection, upload_dir):
         connection, "tasks", "task_date", upload_dir
     )
     backfill_legacy_attachment_metadata(connection, "stages", "id", upload_dir)
+    finalize_expired_tasks(connection)
     connection.commit()
     cleanup_orphaned_uploads(connection, upload_dir)
     connection.execute("PRAGMA journal_mode = WAL")
@@ -820,6 +1030,12 @@ def init_db():
         )
         migrate_content_schema(connection, UPLOAD_DIR)
         ensure_platform_state(connection)
+        # Mascots are part of every Day1 preview, not a per-space setting.
+        # Keep the legacy column for database compatibility while upgrading
+        # existing spaces that were created before the shared appearance.
+        connection.execute(
+            "UPDATE spaces SET mascot_enabled = 1 WHERE mascot_enabled != 1"
+        )
         reconcile_space_deletion_storage(connection)
         spaces = connection.execute(
             "SELECT * FROM spaces WHERE is_blue_space = 0"
@@ -1304,7 +1520,13 @@ def api_error(message, status=400, code="bad_request"):
     return jsonify({"ok": False, "error": message, "code": code}), status
 
 
-def serialize_space(space, access, connection_status="active", revoked_reason=None):
+def serialize_space(
+    space,
+    access,
+    connection_status="active",
+    revoked_reason=None,
+    can_disconnect=False,
+):
     return {
         "publicId": space["public_id"],
         "name": space["name"],
@@ -1313,7 +1535,8 @@ def serialize_space(space, access, connection_status="active", revoked_reason=No
         "isBlueSpace": bool(space["is_blue_space"]),
         "connectionStatus": connection_status,
         "revokedReason": revoked_reason,
-        "appearance": {"mascotEnabled": bool(space["mascot_enabled"])},
+        "canDisconnect": bool(can_disconnect),
+        "appearance": {"mascotEnabled": True},
     }
 
 
@@ -1365,6 +1588,7 @@ def user_spaces(user=None):
                     row["revoked_reason"]
                     or "识别码已刷新，请向管理者获取新的识别码。"
                 ),
+                can_disconnect=True,
             )
         )
     return rows
@@ -1669,11 +1893,14 @@ def serialize_progress_asset(row):
 
 
 def serialize_progress_entry(row, assets):
+    record_date = row["record_date"] or business_date_for_timestamp(row["created_at"])
     return {
         "id": row["id"],
         "note": row["note"] or "",
         "progressPercent": row["progress_percent"],
         "createdAt": utc_iso(row["created_at"]),
+        "recordDate": record_date,
+        "supplemental": record_date > row["task_date"],
         "assets": [serialize_progress_asset(asset) for asset in assets],
         "legacy": False,
     }
@@ -1707,6 +1934,8 @@ def legacy_progress_entry(row):
         "note": "",
         "progressPercent": min(100, max(0, percent)),
         "createdAt": utc_iso(created_at),
+        "recordDate": row["task_date"],
+        "supplemental": False,
         "assets": assets,
         "legacy": True,
     }
@@ -1763,22 +1992,26 @@ def serialize_task(row, progress_entries=None):
     result_note = row["result_note"] or row["proof_text"] or ""
     result_recorded_at = row["result_recorded_at"] or row["completed_at"]
     recorded_iso = utc_iso(result_recorded_at)
+    result_locked_at = row["result_locked_at"]
+    result_locked = result_locked_at is not None
     entries = list(progress_entries or [])
     actual_entries = [
         entry
         for entry in entries
         if not entry.get("legacy") and isinstance(entry.get("id"), int)
     ]
+    day_entries = [entry for entry in actual_entries if not entry.get("supplemental")]
+    supplement_entries = [entry for entry in actual_entries if entry.get("supplemental")]
     confirmed_progress_id = row["result_confirmed_progress_id"]
     if result_status == "pending":
         result_is_stale = False
         confirmed_progress_count = 0
     elif isinstance(confirmed_progress_id, int):
         result_is_stale = any(
-            entry["id"] > confirmed_progress_id for entry in actual_entries
+            entry["id"] > confirmed_progress_id for entry in day_entries
         )
         confirmed_progress_count = sum(
-            entry["id"] <= confirmed_progress_id for entry in actual_entries
+            entry["id"] <= confirmed_progress_id for entry in day_entries
         )
     else:
         # Rows created before exact progress snapshots were introduced retain
@@ -1789,16 +2022,22 @@ def serialize_task(row, progress_entries=None):
                 and isinstance(entry.get("createdAt"), str)
                 and entry["createdAt"] <= recorded_iso
             )
-            for entry in actual_entries
+            for entry in day_entries
         )
         result_is_stale = bool(
             recorded_iso
             and any(
                 isinstance(entry.get("createdAt"), str)
                 and entry["createdAt"] > recorded_iso
-                for entry in actual_entries
+                for entry in day_entries
             )
         )
+    if result_locked:
+        result_is_stale = False
+
+    current_date = business_today_key()
+    progress_mode = task_progress_mode(row["task_date"], current_date)
+    latest_supplement = supplement_entries[-1] if supplement_entries else None
     payload = {
         "date": row["task_date"],
         "text": row["text"],
@@ -1809,6 +2048,23 @@ def serialize_task(row, progress_entries=None):
         "resultRecordedAt": recorded_iso,
         "resultIsStale": result_is_stale,
         "resultConfirmedProgressCount": confirmed_progress_count,
+        "resultLocked": result_locked,
+        "resultLockedAt": utc_iso(result_locked_at),
+        "resultLockSource": row["result_lock_source"],
+        "canRecordResult": row["task_date"] == current_date and not result_locked,
+        "canAddProgress": progress_mode is not None,
+        "progressEntryMode": progress_mode,
+        "supplemented": bool(supplement_entries),
+        "supplementCompletionPercent": (
+            latest_supplement["progressPercent"] if latest_supplement else None
+        ),
+        "supplementRecordedAt": (
+            latest_supplement.get("createdAt") if latest_supplement else None
+        ),
+        "supplementRecordDate": (
+            latest_supplement.get("recordDate") if latest_supplement else None
+        ),
+        "supplementProgressCount": len(supplement_entries),
         "createdAt": utc_iso(row["created_at"]),
         "completedAt": utc_iso(row["completed_at"]),
         "proofText": row["proof_text"] or "",
@@ -1825,6 +2081,59 @@ def serialize_task(row, progress_entries=None):
     ))
     payload["progressEntries"] = entries
     return payload
+
+
+def validate_goal_fields(payload, existing=None):
+    if not isinstance(payload, dict):
+        return None
+    title_value = payload.get("title", existing["title"] if existing is not None else None)
+    description_value = payload.get(
+        "description", existing["description"] if existing is not None else ""
+    )
+    color_value = payload.get(
+        "colorKey", existing["color_key"] if existing is not None else "mist"
+    )
+    if not all(isinstance(value, str) for value in (title_value, description_value, color_value)):
+        return None
+    title = title_value.strip()
+    description = description_value.strip()
+    color_key = color_value.strip().lower()
+    if not title or len(title) > MAX_GOAL_TITLE_LENGTH:
+        return None
+    if len(description) > MAX_GOAL_DESCRIPTION_LENGTH or color_key not in GOAL_COLOR_KEYS:
+        return None
+    return title, description, color_key
+
+
+def validate_subgoal_title(value):
+    if not isinstance(value, str):
+        return None
+    title = value.strip()
+    if not title or len(title) > MAX_SUBGOAL_TITLE_LENGTH:
+        return None
+    return title
+
+
+def validate_weight_percent(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= 100 else None
+
+
+def goal_allocated_percent(database, goal_id, exclude_stage_id=None):
+    if exclude_stage_id is None:
+        row = database.execute(
+            "SELECT COALESCE(SUM(weight_percent), 0) AS total FROM stages "
+            "WHERE goal_id = ?",
+            (goal_id,),
+        ).fetchone()
+    else:
+        row = database.execute(
+            "SELECT COALESCE(SUM(weight_percent), 0) AS total FROM stages "
+            "WHERE goal_id = ? AND id != ?",
+            (goal_id, exclude_stage_id),
+        ).fetchone()
+    return int(row["total"] or 0)
 
 
 def validate_stage_fields(payload, existing=None):
@@ -1877,9 +2186,37 @@ def validate_client_record_key(value):
     return value
 
 
-def serialize_stage(row):
+def serialize_subgoal(row):
+    return {
+        "id": row["id"],
+        "stageId": row["stage_id"],
+        "title": row["title"],
+        "position": row["position"],
+        "status": row["status"],
+        "completed": row["status"] == "completed",
+        "createdAt": utc_iso(row["created_at"]),
+        "updatedAt": utc_iso(row["updated_at"]),
+        "completedAt": utc_iso(row["completed_at"]),
+    }
+
+
+def stage_subgoal_rows(database, stage_id):
+    return database.execute(
+        "SELECT * FROM stage_subgoals WHERE stage_id = ? ORDER BY position, id",
+        (stage_id,),
+    ).fetchall()
+
+
+def serialize_stage(row, database=None):
+    subgoals = [
+        serialize_subgoal(item)
+        for item in (stage_subgoal_rows(database, row["id"]) if database else [])
+    ]
+    completed_subgoals = sum(item["completed"] for item in subgoals)
     payload = {
         "id": row["id"],
+        "goalId": row["goal_id"],
+        "weightPercent": row["weight_percent"],
         "title": row["title"],
         "description": row["description"],
         "status": row["status"],
@@ -1891,9 +2228,62 @@ def serialize_stage(row):
         "durationDays": row["duration_days"],
         "proofText": row["proof_text"] or "",
         "proofUrl": row["proof_url"] or "",
+        "subgoals": subgoals,
+        "subgoalCount": len(subgoals),
+        "completedSubgoalCount": completed_subgoals,
+        "subgoalProgressPercent": (
+            round(completed_subgoals * 100 / len(subgoals)) if subgoals else 0
+        ),
     }
     payload.update(proof_file_fields(row))
     return payload
+
+
+def serialize_goal(row, database):
+    stage_rows = database.execute(
+        "SELECT * FROM stages WHERE goal_id = ? ORDER BY started_at, id",
+        (row["id"],),
+    ).fetchall()
+    stages = [serialize_stage(stage, database) for stage in stage_rows]
+    allocated = sum(stage["weightPercent"] or 0 for stage in stages)
+    completed = sum(
+        (stage["weightPercent"] or 0)
+        for stage in stages
+        if stage["status"] == "completed"
+    )
+    current_stage = next(
+        (stage for stage in stages if stage["status"] == "active"), None
+    )
+    next_subgoal = None
+    if current_stage:
+        next_subgoal = next(
+            (item for item in current_stage["subgoals"] if not item["completed"]),
+            None,
+        )
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "description": row["description"],
+        "colorKey": row["color_key"],
+        "status": row["status"],
+        "startedAt": utc_iso(row["started_at"]),
+        "startDate": row["started_date"],
+        "updatedAt": utc_iso(row["updated_at"]),
+        "completedAt": utc_iso(row["completed_at"]),
+        "completionDate": row["completed_date"],
+        "allocatedPercent": allocated,
+        "remainingPercent": max(0, 100 - allocated),
+        "progressPercent": min(100, completed),
+        "canComplete": (
+            row["status"] == "active"
+            and allocated == 100
+            and completed == 100
+            and current_stage is None
+        ),
+        "currentStageId": current_stage["id"] if current_stage else None,
+        "nextSubgoal": next_subgoal,
+        "stages": stages,
+    }
 
 
 def client_ip():
@@ -2211,7 +2601,7 @@ def register():
                 "public_id, owner_user_id, name, storage_key, viewer_secret, "
                 "viewer_code_version, viewer_code_hash, mascot_enabled, "
                 "is_blue_space, status, created_at, updated_at"
-                ") VALUES (?, ?, ?, ?, ?, 1, ?, 0, 0, 'ready', ?, ?)",
+                ") VALUES (?, ?, ?, ?, ?, 1, ?, 1, 0, 'ready', ?, ?)",
                 (
                     public_id,
                     cursor.lastrowid,
@@ -2434,8 +2824,67 @@ def connect_space():
     record_auth_event("viewer_connect", email, True)
     return jsonify({
         "ok": True,
-        "space": serialize_space(space, "viewer"),
+        "space": serialize_space(space, "viewer", can_disconnect=True),
         "alreadyConnected": False,
+    })
+
+
+@app.delete("/api/spaces/connections/<public_id>")
+@require_auth
+@require_csrf
+def disconnect_space(public_id):
+    database = get_db()
+    disconnected = False
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        connection = database.execute(
+            "SELECT viewer_connections.id FROM viewer_connections "
+            "JOIN spaces ON spaces.id = viewer_connections.space_id "
+            "WHERE viewer_connections.user_id = ? AND spaces.public_id = ? "
+            "AND spaces.status = 'ready'",
+            (g.current_user["id"], public_id),
+        ).fetchone()
+        if connection:
+            database.execute(
+                "DELETE FROM viewer_connections WHERE id = ? AND user_id = ?",
+                (connection["id"], g.current_user["id"]),
+            )
+            disconnected = True
+        else:
+            own_space = database.execute(
+                "SELECT 1 FROM spaces WHERE public_id = ? AND owner_user_id = ? "
+                "AND status = 'ready'",
+                (public_id, g.current_user["id"]),
+            ).fetchone()
+            if own_space:
+                database.rollback()
+                return api_error(
+                    "自己的管理端不能断开。",
+                    403,
+                    "owned_space_not_disconnectable",
+                )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error(
+            "暂时无法断开这个预览端，请稍后重试。",
+            409,
+            "disconnect_conflict",
+        )
+    spaces = user_spaces()
+    return jsonify({
+        "ok": True,
+        "disconnected": disconnected,
+        "disconnectedSpaceId": public_id,
+        "spaces": spaces,
+        "defaultSpaceId": next(
+            (
+                item["publicId"]
+                for item in spaces
+                if item["connectionStatus"] == "active"
+            ),
+            spaces[0]["publicId"] if spaces else None,
+        ),
     })
 
 
@@ -2686,7 +3135,7 @@ def platform_overview():
             "lastLoginAt": utc_iso(row["last_login_at"]),
             "createdAt": utc_iso(row["created_at"]),
             "previewPermission": "read_only",
-            "appearance": {"mascotEnabled": bool(row["mascot_enabled"])},
+            "appearance": {"mascotEnabled": True},
             "isBlueSpace": bool(row["is_blue_space"]),
         }
         for row in space_rows
@@ -2765,32 +3214,6 @@ def platform_overview():
         "managerInvites": [
             serialize_manager_invite(row) for row in invite_rows
         ],
-    })
-
-
-@app.post("/api/platform/spaces/<public_id>/mascot")
-@require_platform_admin
-@require_csrf
-def set_space_mascot(public_id):
-    payload = parse_json()
-    enabled = payload.get("enabled") if payload else None
-    if not isinstance(enabled, bool):
-        return api_error("小精灵显示设置无效。")
-    database = get_db()
-    cursor = database.execute(
-        "UPDATE spaces SET mascot_enabled = ?, updated_at = ? "
-        "WHERE public_id = ? AND status = 'ready'",
-        (1 if enabled else 0, now_ts(), public_id),
-    )
-    database.commit()
-    if cursor.rowcount != 1:
-        return api_error("未找到请求的内容。", 404, "not_found")
-    row = database.execute(
-        "SELECT * FROM spaces WHERE public_id = ?", (public_id,)
-    ).fetchone()
-    return jsonify({
-        "ok": True,
-        "space": serialize_space(row, "platform_preview"),
     })
 
 
@@ -3045,8 +3468,6 @@ def serialize_message(row):
 @app.get("/api/messages")
 @require_space
 def list_messages():
-    if g.space_access == "platform_preview":
-        return api_error("未找到请求的内容。", 404, "not_found")
     window = message_window()
     database = get_db()
     if g.space_access == "owner":
@@ -3102,8 +3523,8 @@ def list_messages():
 @require_space
 @require_csrf
 def leave_message():
-    if g.space_access != "viewer":
-        return api_error("只有已连接的访客可以留言。", 403, "viewer_required")
+    if g.space_access not in {"viewer", "platform_preview"}:
+        return api_error("当前页面不能发送留言。", 403, "viewer_required")
     payload = parse_json()
     body = normalize_message_body(payload.get("body") if payload else None)
     if not body:
@@ -3119,21 +3540,22 @@ def leave_message():
         return api_error("留言发送较快，请稍后再试。", 429, "rate_limited")
     try:
         database.execute("BEGIN IMMEDIATE")
-        connection = database.execute(
-            "SELECT viewer_connections.* FROM viewer_connections "
-            "JOIN spaces ON spaces.id = viewer_connections.space_id "
-            "WHERE viewer_connections.user_id = ? AND viewer_connections.space_id = ? "
-            "AND viewer_connections.revoked_at IS NULL "
-            "AND viewer_connections.code_version = spaces.viewer_code_version",
-            (g.current_user["id"], g.current_space["id"]),
-        ).fetchone()
-        if not connection:
-            database.rollback()
-            return api_error(
-                "管理者已经刷新识别码，请重新连接后再留言。",
-                410,
-                "preview_access_revoked",
-            )
+        if g.space_access == "viewer":
+            connection = database.execute(
+                "SELECT viewer_connections.* FROM viewer_connections "
+                "JOIN spaces ON spaces.id = viewer_connections.space_id "
+                "WHERE viewer_connections.user_id = ? AND viewer_connections.space_id = ? "
+                "AND viewer_connections.revoked_at IS NULL "
+                "AND viewer_connections.code_version = spaces.viewer_code_version",
+                (g.current_user["id"], g.current_space["id"]),
+            ).fetchone()
+            if not connection:
+                database.rollback()
+                return api_error(
+                    "管理者已经刷新识别码，请重新连接后再留言。",
+                    410,
+                    "preview_access_revoked",
+                )
         cursor = database.execute(
             "INSERT INTO messages("
             "space_id, visitor_user_id, sender_user_id, sender_kind, body, created_at"
@@ -3230,11 +3652,14 @@ def reply_message(visitor_user_id):
 @require_space
 def get_data():
     database = get_content_db()
+    current_date = business_today_key()
+    if finalize_expired_tasks(database, current_date):
+        database.commit()
     if g.space_access == "owner":
         task_rows = database.execute("SELECT * FROM tasks ORDER BY task_date").fetchall()
         progress_by_date = task_progress_map(database)
     else:
-        public_cutoff = business_today_key()
+        public_cutoff = current_date
         task_rows = database.execute(
             "SELECT * FROM tasks WHERE task_date <= ? ORDER BY task_date",
             (public_cutoff,),
@@ -3246,6 +3671,7 @@ def get_data():
     ]
     payload = {
         "ok": True,
+        "businessDate": current_date,
         "tasks": tasks,
         "user": {
             "email": g.current_user["email"],
@@ -3260,7 +3686,7 @@ def get_data():
             g.space_access,
         ),
     }
-    public_cutoff = business_today_key()
+    public_cutoff = current_date
     if g.space_access == "owner":
         stat_rows = database.execute(
             "SELECT * FROM daily_stats ORDER BY stat_date"
@@ -3300,6 +3726,149 @@ def parse_stage_year(value):
     return year if 2020 <= year <= 2100 else False
 
 
+@app.get("/api/goals")
+@require_space
+def list_goals():
+    database = get_content_db()
+    active_row = database.execute(
+        "SELECT * FROM long_term_goals WHERE status = 'active' LIMIT 1"
+    ).fetchone()
+    completed_rows = database.execute(
+        "SELECT * FROM long_term_goals WHERE status = 'completed' "
+        "ORDER BY completed_date DESC, id DESC"
+    ).fetchall()
+    return jsonify({
+        "ok": True,
+        "activeGoal": serialize_goal(active_row, database) if active_row else None,
+        "completedGoals": [serialize_goal(row, database) for row in completed_rows],
+    })
+
+
+@app.post("/api/goals")
+@require_owner
+@require_csrf
+def create_goal():
+    payload = parse_json()
+    fields = validate_goal_fields(payload)
+    if not fields:
+        return api_error("长期目标名称不能超过 30 字，描述不能超过 120 字。")
+    title, description, color_key = fields
+    database = get_content_db()
+    if database.execute(
+        "SELECT 1 FROM long_term_goals WHERE status = 'active'"
+    ).fetchone():
+        return api_error("请先完成当前长期目标。", 409, "active_goal_exists")
+    active_stage = database.execute(
+        "SELECT * FROM stages WHERE status = 'active' LIMIT 1"
+    ).fetchone()
+    active_stage_weight = None
+    if active_stage:
+        if active_stage["goal_id"] is not None:
+            return api_error("当前阶段已经属于另一个长期目标。", 409, "stage_goal_conflict")
+        active_stage_weight = validate_weight_percent(
+            payload.get("activeStageWeight") if payload else None
+        )
+        if active_stage_weight is None:
+            return api_error("请设置当前阶段在长期目标中所占的百分比。")
+    current = now_ts()
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        cursor = database.execute(
+            "INSERT INTO long_term_goals("
+            "title, description, color_key, status, started_at, started_date, updated_at"
+            ") VALUES (?, ?, ?, 'active', ?, ?, ?)",
+            (title, description, color_key, current, business_today_key(), current),
+        )
+        if active_stage:
+            database.execute(
+                "UPDATE stages SET goal_id = ?, weight_percent = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'active' AND goal_id IS NULL",
+                (cursor.lastrowid, active_stage_weight, current, active_stage["id"]),
+            )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error("请先完成当前长期目标。", 409, "active_goal_exists")
+    row = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return jsonify({"ok": True, "goal": serialize_goal(row, database)}), 201
+
+
+@app.put("/api/goals/<int:goal_id>")
+@require_owner
+@require_csrf
+def update_goal(goal_id):
+    database = get_content_db()
+    row = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (goal_id,)
+    ).fetchone()
+    if not row:
+        return api_error("未找到该长期目标。", 404, "not_found")
+    if row["status"] != "active":
+        return api_error("已完成的长期目标不能修改。", 409, "goal_completed")
+    fields = validate_goal_fields(parse_json(), row)
+    if not fields:
+        return api_error("长期目标名称不能超过 30 字，描述不能超过 120 字。")
+    title, description, color_key = fields
+    database.execute(
+        "UPDATE long_term_goals SET title = ?, description = ?, color_key = ?, "
+        "updated_at = ? WHERE id = ? AND status = 'active'",
+        (title, description, color_key, now_ts(), goal_id),
+    )
+    database.commit()
+    updated = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (goal_id,)
+    ).fetchone()
+    return jsonify({"ok": True, "goal": serialize_goal(updated, database)})
+
+
+@app.post("/api/goals/<int:goal_id>/complete")
+@require_owner
+@require_csrf
+def complete_goal(goal_id):
+    database = get_content_db()
+    row = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (goal_id,)
+    ).fetchone()
+    if not row:
+        return api_error("未找到该长期目标。", 404, "not_found")
+    if row["status"] == "completed":
+        return jsonify({
+            "ok": True,
+            "idempotent": True,
+            "goal": serialize_goal(row, database),
+        })
+    goal = serialize_goal(row, database)
+    if goal["currentStageId"] is not None:
+        return api_error("请先完成当前阶段。", 409, "active_stage_exists")
+    if goal["allocatedPercent"] != 100 or goal["progressPercent"] != 100:
+        return api_error(
+            "长期目标需要规划满 100%，并完成全部阶段后才能归档。",
+            409,
+            "goal_incomplete",
+        )
+    completed_at = now_ts()
+    cursor = database.execute(
+        "UPDATE long_term_goals SET status = 'completed', updated_at = ?, "
+        "completed_at = ?, completed_date = ? "
+        "WHERE id = ? AND status = 'active'",
+        (completed_at, completed_at, business_today_key(), goal_id),
+    )
+    if cursor.rowcount != 1:
+        database.rollback()
+        return api_error("该长期目标已经完成。", 409, "goal_completed")
+    database.commit()
+    updated = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (goal_id,)
+    ).fetchone()
+    return jsonify({
+        "ok": True,
+        "idempotent": False,
+        "goal": serialize_goal(updated, database),
+    })
+
+
 @app.get("/api/stages")
 @app.get("/api/stages/year/<int:path_year>")
 @require_space
@@ -3308,6 +3877,9 @@ def list_stages(path_year=None):
     if year is False:
         return api_error("年份无效。")
     database = get_content_db()
+    active_goal_row = database.execute(
+        "SELECT * FROM long_term_goals WHERE status = 'active' LIMIT 1"
+    ).fetchone()
     active_row = database.execute(
         "SELECT * FROM stages WHERE status = 'active' LIMIT 1"
     ).fetchone()
@@ -3325,8 +3897,11 @@ def list_stages(path_year=None):
         ).fetchall()
     return jsonify({
         "ok": True,
-        "activeStage": serialize_stage(active_row) if active_row else None,
-        "completedStages": [serialize_stage(row) for row in completed_rows],
+        "activeGoal": (
+            serialize_goal(active_goal_row, database) if active_goal_row else None
+        ),
+        "activeStage": serialize_stage(active_row, database) if active_row else None,
+        "completedStages": [serialize_stage(row, database) for row in completed_rows],
         "completionDates": [
             {"date": row["completed_date"], "stageId": row["id"]}
             for row in completed_rows
@@ -3337,38 +3912,68 @@ def list_stages(path_year=None):
 @app.get("/api/stages/<int:stage_id>")
 @require_space
 def get_stage(stage_id):
-    row = get_content_db().execute(
+    database = get_content_db()
+    row = database.execute(
         "SELECT * FROM stages WHERE id = ?", (stage_id,)
     ).fetchone()
     if not row:
         return api_error("未找到该阶段。", 404, "not_found")
-    return jsonify({"ok": True, "stage": serialize_stage(row)})
+    return jsonify({"ok": True, "stage": serialize_stage(row, database)})
 
 
 @app.post("/api/stages")
 @require_owner
 @require_csrf
 def create_stage():
-    fields = validate_stage_fields(parse_json())
+    payload = parse_json()
+    fields = validate_stage_fields(payload)
     if not fields:
         return api_error("阶段标题或说明无效，标题不能超过 200 字，说明不能超过 5000 字。")
     title, description = fields
     database = get_content_db()
     if database.execute("SELECT 1 FROM stages WHERE status = 'active'").fetchone():
         return api_error("请先完成当前阶段，再新建下一阶段。", 409, "active_stage_exists")
+    active_goal = database.execute(
+        "SELECT * FROM long_term_goals WHERE status = 'active' LIMIT 1"
+    ).fetchone()
+    goal_id = active_goal["id"] if active_goal else None
+    weight_percent = None
+    if active_goal:
+        weight_percent = validate_weight_percent(
+            payload.get("weightPercent") if payload else None
+        )
+        if weight_percent is None:
+            return api_error("请设置这个阶段在长期目标中所占的百分比。")
+        remaining = 100 - goal_allocated_percent(database, goal_id)
+        if weight_percent > remaining:
+            return api_error(
+                f"这个阶段最多可以占长期目标的 {remaining}%。",
+                409,
+                "goal_weight_exceeded",
+            )
     current = now_ts()
     try:
         cursor = database.execute(
-            "INSERT INTO stages(title, description, status, started_at, started_date, updated_at) "
-            "VALUES (?, ?, 'active', ?, ?, ?)",
-            (title, description, current, business_today_key(), current),
+            "INSERT INTO stages("
+            "goal_id, weight_percent, title, description, status, "
+            "started_at, started_date, updated_at"
+            ") VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+            (
+                goal_id,
+                weight_percent,
+                title,
+                description,
+                current,
+                business_today_key(),
+                current,
+            ),
         )
         database.commit()
     except sqlite3.IntegrityError:
         database.rollback()
         return api_error("请先完成当前阶段，再新建下一阶段。", 409, "active_stage_exists")
     row = database.execute("SELECT * FROM stages WHERE id = ?", (cursor.lastrowid,)).fetchone()
-    return jsonify({"ok": True, "stage": serialize_stage(row)}), 201
+    return jsonify({"ok": True, "stage": serialize_stage(row, database)}), 201
 
 
 @app.put("/api/stages/<int:stage_id>")
@@ -3381,21 +3986,197 @@ def update_stage(stage_id):
         return api_error("未找到该阶段。", 404, "not_found")
     if row["status"] != "active":
         return api_error("已完成的阶段不能修改。", 409, "stage_completed")
-    fields = validate_stage_fields(parse_json(), row)
+    payload = parse_json()
+    fields = validate_stage_fields(payload, row)
     if not fields:
         return api_error("阶段标题或说明无效，标题不能超过 200 字，说明不能超过 5000 字。")
     title, description = fields
+    weight_percent = row["weight_percent"]
+    if payload and "weightPercent" in payload:
+        if row["goal_id"] is None:
+            return api_error("这个阶段还没有关联长期目标。", 409, "stage_without_goal")
+        weight_percent = validate_weight_percent(payload.get("weightPercent"))
+        if weight_percent is None:
+            return api_error("阶段占比必须是 1 到 100 的整数。")
+        allocated_without_stage = goal_allocated_percent(
+            database, row["goal_id"], stage_id
+        )
+        remaining = 100 - allocated_without_stage
+        if weight_percent > remaining:
+            return api_error(
+                f"这个阶段最多可以占长期目标的 {remaining}%。",
+                409,
+                "goal_weight_exceeded",
+            )
     cursor = database.execute(
-        "UPDATE stages SET title = ?, description = ?, updated_at = ? "
+        "UPDATE stages SET title = ?, description = ?, weight_percent = ?, updated_at = ? "
         "WHERE id = ? AND status = 'active'",
-        (title, description, now_ts(), stage_id),
+        (title, description, weight_percent, now_ts(), stage_id),
     )
     if cursor.rowcount != 1:
         database.rollback()
         return api_error("已完成的阶段不能修改。", 409, "stage_completed")
     database.commit()
     updated = database.execute("SELECT * FROM stages WHERE id = ?", (stage_id,)).fetchone()
-    return jsonify({"ok": True, "stage": serialize_stage(updated)})
+    return jsonify({"ok": True, "stage": serialize_stage(updated, database)})
+
+
+@app.post("/api/stages/<int:stage_id>/subgoals")
+@require_owner
+@require_csrf
+def create_stage_subgoal(stage_id):
+    payload = parse_json()
+    title = validate_subgoal_title(payload.get("title") if payload else None)
+    if title is None:
+        return api_error("子目标不能为空，且不能超过 60 字。")
+    database = get_content_db()
+    stage = database.execute(
+        "SELECT * FROM stages WHERE id = ?", (stage_id,)
+    ).fetchone()
+    if not stage:
+        return api_error("未找到该阶段。", 404, "not_found")
+    if stage["status"] != "active":
+        return api_error("已完成的阶段不能修改子目标。", 409, "stage_completed")
+    position_row = database.execute(
+        "SELECT COALESCE(MAX(position), -1) + 1 AS next_position "
+        "FROM stage_subgoals WHERE stage_id = ?",
+        (stage_id,),
+    ).fetchone()
+    current = now_ts()
+    cursor = database.execute(
+        "INSERT INTO stage_subgoals("
+        "stage_id, title, position, status, created_at, updated_at"
+        ") VALUES (?, ?, ?, 'pending', ?, ?)",
+        (stage_id, title, position_row["next_position"], current, current),
+    )
+    database.commit()
+    row = database.execute(
+        "SELECT * FROM stage_subgoals WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return jsonify({"ok": True, "subgoal": serialize_subgoal(row)}), 201
+
+
+@app.put("/api/subgoals/<int:subgoal_id>")
+@require_owner
+@require_csrf
+def update_stage_subgoal(subgoal_id):
+    payload = parse_json()
+    if not isinstance(payload, dict):
+        return api_error("子目标内容无效。")
+    database = get_content_db()
+    row = database.execute(
+        "SELECT stage_subgoals.*, stages.status AS stage_status "
+        "FROM stage_subgoals JOIN stages ON stages.id = stage_subgoals.stage_id "
+        "WHERE stage_subgoals.id = ?",
+        (subgoal_id,),
+    ).fetchone()
+    if not row:
+        return api_error("未找到该子目标。", 404, "not_found")
+    if row["stage_status"] != "active":
+        return api_error("已完成的阶段不能修改子目标。", 409, "stage_completed")
+    title = row["title"]
+    if "title" in payload:
+        title = validate_subgoal_title(payload.get("title"))
+        if title is None:
+            return api_error("子目标不能为空，且不能超过 60 字。")
+    status = row["status"]
+    completed_at = row["completed_at"]
+    if "completed" in payload:
+        if not isinstance(payload.get("completed"), bool):
+            return api_error("子目标完成状态无效。")
+        status = "completed" if payload["completed"] else "pending"
+        completed_at = now_ts() if payload["completed"] else None
+    if "title" not in payload and "completed" not in payload:
+        return api_error("没有可更新的子目标内容。")
+    database.execute(
+        "UPDATE stage_subgoals SET title = ?, status = ?, completed_at = ?, "
+        "updated_at = ? WHERE id = ?",
+        (title, status, completed_at, now_ts(), subgoal_id),
+    )
+    database.commit()
+    updated = database.execute(
+        "SELECT * FROM stage_subgoals WHERE id = ?", (subgoal_id,)
+    ).fetchone()
+    return jsonify({"ok": True, "subgoal": serialize_subgoal(updated)})
+
+
+@app.delete("/api/subgoals/<int:subgoal_id>")
+@require_owner
+@require_csrf
+def delete_stage_subgoal(subgoal_id):
+    database = get_content_db()
+    row = database.execute(
+        "SELECT stage_subgoals.*, stages.status AS stage_status "
+        "FROM stage_subgoals JOIN stages ON stages.id = stage_subgoals.stage_id "
+        "WHERE stage_subgoals.id = ?",
+        (subgoal_id,),
+    ).fetchone()
+    if not row:
+        return api_error("未找到该子目标。", 404, "not_found")
+    if row["stage_status"] != "active":
+        return api_error("已完成的阶段不能删除子目标。", 409, "stage_completed")
+    database.execute("DELETE FROM stage_subgoals WHERE id = ?", (subgoal_id,))
+    remaining = database.execute(
+        "SELECT id FROM stage_subgoals WHERE stage_id = ? ORDER BY position, id",
+        (row["stage_id"],),
+    ).fetchall()
+    for position, item in enumerate(remaining):
+        database.execute(
+            "UPDATE stage_subgoals SET position = ?, updated_at = ? WHERE id = ?",
+            (position, now_ts(), item["id"]),
+        )
+    database.commit()
+    return jsonify({"ok": True, "deleted": True})
+
+
+@app.post("/api/stages/<int:stage_id>/subgoals/reorder")
+@require_owner
+@require_csrf
+def reorder_stage_subgoals(stage_id):
+    payload = parse_json()
+    ordered_ids = payload.get("ids") if isinstance(payload, dict) else None
+    if (
+        not isinstance(ordered_ids, list)
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in ordered_ids)
+        or len(set(ordered_ids)) != len(ordered_ids)
+    ):
+        return api_error("子目标顺序无效。")
+    database = get_content_db()
+    stage = database.execute(
+        "SELECT * FROM stages WHERE id = ?", (stage_id,)
+    ).fetchone()
+    if not stage:
+        return api_error("未找到该阶段。", 404, "not_found")
+    if stage["status"] != "active":
+        return api_error("已完成的阶段不能调整子目标。", 409, "stage_completed")
+    existing = database.execute(
+        "SELECT id FROM stage_subgoals WHERE stage_id = ? ORDER BY position, id",
+        (stage_id,),
+    ).fetchall()
+    if set(ordered_ids) != {item["id"] for item in existing}:
+        return api_error("必须提交当前阶段的全部子目标。", 409, "subgoal_set_changed")
+    current = now_ts()
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        database.execute(
+            "UPDATE stage_subgoals SET position = position + 100000, updated_at = ? "
+            "WHERE stage_id = ?",
+            (current, stage_id),
+        )
+        for position, item_id in enumerate(ordered_ids):
+            database.execute(
+                "UPDATE stage_subgoals SET position = ?, updated_at = ? "
+                "WHERE id = ? AND stage_id = ?",
+                (position, current, item_id, stage_id),
+            )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error("子目标顺序刚刚发生变化，请刷新后重试。", 409, "subgoal_set_changed")
+    return jsonify({
+        "ok": True,
+        "subgoals": [serialize_subgoal(item) for item in stage_subgoal_rows(database, stage_id)],
+    })
 
 
 @app.post("/api/stages/<int:stage_id>/complete")
@@ -3434,8 +4215,26 @@ def complete_stage(stage_id):
             and proof_text == (row["proof_text"] or "")
             and proof_url == (row["proof_url"] or "")
         ):
-            return jsonify({"ok": True, "idempotent": True, "stage": serialize_stage(row)})
+            return jsonify({
+                "ok": True,
+                "idempotent": True,
+                "stage": serialize_stage(row, database),
+            })
         return api_error("该阶段已经完成，不能重复修改完成证明。", 409, "stage_completed")
+    if row["goal_id"] is not None:
+        subgoals = stage_subgoal_rows(database, stage_id)
+        if not subgoals:
+            return api_error(
+                "请先为当前阶段添加至少一个子目标。",
+                409,
+                "stage_subgoals_required",
+            )
+        if any(item["status"] != "completed" for item in subgoals):
+            return api_error(
+                "请先完成当前阶段的全部子目标。",
+                409,
+                "stage_subgoals_incomplete",
+            )
     if not proof_text and not proof_url and not has_upload:
         return api_error("请填写完成说明、证据链接或上传一个证明附件。")
 
@@ -3478,7 +4277,11 @@ def complete_stage(stage_id):
         delete_stored_proof(new_file)
         raise
     updated = database.execute("SELECT * FROM stages WHERE id = ?", (stage_id,)).fetchone()
-    return jsonify({"ok": True, "idempotent": False, "stage": serialize_stage(updated)})
+    return jsonify({
+        "ok": True,
+        "idempotent": False,
+        "stage": serialize_stage(updated, database),
+    })
 
 
 @app.put("/api/tasks/<task_date>")
@@ -3490,7 +4293,16 @@ def set_task(task_date):
     text = payload.get("text", "").strip() if payload and isinstance(payload.get("text"), str) else ""
     if not task_date or not text or len(text) > 1000:
         return api_error("任务日期或内容无效，内容不能超过 1000 字。")
+    current_date = business_today_key(task_date)
+    if task_date < current_date:
+        return api_error(
+            "过去日期已经冻结，不能再新建或修改任务。",
+            409,
+            "task_window_closed",
+        )
     database = get_content_db()
+    database.execute("BEGIN IMMEDIATE")
+    finalize_expired_tasks(database, current_date)
     cursor = database.execute(
         "INSERT INTO tasks(task_date, text, done, created_at) VALUES (?, ?, 0, ?) "
         "ON CONFLICT(task_date) DO UPDATE SET text = excluded.text "
@@ -3514,10 +4326,12 @@ def delete_task(task_date):
     task_date = validate_date_key(task_date)
     if not task_date:
         return api_error("任务日期无效。")
+    current_date = business_today_key(task_date)
     database = get_content_db()
     # Keep attachment discovery and the cascading task delete in the same
     # write-locked transaction as concurrent progress-file inserts.
     database.execute("BEGIN IMMEDIATE")
+    finalize_expired_tasks(database, current_date)
     row = database.execute(
         "SELECT done, result_status, proof_file FROM tasks WHERE task_date = ?", (task_date,)
     ).fetchone()
@@ -3865,6 +4679,18 @@ def create_task_progress(task_date):
     payload = parse_json()
     if not task_date or not isinstance(payload, dict):
         return api_error("进度记录无效。")
+    current_date = business_today_key(task_date)
+    progress_mode = task_progress_mode(task_date, current_date)
+    if progress_mode is None:
+        if task_date < current_date:
+            return api_error(
+                "只能补充昨天的记录，更早日期已经关闭。",
+                409,
+                "supplement_window_closed",
+            )
+        return api_error(
+            "任务当天开始后才能记录进度。", 409, "progress_window_not_open"
+        )
 
     note_value = payload.get("note", "")
     progress_percent = payload.get("progressPercent")
@@ -3912,12 +4738,34 @@ def create_task_progress(task_date):
         # lock, two workers can both miss the token and one would surface a
         # UNIQUE violation instead of returning the already-created record.
         database.execute("BEGIN IMMEDIATE")
+        current_date = business_today_key(task_date)
+        progress_mode = task_progress_mode(task_date, current_date)
+        if progress_mode is None:
+            database.rollback()
+            if task_date < current_date:
+                return api_error(
+                    "只能补充昨天的记录，更早日期已经关闭。",
+                    409,
+                    "supplement_window_closed",
+                )
+            return api_error(
+                "任务当天开始后才能记录进度。",
+                409,
+                "progress_window_not_open",
+            )
+        finalize_expired_tasks(database, current_date)
+        created_at = now_ts()
         task_row = database.execute(
             "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
         ).fetchone()
         if not task_row:
             database.rollback()
             return api_error("未找到该任务。", 404, "not_found")
+        if progress_mode == "day" and task_row["result_locked_at"] is not None:
+            database.rollback()
+            return api_error(
+                "当日结果已经锁定，不能再修改。", 409, "result_locked"
+            )
         if client_key:
             existing_progress = database.execute(
                 "SELECT id FROM task_progress WHERE task_date = ? AND client_key = ?",
@@ -3963,9 +4811,16 @@ def create_task_progress(task_date):
             )
         cursor = database.execute(
             "INSERT INTO task_progress("
-            "task_date, client_key, note, progress_percent, created_at"
-            ") VALUES (?, ?, ?, ?, ?)",
-            (task_date, client_key, note, progress_percent, created_at),
+            "task_date, client_key, note, progress_percent, record_date, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                task_date,
+                client_key,
+                note,
+                progress_percent,
+                current_date,
+                created_at,
+            ),
         )
         progress_id = cursor.lastrowid
         for position, proof_url in enumerate(links):
@@ -4026,6 +4881,14 @@ def add_task_progress_file(task_date, progress_id):
     task_date = validate_date_key(task_date)
     if not task_date:
         return api_error("任务日期无效。")
+    current_date = business_today_key(task_date)
+    progress_mode = task_progress_mode(task_date, current_date)
+    if progress_mode is None:
+        return api_error(
+            "只能为今天或昨天刚补充的进度添加附件。",
+            409,
+            "progress_file_window_closed",
+        )
     try:
         upload = get_proof_upload()
     except ValueError as error:
@@ -4045,6 +4908,12 @@ def add_task_progress_file(task_date, progress_id):
     ).fetchone()
     if not progress_row:
         return api_error("未找到该进度记录。", 404, "not_found")
+    if progress_row["record_date"] != current_date:
+        return api_error(
+            "只能为今天新建的进度添加附件。",
+            409,
+            "progress_file_window_closed",
+        )
     if client_key:
         existing_asset = database.execute(
             "SELECT * FROM task_progress_assets "
@@ -4075,6 +4944,17 @@ def add_task_progress_file(task_date, progress_id):
         # allocation, and insert so concurrent workers cannot create duplicate
         # rows or collide on MAX(position) + 1.
         database.execute("BEGIN IMMEDIATE")
+        current_date = business_today_key(task_date)
+        progress_mode = task_progress_mode(task_date, current_date)
+        if progress_mode is None:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error(
+                "只能为今天或昨天刚补充的进度添加附件。",
+                409,
+                "progress_file_window_closed",
+            )
+        finalize_expired_tasks(database, current_date)
         progress_row = database.execute(
             "SELECT progress.* FROM task_progress AS progress "
             "JOIN tasks ON tasks.task_date = progress.task_date "
@@ -4085,6 +4965,14 @@ def add_task_progress_file(task_date, progress_id):
             database.rollback()
             delete_stored_proof_if_unreferenced(database, new_file)
             return api_error("未找到该进度记录。", 404, "not_found")
+        if progress_row["record_date"] != current_date:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error(
+                "只能为今天新建的进度添加附件。",
+                409,
+                "progress_file_window_closed",
+            )
         if client_key:
             existing_asset = database.execute(
                 "SELECT * FROM task_progress_assets "
@@ -4229,15 +5117,33 @@ def delete_task_progress_asset(task_date, progress_id, asset_id):
     task_date = validate_date_key(task_date)
     if not task_date:
         return api_error("任务日期无效。")
+    current_date = business_today_key(task_date)
+    if task_progress_mode(task_date, current_date) is None:
+        return api_error(
+            "只能调整今天新建的进度附件。",
+            409,
+            "progress_asset_window_closed",
+        )
     database = get_content_db()
+    database.execute("BEGIN IMMEDIATE")
+    finalize_expired_tasks(database, current_date)
     asset_row = database.execute(
-        "SELECT assets.* FROM task_progress_assets AS assets "
+        "SELECT assets.*, progress.record_date AS progress_record_date "
+        "FROM task_progress_assets AS assets "
         "JOIN task_progress AS progress ON progress.id = assets.progress_id "
         "WHERE assets.id = ? AND progress.id = ? AND progress.task_date = ?",
         (asset_id, progress_id, task_date),
     ).fetchone()
     if not asset_row:
+        database.rollback()
         return api_error("未找到该附件或链接。", 404, "not_found")
+    if asset_row["progress_record_date"] != current_date:
+        database.rollback()
+        return api_error(
+            "只能调整今天新建的进度附件。",
+            409,
+            "progress_asset_window_closed",
+        )
     stored_file = asset_row["proof_file"]
     database.execute("DELETE FROM task_progress_assets WHERE id = ?", (asset_id,))
     database.commit()
@@ -4262,6 +5168,13 @@ def record_task_result(task_date):
     task_date = validate_date_key(task_date)
     if not task_date:
         return api_error("任务日期无效。")
+    current_date = business_today_key(task_date)
+    if task_date != current_date:
+        return api_error(
+            "最终结果只能在任务当天记录；24:00 后结果已经冻结。",
+            409,
+            "result_window_closed",
+        )
     legacy_completion = request.path.endswith("/complete")
     result_status = request.form.get("resultStatus")
     if legacy_completion and not result_status:
@@ -4325,6 +5238,16 @@ def record_task_result(task_date):
         # monotonic result version for true compare-and-swap semantics even
         # when two writes arrive within the same second.
         database.execute("BEGIN IMMEDIATE")
+        current_date = business_today_key(task_date)
+        if task_date != current_date:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error(
+                "最终结果只能在任务当天记录；24:00 后结果已经冻结。",
+                409,
+                "result_window_closed",
+            )
+        finalize_expired_tasks(database, current_date)
         current_row = database.execute(
             "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
         ).fetchone()
@@ -4332,6 +5255,12 @@ def record_task_result(task_date):
             database.rollback()
             delete_stored_proof_if_unreferenced(database, new_file)
             return api_error("未找到该任务。", 404, "not_found")
+        if current_row["result_locked_at"] is not None:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error(
+                "当日结果已经锁定，不能再修改。", 409, "result_locked"
+            )
         if current_row["result_version"] != initial_result_version:
             database.rollback()
             delete_stored_proof_if_unreferenced(database, new_file)
@@ -4586,6 +5515,22 @@ def validate_legacy_import(value):
             created_at, created_iso = parse_import_progress_timestamp(
                 entry.get("createdAt")
             )
+            record_date_value = entry.get("recordDate")
+            if record_date_value is None:
+                record_date = business_date_for_timestamp(created_at)
+            else:
+                record_date = validate_date_key(record_date_value)
+                if not record_date:
+                    raise ValueError("invalid")
+            supplemental_value = entry.get("supplemental")
+            if (
+                supplemental_value is not None
+                and (
+                    not isinstance(supplemental_value, bool)
+                    or supplemental_value != (record_date > key)
+                )
+            ):
+                raise ValueError("invalid")
             client_key = imported_progress_client_key(
                 key,
                 nonlegacy_progress_index,
@@ -4595,7 +5540,15 @@ def validate_legacy_import(value):
                 links,
             )
             progress_entries.append(
-                (key, client_key, note, progress_percent, created_at, links)
+                (
+                    key,
+                    client_key,
+                    note,
+                    progress_percent,
+                    record_date,
+                    created_at,
+                    links,
+                )
             )
             nonlegacy_progress_index += 1
         result_recorded_value = item.get("resultRecordedAt")
@@ -4636,6 +5589,29 @@ def validate_legacy_import(value):
                 != (confirmed_progress_count < nonlegacy_progress_index)
             ):
                 raise ValueError("invalid")
+        result_locked_value = item.get("resultLocked", False)
+        if not isinstance(result_locked_value, bool):
+            raise ValueError("invalid")
+        result_locked_at_value = item.get("resultLockedAt")
+        result_lock_source = item.get("resultLockSource")
+        if result_locked_value:
+            if result_status == "pending" or result_lock_source not in {
+                "recorded",
+                "automatic",
+            }:
+                raise ValueError("invalid")
+            result_locked_at = (
+                parse_import_progress_timestamp(result_locked_at_value)[0]
+                if result_locked_at_value is not None
+                else task_deadline_timestamp(key)
+            )
+            if result_locked_at != task_deadline_timestamp(key):
+                raise ValueError("invalid")
+        else:
+            if result_locked_at_value is not None or result_lock_source is not None:
+                raise ValueError("invalid")
+            result_locked_at = None
+            result_lock_source = None
         tasks.append(
             (
                 key,
@@ -4645,6 +5621,8 @@ def validate_legacy_import(value):
                 result_note.strip(),
                 result_recorded_at,
                 confirmed_progress_count,
+                result_locked_at,
+                result_lock_source,
             )
         )
     clean_poms = {}
@@ -4716,14 +5694,17 @@ def import_data():
             result_note,
             result_recorded_at,
             _confirmed_progress_count,
+            result_locked_at,
+            result_lock_source,
         ) in tasks:
             recorded = result_status != "pending"
             imported_at = now_ts()
             cursor = database.execute(
                 "INSERT OR IGNORE INTO tasks("
                 "task_date, text, done, result_status, completion_percent, result_note, "
-                "result_recorded_at, result_version, created_at, completed_at, proof_text"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "result_recorded_at, result_version, result_locked_at, result_lock_source, "
+                "created_at, completed_at, proof_text"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     key,
                     text,
@@ -4733,6 +5714,8 @@ def import_data():
                     result_note,
                     (result_recorded_at or imported_at) if recorded else None,
                     1 if recorded else 0,
+                    result_locked_at,
+                    result_lock_source,
                     imported_at,
                     (result_recorded_at or imported_at)
                     if result_status == "completed"
@@ -4755,6 +5738,7 @@ def import_data():
             client_key,
             note,
             progress_percent,
+            record_date,
             created_at,
             links,
         ) in progress_entries:
@@ -4763,9 +5747,16 @@ def import_data():
                 continue
             cursor = database.execute(
                 "INSERT OR IGNORE INTO task_progress("
-                "task_date, client_key, note, progress_percent, created_at"
-                ") VALUES (?, ?, ?, ?, ?)",
-                (task_date, client_key, note, progress_percent, created_at),
+                "task_date, client_key, note, progress_percent, record_date, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    task_date,
+                    client_key,
+                    note,
+                    progress_percent,
+                    record_date,
+                    created_at,
+                ),
             )
             if cursor.rowcount == 0:
                 continue
@@ -4794,6 +5785,7 @@ def import_data():
                 "WHERE task_date = ?",
                 (confirmed_progress_id, task_date),
             )
+        finalize_expired_tasks(database)
         for key in set(poms) | set(notes) | set(distractions):
             database.execute(
                 "INSERT INTO daily_stats(stat_date, poms, note, distractions, updated_at) "
@@ -4842,6 +5834,9 @@ def export_data():
             "resultConfirmedProgressCount": serialized[
                 "resultConfirmedProgressCount"
             ],
+            "resultLocked": serialized["resultLocked"],
+            "resultLockedAt": serialized["resultLockedAt"],
+            "resultLockSource": serialized["resultLockSource"],
             "createdAt": utc_iso(row["created_at"]),
             "doneAt": utc_iso(row["completed_at"]),
             "proofText": row["proof_text"] or "",
@@ -4851,8 +5846,14 @@ def export_data():
         }
     stats = database.execute("SELECT * FROM daily_stats ORDER BY stat_date").fetchall()
     stages = [
-        serialize_stage(row)
+        serialize_stage(row, database)
         for row in database.execute("SELECT * FROM stages ORDER BY started_at, id").fetchall()
+    ]
+    goals = [
+        serialize_goal(row, database)
+        for row in database.execute(
+            "SELECT * FROM long_term_goals ORDER BY started_at, id"
+        ).fetchall()
     ]
     body = json.dumps({
         "formatVersion": 2,
@@ -4861,6 +5862,7 @@ def export_data():
         "poms": {row["stat_date"]: row["poms"] for row in stats},
         "notes": {row["stat_date"]: row["note"] for row in stats},
         "distractions": {row["stat_date"]: row["distractions"] for row in stats},
+        "goals": goals,
         "stages": stages,
     }, ensure_ascii=False, indent=2)
     filename = f"blue-{business_today_key()}.json"

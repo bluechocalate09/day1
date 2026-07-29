@@ -46,6 +46,7 @@
     tasks: [],
     stats: {},
     publicPoms: {},
+    activeGoal: null,
     activeStage: null,
     stageYears: {},
     mode: "visitor",
@@ -102,8 +103,10 @@
       access: space.access === "owner" ? "owner" : "viewer",
       connectionStatus: ["revoked", "blocked"].includes(space.connectionStatus) ? space.connectionStatus : "active",
       revokedReason: textValue(space.revokedReason),
+      canDisconnect: Boolean(space.canDisconnect),
+      platformPreview: Boolean(space.platformPreview || space.access === "platform_preview"),
       appearance: {
-        mascotEnabled: Boolean(space.appearance && space.appearance.mascotEnabled),
+        mascotEnabled: true,
       },
       ownerEmail: textValue(space.ownerEmail),
       ownerDisplayName: textValue(space.ownerDisplayName || space.ownerName),
@@ -284,13 +287,43 @@
     return Number.isInteger(value) ? Math.min(100, Math.max(0, value)) : 0;
   }
 
+  function progressIsSupplemental(entry, taskDate) {
+    if (!entry || entry.legacy) return false;
+    if (typeof entry.supplemental === "boolean") return entry.supplemental;
+    return Boolean(entry.recordDate && taskDate && entry.recordDate > taskDate);
+  }
+
   function latestProgressEntry(task) {
     const entries = taskProgressEntries(task);
     return entries.length ? entries[entries.length - 1] : null;
   }
 
+  function taskDayProgressEntries(task) {
+    return taskProgressEntries(task).filter((entry) => !progressIsSupplemental(entry, task && task.date));
+  }
+
+  function taskSupplementEntries(task) {
+    return taskProgressEntries(task).filter((entry) => progressIsSupplemental(entry, task && task.date));
+  }
+
+  function latestDayProgressEntry(task) {
+    const entries = taskDayProgressEntries(task);
+    return entries.length ? entries[entries.length - 1] : null;
+  }
+
+  function latestSupplementEntry(task) {
+    const entries = taskSupplementEntries(task);
+    return entries.length ? entries[entries.length - 1] : null;
+  }
+
   function taskHasProgress(task) {
     return taskProgressEntries(task).length > 0;
+  }
+
+  function taskHasSupplement(task) {
+    if (!task) return false;
+    if (typeof task.supplemented === "boolean") return task.supplemented;
+    return taskSupplementEntries(task).length > 0;
   }
 
   function taskHasPublicRecord(task) {
@@ -308,9 +341,9 @@
   }
 
   function taskResultIsStale(task) {
-    if (!taskHasResult(task)) return false;
+    if (!taskHasResult(task) || task.resultLocked) return false;
     if (typeof task.resultIsStale === "boolean") return task.resultIsStale;
-    const latest = latestProgressEntry(task);
+    const latest = latestDayProgressEntry(task);
     if (!latest) return false;
     const latestTime = Date.parse(latest.createdAt || "");
     const resultTime = Date.parse(task.resultRecordedAt || task.completedAt || "");
@@ -320,10 +353,36 @@
   function taskCompletionPercent(task) {
     const status = taskResultStatus(task);
     if (status === "completed") return 100;
-    if (status === "pending") return progressPercent(latestProgressEntry(task));
-    if (taskResultIsStale(task)) return progressPercent(latestProgressEntry(task));
-    const value = Number.parseInt(task && task.completionPercent, 10);
-    return Number.isInteger(value) ? Math.min(99, Math.max(0, value)) : 0;
+    const stored = Number.parseInt(task && task.completionPercent, 10);
+    const storedPercent = Number.isInteger(stored) ? Math.min(99, Math.max(0, stored)) : 0;
+    if (status === "pending") return progressPercent(latestDayProgressEntry(task));
+    if (taskResultIsStale(task)) return progressPercent(latestDayProgressEntry(task));
+    return storedPercent;
+  }
+
+  function taskSupplementPercent(task) {
+    const stored = Number.parseInt(task && task.supplementCompletionPercent, 10);
+    if (Number.isInteger(stored)) return Math.min(100, Math.max(0, stored));
+    return progressPercent(latestSupplementEntry(task));
+  }
+
+  function taskCompletionSummary(task) {
+    const original = taskCompletionPercent(task);
+    if (!taskHasSupplement(task)) return `当日 ${original}%`;
+    return `当日 ${original}% · 次日补充至 ${taskSupplementPercent(task)}%`;
+  }
+
+  function taskCanAddProgress(task) {
+    if (!task) return false;
+    if (typeof task.canAddProgress === "boolean") return task.canAddProgress;
+    const today = dateKeyInShanghai();
+    return task.date === today || task.date === shiftDate(today, -1);
+  }
+
+  function taskCanRecordResult(task) {
+    if (!task) return false;
+    if (typeof task.canRecordResult === "boolean") return task.canRecordResult;
+    return task.date === dateKeyInShanghai() && !task.resultLocked;
   }
 
   function taskResultNote(task) {
@@ -355,7 +414,6 @@
     }
     return "待反馈";
   }
-
   function publicPomsFor(key) {
     const parsed = Number.parseInt(state.publicPoms[key], 10);
     return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
@@ -532,6 +590,7 @@
 
   async function loadStageYear(year) {
     const payload = await api(`/api/stages?year=${encodeURIComponent(String(year))}`);
+    state.activeGoal = payload.activeGoal || null;
     state.activeStage = payload.activeStage || null;
     state.stageYears[String(year)] = {
       completedStages: Array.isArray(payload.completedStages) ? payload.completedStages : [],
@@ -785,9 +844,14 @@
   async function loadData() {
     if (!state.activeSpaceId) throw new ApiError("请先连接或选择一个 Day1。", 400, "space_required");
     const payload = await api("/api/data");
+    const previousWorkspace = spaceById(state.activeSpaceId);
     const workspace = normalizeSpace(Object.assign({}, payload.workspace || {}, {
       access: payload.access || (payload.workspace && payload.workspace.access),
-    })) || spaceById(state.activeSpaceId);
+    })) || previousWorkspace;
+    if (workspace && previousWorkspace) {
+      workspace.canDisconnect = workspace.canDisconnect || previousWorkspace.canDisconnect;
+      workspace.platformPreview = workspace.platformPreview || previousWorkspace.platformPreview;
+    }
     state.workspace = workspace;
     state.access = payload.access === "owner" || (workspace && workspace.access === "owner") ? "owner" : "viewer";
     if (workspace) {
@@ -865,6 +929,7 @@
     state.lastAccessCheckAt = 0;
     state.selectedOwnerDate = "";
     state.selectedVisitorDate = "";
+    state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
     state.forcedPasswordChange = false;
@@ -886,6 +951,7 @@
     state.publicPoms = {};
     state.selectedOwnerDate = "";
     state.selectedVisitorDate = "";
+    state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
     $("#today-task-text").textContent = "";
@@ -922,8 +988,11 @@
     $("#task-form").reset();
     $("#progress-form").reset();
     $("#proof-form").reset();
+    $("#goal-form").reset();
     $("#stage-form").reset();
     $("#stage-complete-form").reset();
+    $("#subgoal-form").reset();
+    $("#subgoal-form").dataset.editId = "";
     $("#password-form").reset();
     $("#message-form").reset();
     $("#message-panel").hidden = true;
@@ -960,7 +1029,7 @@
     $("#workspace-danger-zone").open = false;
     clearProgressFiles();
     clearStageImagePreview();
-    ["#task-dialog", "#progress-dialog", "#proof-dialog", "#stage-dialog", "#stage-complete-dialog", "#proof-view-dialog", "#password-dialog", "#confirm-dialog", "#connect-space-dialog", "#refresh-viewer-code-dialog", "#delete-space-dialog", "#ip-block-dialog", "#manager-invite-dialog"].forEach((selector) => {
+    ["#task-dialog", "#progress-dialog", "#proof-dialog", "#goal-route-dialog", "#goal-dialog", "#stage-dialog", "#stage-complete-dialog", "#proof-view-dialog", "#password-dialog", "#confirm-dialog", "#connect-space-dialog", "#refresh-viewer-code-dialog", "#delete-space-dialog", "#ip-block-dialog", "#manager-invite-dialog"].forEach((selector) => {
       const dialog = $(selector);
       if (dialog.open) closeDialog(dialog);
     });
@@ -970,6 +1039,7 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
     state.workspace = null;
@@ -994,6 +1064,8 @@
   }
 
   function workspaceOption(space) {
+    const row = document.createElement("div");
+    row.className = "workspace-option-row";
     const button = document.createElement("button");
     button.className = "workspace-option";
     button.type = "button";
@@ -1025,9 +1097,21 @@
     indicator.className = "workspace-option-indicator";
     indicator.setAttribute("aria-hidden", "true");
     indicator.textContent = space.publicId === state.activeSpaceId && state.mode !== "platform" ? "✓" : "›";
-    button.append(mark, copy, indicator);
+    button.append(mark, copy);
+    if (space.access === "owner") button.appendChild(indicator);
     button.addEventListener("click", () => switchWorkspace(space.publicId));
-    return button;
+    row.appendChild(button);
+    if (space.access !== "owner") {
+      const disconnect = document.createElement("button");
+      disconnect.className = "workspace-option-disconnect";
+      disconnect.type = "button";
+      disconnect.textContent = "断开";
+      disconnect.dataset.loadingLabel = "…";
+      disconnect.setAttribute("aria-label", `断开与 ${space.name} 的预览连接`);
+      disconnect.addEventListener("click", () => disconnectWorkspace(space, disconnect));
+      row.appendChild(disconnect);
+    }
+    return row;
   }
 
   function renderWorkspaceMenu() {
@@ -1046,6 +1130,88 @@
       ordered.forEach((space) => list.appendChild(workspaceOption(space)));
     }
     $("#platform-entry-wrap").hidden = !isPlatformAdmin();
+  }
+
+  async function disconnectWorkspace(space, button) {
+    if (!space || space.access === "owner") return;
+    $("#workspace-menu").open = false;
+    const persistentConnection = Boolean(space.canDisconnect);
+    const description = persistentConnection
+      ? `断开与「${space.name}」的预览连接吗？这个端会从切换列表移除；对方的记录和既有留言不会被删除。以后需要使用有效识别码重新连接。`
+      : `从切换列表移除「${space.name}」吗？不会影响对方的管理端，以后仍可从平台概览重新预览。`;
+    const confirmed = await confirmAction(description, persistentConnection ? "确认断开" : "确认移除");
+    if (!confirmed) return;
+
+    const disconnectedActiveSpace = space.publicId === state.activeSpaceId;
+    const returnToPlatform = Boolean(state.returnToPlatform && isPlatformAdmin());
+    setLoading(button, true);
+    try {
+      if (persistentConnection) {
+        const transientPreviews = state.spaces.filter((item) => (
+          item.publicId !== space.publicId
+          && item.platformPreview
+          && !item.canDisconnect
+        ));
+        const payload = await api(`/api/spaces/connections/${encodeURIComponent(space.publicId)}`, {
+          method: "DELETE",
+        });
+        const serverSpaces = (Array.isArray(payload.spaces) ? payload.spaces : []).map(normalizeSpace).filter(Boolean);
+        const serverIds = new Set(serverSpaces.map((item) => item.publicId));
+        state.spaces = serverSpaces.concat(
+          transientPreviews.filter((item) => !serverIds.has(item.publicId)),
+        );
+        state.defaultSpaceId = textValue(payload.defaultSpaceId);
+      } else {
+        state.spaces = state.spaces.filter((item) => item.publicId !== space.publicId);
+      }
+
+      if (!disconnectedActiveSpace) {
+        renderWorkspaceChrome();
+        toast(persistentConnection ? "预览连接已断开。" : "已从切换列表移除。", "success");
+        return;
+      }
+
+      $("#message-panel").hidden = true;
+      $("#message-toggle").setAttribute("aria-expanded", "false");
+      clearMessageContent();
+      sessionStorage.removeItem(ACTIVE_SPACE_KEY);
+      clearWorkspaceState();
+
+      if (returnToPlatform) {
+        state.returnToPlatform = false;
+        const fallback = state.spaces.find((item) => item.access === "owner" && item.connectionStatus === "active")
+          || state.spaces.find((item) => item.connectionStatus === "active")
+          || null;
+        state.activeSpaceId = fallback ? fallback.publicId : "";
+        if (fallback) sessionStorage.setItem(ACTIVE_SPACE_KEY, fallback.publicId);
+        showPrimaryView("app");
+        setMode("platform");
+        await loadPlatformOverview();
+      } else {
+        const fallback = state.spaces.find((item) => item.access === "owner" && item.connectionStatus === "active")
+          || state.spaces.find((item) => item.connectionStatus === "active")
+          || null;
+        if (fallback) {
+          await switchWorkspace(
+            fallback.publicId,
+            fallback.access === "owner" ? "owner" : "visitor",
+          );
+        } else {
+          state.activeSpaceId = "";
+          showPrimaryView("app");
+          showConnectionLost(
+            "当前没有已连接的预览端。需要时可输入新的识别码。",
+            true,
+            "empty",
+          );
+        }
+      }
+      toast(persistentConnection ? "预览连接已断开。" : "已从切换列表移除。", "success");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      setLoading(button, false);
+    }
   }
 
   function renderWorkspaceChrome() {
@@ -1122,6 +1288,7 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
     state.messagesPayload = null;
@@ -1145,6 +1312,7 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
     state.messagesPayload = null;
@@ -1163,6 +1331,7 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
     state.workspace = null;
@@ -1296,7 +1465,7 @@
     $("#preview-banner").hidden = !(ownPreview || platformPreview);
     $("#preview-banner-title").textContent = platformPreview ? "平台只读预览" : "访客预览";
     $("#preview-banner-copy").textContent = platformPreview
-      ? "你可以检查这个端的公开页面，但不能修改记录或查看私密留言。"
+      ? "你只能检查公开记录；留言中只会显示你与这个端之间的对话。"
       : "这是其他账号看到的只读页面。";
     $("#exit-preview-button").textContent = platformPreview ? "返回平台" : "返回管理";
     $("#exit-preview-button").dataset.switchView = platformPreview ? "platform" : "owner";
@@ -1338,6 +1507,207 @@
     return count;
   }
 
+  function activeGoalStage() {
+    const goal = state.activeGoal;
+    if (!goal) return null;
+    if (state.activeStage && String(state.activeStage.goalId) === String(goal.id)) return state.activeStage;
+    return (goal.stages || []).find((stage) => stage.status === "active") || null;
+  }
+
+
+  function nextGoalSubgoal() {
+    const stage = activeGoalStage();
+    if (!stage) return null;
+    return (stage.subgoals || []).find((item) => !item.completed) || null;
+  }
+
+
+  function setGoalProgress(prefix, percent) {
+    const value = Math.min(100, Math.max(0, Number(percent) || 0));
+    const label = $(`#${prefix}-goal-percent`);
+    const bar = $(`#${prefix}-goal-progressbar`);
+    if (label) label.textContent = `${value}%`;
+    if (bar) {
+      bar.setAttribute("aria-valuenow", String(value));
+      const fill = bar.querySelector("span");
+      if (fill) fill.style.width = `${value}%`;
+    }
+  }
+
+
+  function renderGoalBanner(prefix, readonly) {
+    const banner = $(`#${prefix}-goal-banner`);
+    const goal = state.activeGoal;
+    if (!banner) return;
+    if (readonly && !goal) {
+      banner.hidden = true;
+      return;
+    }
+    banner.hidden = false;
+    banner.classList.toggle("is-empty", !goal);
+    banner.dataset.goalColor = goal ? goal.colorKey : "mist";
+    const title = $(`#${prefix}-goal-title`);
+    const description = $(`#${prefix}-goal-description`);
+    const nextRow = $(`#${prefix}-goal-next`);
+    const stageLabel = $(`#${prefix}-goal-stage`);
+    if (!goal) {
+      title.textContent = "还没有设定长期目标";
+      description.textContent = "把最终想抵达的位置写清楚，今天会更容易找到方向。";
+      description.hidden = false;
+      nextRow.hidden = true;
+      stageLabel.textContent = "完成阶段后，进度会累加到这里。";
+      setGoalProgress(prefix, 0);
+      banner.dataset.goalState = "empty";
+      if (!readonly) {
+        $("#owner-goal-primary").textContent = "设定长期目标";
+        $("#owner-goal-route").hidden = true;
+        $("#owner-goal-today").hidden = true;
+      }
+      return;
+    }
+    title.textContent = goal.title;
+    description.textContent = goal.description || "";
+    description.hidden = !goal.description;
+    const stage = activeGoalStage();
+    const next = nextGoalSubgoal();
+    nextRow.hidden = !next;
+    if (next) nextRow.querySelector("strong").textContent = next.title;
+    if (stage) {
+      stageLabel.textContent = `当前阶段 · ${stage.title} · 完成后 +${stage.weightPercent || 0}%`;
+    } else if (goal.remainingPercent > 0) {
+      stageLabel.textContent = `还有 ${goal.remainingPercent}% 待规划为后续阶段。`;
+    } else {
+      stageLabel.textContent = "全部阶段已经完成，可以归档这个长期目标。";
+    }
+    setGoalProgress(prefix, goal.progressPercent);
+    banner.dataset.goalState = goal.progressPercent >= 100 ? "complete" : (goal.progressPercent >= 75 ? "near" : "active");
+    if (!readonly) {
+      $("#owner-goal-primary").textContent = "编辑长期目标";
+      $("#owner-goal-route").hidden = false;
+      $("#owner-goal-today").hidden = !next;
+    }
+  }
+
+
+  function renderGoalRoute() {
+    const goal = state.activeGoal;
+    if (!goal) return;
+    const drawer = $("#goal-route-dialog");
+    drawer.dataset.goalColor = goal.colorKey || "mist";
+    $("#goal-route-goal-title").textContent = goal.title;
+    $("#goal-route-goal-description").textContent = goal.description || "没有补充描述。";
+    $("#goal-route-percent").textContent = `${goal.progressPercent}%`;
+    const progress = $("#goal-route-progressbar");
+    progress.setAttribute("aria-valuenow", String(goal.progressPercent));
+    progress.querySelector("span").style.width = `${goal.progressPercent}%`;
+    $("#goal-route-allocation").textContent = goal.remainingPercent
+      ? `已规划 ${goal.allocatedPercent}% · 待规划 ${goal.remainingPercent}%`
+      : `已规划 100% · 已完成 ${goal.progressPercent}%`;
+
+    const list = $("#goal-route-stages");
+    list.replaceChildren();
+    const stages = Array.isArray(goal.stages) ? goal.stages : [];
+    if (!stages.length) {
+      const empty = document.createElement("li");
+      empty.className = "goal-route-empty";
+      empty.textContent = "还没有阶段。先把长期目标拆成第一段路。";
+      list.append(empty);
+    }
+    stages.forEach((stage, index) => {
+      const item = document.createElement("li");
+      item.className = `goal-route-stage is-${stage.status}`;
+      const marker = document.createElement("span");
+      marker.className = "goal-route-stage-marker";
+      marker.textContent = String(index + 1).padStart(2, "0");
+      const copy = document.createElement("div");
+      const title = document.createElement("strong");
+      title.textContent = stage.title;
+      const meta = document.createElement("span");
+      const completed = Number(stage.completedSubgoalCount || 0);
+      const total = Number(stage.subgoalCount || 0);
+      meta.textContent = stage.status === "completed"
+        ? `已完成 · 长期进度 +${stage.weightPercent || 0}%`
+        : `进行中 · 子目标 ${completed}/${total} · 完成后 +${stage.weightPercent || 0}%`;
+      copy.append(title, meta);
+      item.append(marker, copy);
+      list.append(item);
+    });
+
+    const canManage = canManageActiveWorkspace();
+    $$(`[data-goal-owner-only]`).forEach((element) => { element.hidden = !canManage; });
+    const activeStage = activeGoalStage();
+    const currentSection = $("#goal-route-current");
+    currentSection.hidden = !activeStage;
+    if (activeStage) {
+      $("#goal-route-current-title").textContent = activeStage.title;
+      $("#goal-route-subgoal-count").textContent = `${activeStage.completedSubgoalCount || 0}/${activeStage.subgoalCount || 0}`;
+      const subgoalList = $("#goal-route-subgoals");
+      subgoalList.replaceChildren();
+      const subgoals = Array.isArray(activeStage.subgoals) ? activeStage.subgoals : [];
+      if (!subgoals.length) {
+        const empty = document.createElement("li");
+        empty.className = "goal-route-empty";
+        empty.textContent = canManage ? "添加第一个子目标，让下一步变得明确。" : "这个阶段还没有公开子目标。";
+        subgoalList.append(empty);
+      }
+      subgoals.forEach((subgoal, index) => {
+        const item = document.createElement("li");
+        item.className = `goal-route-subgoal${subgoal.completed ? " is-completed" : ""}`;
+        const toggle = document.createElement(canManage ? "button" : "span");
+        toggle.className = "subgoal-toggle";
+        toggle.textContent = subgoal.completed ? "✓" : "";
+        if (canManage) {
+          toggle.type = "button";
+          toggle.dataset.subgoalAction = "toggle";
+          toggle.dataset.subgoalId = String(subgoal.id);
+          toggle.setAttribute("aria-label", subgoal.completed ? "标记为未完成" : "标记为已完成");
+        }
+        const title = document.createElement(canManage ? "button" : "span");
+        title.className = "subgoal-title";
+        title.textContent = subgoal.title;
+        if (canManage) {
+          title.type = "button";
+          title.dataset.subgoalAction = "edit";
+          title.dataset.subgoalId = String(subgoal.id);
+        }
+        item.append(toggle, title);
+        if (canManage) {
+          const actions = document.createElement("div");
+          actions.className = "subgoal-actions";
+          [["up", "上移", index === 0], ["down", "下移", index === subgoals.length - 1], ["delete", "删除", false]].forEach(([action, label, disabled]) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = label;
+            button.disabled = disabled;
+            button.dataset.subgoalAction = action;
+            button.dataset.subgoalId = String(subgoal.id);
+            actions.append(button);
+          });
+          item.append(actions);
+        }
+        subgoalList.append(item);
+      });
+    }
+    const stageButton = $("#goal-route-stage-button");
+    stageButton.hidden = !canManage || Boolean(activeStage) || goal.remainingPercent <= 0;
+    $("#goal-route-owner-actions").hidden = !canManage;
+    $("#complete-goal-button").disabled = !goal.canComplete;
+    $("#complete-goal-button").title = goal.canComplete ? "" : "需要规划满 100% 并完成全部阶段";
+    if (activeStage) {
+      const ready = activeStage.subgoalCount > 0 && activeStage.completedSubgoalCount === activeStage.subgoalCount;
+      $("#goal-route-complete-stage").disabled = !ready;
+      $("#goal-route-complete-stage").title = ready ? "" : "请先完成全部子目标";
+    }
+  }
+
+
+  function renderGoalExperience() {
+    renderGoalBanner("owner", false);
+    renderGoalBanner("visitor", true);
+    if (state.activeGoal) renderGoalRoute();
+  }
+
+
   function configureStageExpansion(prefix, stage) {
     const card = $(`#${prefix}-stage-card`);
     const button = $(`#${prefix}-stage-expand`);
@@ -1372,8 +1742,18 @@
       $("#owner-stage-description").hidden = !stage.description;
       $("#owner-stage-start").textContent = start || "—";
       $("#owner-stage-days").textContent = `${stageDuration(stage, today)} 天`;
+      const completedSubgoals = Number(stage.completedSubgoalCount || 0);
+      const totalSubgoals = Number(stage.subgoalCount || 0);
+      const nextSubgoal = (stage.subgoals || []).find((item) => !item.completed);
+      $("#owner-stage-subgoal-summary").textContent = totalSubgoals
+        ? `子目标 ${completedSubgoals}/${totalSubgoals}${nextSubgoal ? ` · 下一步：${nextSubgoal.title}` : " · 已全部完成"}`
+        : "还没有添加子目标";
       $("#edit-stage-button").dataset.stageId = String(stage.id);
       $("#complete-stage-button").dataset.stageId = String(stage.id);
+      const needsSubgoals = stage.goalId !== null && stage.goalId !== undefined;
+      const stageReady = !needsSubgoals || (totalSubgoals > 0 && completedSubgoals === totalSubgoals);
+      $("#complete-stage-button").disabled = !stageReady;
+      $("#complete-stage-button").title = stageReady ? "" : "请先完成当前阶段的全部子目标";
     } else {
       $("#owner-stage-empty-title strong").textContent = latest ? "可以开始下一阶段" : "还没有当前阶段";
       $("#owner-stage-empty-copy").textContent = latest
@@ -1393,6 +1773,12 @@
       $("#visitor-stage-description").hidden = !stage.description;
       $("#visitor-stage-start").textContent = start || "—";
       $("#visitor-stage-days").textContent = `${stageDuration(stage, today)} 天`;
+      const completedSubgoals = Number(stage.completedSubgoalCount || 0);
+      const totalSubgoals = Number(stage.subgoalCount || 0);
+      const nextSubgoal = (stage.subgoals || []).find((item) => !item.completed);
+      $("#visitor-stage-subgoal-summary").textContent = totalSubgoals
+        ? `子目标 ${completedSubgoals}/${totalSubgoals}${nextSubgoal ? ` · 下一步：${nextSubgoal.title}` : " · 已全部完成"}`
+        : "还没有添加子目标";
     }
     configureStageExpansion("visitor", stage);
 
@@ -1405,6 +1791,7 @@
       $(`#${prefix}-last-stage-title`).textContent = latest.title;
       $(`#${prefix}-last-stage-meta`).textContent = `${completed || "已完成"} · 用时 ${stageDuration(latest, completed)} 天`;
     });
+    renderGoalExperience();
   }
 
   function renderOwner() {
@@ -1428,10 +1815,10 @@
     $("#edit-today-task").textContent = todayTask ? "编辑任务" : "设置任务";
     $("#edit-today-task").hidden = Boolean(todayTask && taskHasResult(todayTask));
     $("#complete-today-task").dataset.taskDate = today;
-    $("#complete-today-task").hidden = !todayTask;
+    $("#complete-today-task").hidden = !todayTask || !taskCanRecordResult(todayTask);
     $("#complete-today-task").textContent = todayTask && taskHasResult(todayTask) ? "更新最终结果" : "记录最终结果";
     $("#add-today-progress").dataset.taskDate = today;
-    $("#add-today-progress").hidden = !todayTask;
+    $("#add-today-progress").hidden = !todayTask || !taskCanAddProgress(todayTask);
     $("#add-today-progress").textContent = todayTask && taskHasProgress(todayTask) ? "继续补充进度" : "添加进度";
 
     const ownerRecord = Boolean(todayTask && taskHasPublicRecord(todayTask));
@@ -1460,13 +1847,8 @@
     const task = taskFor(today);
     const workspace = activeSpace();
     const workspaceName = workspace ? workspace.name : "Day1";
-    const mascotEnabled = Boolean(workspace && workspace.appearance && workspace.appearance.mascotEnabled);
     $("#visitor-page-title").textContent = `${workspaceName} 的每日记录`;
     $("#visitor-record-kicker").hidden = false;
-    $("#visitor-mascot").hidden = !mascotEnabled;
-    $("#visitor-day1-seal").hidden = mascotEnabled;
-    $("#visitor-heading").classList.toggle("visitor-heading-with-mascot", mascotEnabled);
-    $("#visitor-heading").classList.toggle("visitor-heading-with-seal", !mascotEnabled);
     $("#visitor-context-line").textContent = contextualCopy(task, true);
     $("#visitor-mascot").classList.toggle("is-resting", Boolean(task && taskHasResult(task)));
     $("#visitor-mascot").classList.toggle("is-following", Boolean(task && taskHasProgress(task) && !taskHasResult(task)));
@@ -1568,6 +1950,7 @@
       }
       if (task && taskResultStatus(task) === "completed") cell.classList.add("is-done");
       if (task && taskResultStatus(task) === "incomplete") cell.classList.add("is-incomplete");
+      if (task && taskHasSupplement(task)) cell.classList.add("is-supplemented");
       if (poms > 0) cell.classList.add("is-focus-record");
       if (hasPrivate) cell.classList.add("has-private-record");
       if (stageId !== undefined) cell.classList.add("is-stage-complete");
@@ -1577,8 +1960,9 @@
       if (stageId !== undefined) status.push(`阶段已完成${stage ? `：${stage.title}` : ""}`);
       if (task) {
         const result = taskHasPublicRecord(task) ? taskResultLabel(task, true) : "待反馈";
+        const supplement = taskHasSupplement(task) ? `；次日补充至 ${taskSupplementPercent(task)}%` : "";
         const feedback = taskHasResult(task) && taskResultNote(task) ? `；反馈：${taskResultNote(task)}` : "";
-        status.push(`每日任务${result}：${task.text}${feedback}`);
+        status.push(`每日任务${result}${supplement}：${task.text}${feedback}`);
       }
       if (poms > 0) status.push(`专注番茄：${poms} 个`);
       if (hasPrivate) status.push("含私人记录，仅你可见");
@@ -1696,6 +2080,7 @@
         item.className = "history-item";
         if (entry.stageId !== null) item.classList.add("has-stage");
         if (entry.poms > 0) item.classList.add("has-focus");
+        if (entry.task && taskHasSupplement(entry.task)) item.classList.add("is-supplemented");
         if (entry.hasPrivate) item.classList.add("has-private-record");
         const time = document.createElement("time");
         time.className = "history-item-date";
@@ -1714,6 +2099,12 @@
           focusMeta.className = "history-item-poms";
           focusMeta.textContent = `专注 · ${entry.poms} 个番茄`;
           text.appendChild(focusMeta);
+        }
+        if (entry.task && taskHasSupplement(entry.task)) {
+          const supplementMeta = document.createElement("span");
+          supplementMeta.className = "history-item-supplement";
+          supplementMeta.textContent = `次日补至 ${taskSupplementPercent(entry.task)}%`;
+          text.appendChild(supplementMeta);
         }
         const action = document.createElement("button");
         action.type = "button";
@@ -1774,7 +2165,7 @@
     else dialog.removeAttribute("open");
   }
 
-  function openTaskEditor(key) {
+  function openTaskEditor(key, suggestedText = "") {
     if (!canManageActiveWorkspace()) return;
     const task = taskFor(key);
     if (task && taskHasResult(task)) {
@@ -1783,7 +2174,7 @@
     }
     $("#task-date-input").value = key;
     $("#task-dialog-date").textContent = `${key} · ${dateLabel(key)}`;
-    $("#task-text-input").value = task ? task.text : "";
+    $("#task-text-input").value = task ? task.text : suggestedText;
     $("#task-dialog-title").textContent = task ? "编辑任务" : "设置任务";
     $("#delete-task-button").hidden = !task;
     setMessage($("#task-dialog-message"), "");
@@ -2051,11 +2442,24 @@
     if (!canManageActiveWorkspace()) return;
     const task = taskFor(key);
     if (!task) return;
+    if (!taskCanAddProgress(task)) {
+      toast("只能记录今天，或补充昨天的进度。", "error");
+      return;
+    }
+    const supplemental = task.progressEntryMode === "supplement" || key === shiftDate(dateKeyInShanghai(), -1);
     clearProgressFiles();
     $("#progress-form").reset();
     state.progressRecordId = uniqueToken("progress");
     $("#progress-date-input").value = key;
+    $("#progress-dialog-title").textContent = supplemental ? "补充昨日进度" : "添加一次进度";
     $("#progress-dialog-date").textContent = `${key} · ${task.text}`;
+    $("#progress-note-help").textContent = supplemental
+      ? "这条记录会标为次日补充；原完成度和完成结果不会改变。"
+      : "每次保存都会追加一条公开时间记录，不会覆盖之前的内容。";
+    $("#progress-dialog .record-destination-note").textContent = supplemental
+      ? "补充会作为公开节点保留实际记录时间，但不会改写昨天 24:00 已冻结的结果。"
+      : "保存一次，就增加一个带时间的公开节点；备注、链接和附件会给访客查看。私人便签和分心记录始终不会公开。";
+    $("#submit-progress-button").textContent = supplemental ? "保存这次补充" : "保存这次进度";
     const latest = latestProgressEntry(task);
     state.progressBaselinePercent = Math.max(
       latest ? progressPercent(latest) : 0,
@@ -2069,7 +2473,7 @@
     existingSummary.hidden = existingFiles + existingLinks === 0;
     existingSummary.textContent = existingSummary.hidden
       ? ""
-      : `今天已保留 ${existingFiles} 个照片或文件、${existingLinks} 个链接；本次只需选择新增内容。`;
+      : `已保留 ${existingFiles} 个照片或文件、${existingLinks} 个链接；本次只需选择新增内容。`;
     updateProgressOutput();
     updateCharacterCount($("#progress-note-input"));
     setMessage($("#progress-dialog-message"), "");
@@ -2215,6 +2619,10 @@
     if (!canManageActiveWorkspace()) return;
     const task = taskFor(key);
     if (!task) return;
+    if (!taskCanRecordResult(task)) {
+      toast("当天 24:00 后结果已经冻结，不能再修改。", "error");
+      return;
+    }
     $("#proof-date-input").value = key;
     $("#proof-dialog-date").textContent = `${key} · ${task.text}`;
     $("#proof-dialog-title").textContent = taskHasResult(task) ? "更新今日反馈" : "记录今日结果";
@@ -2320,7 +2728,7 @@
 
   function isRemovableProgressAsset(entry, asset) {
     if (!canManageActiveWorkspace()) return false;
-    if (!entry || entry.legacy || !asset) return false;
+    if (!entry || entry.legacy || !asset || entry.recordDate !== dateKeyInShanghai()) return false;
     return /^\d+$/.test(String(entry.id)) && /^\d+$/.test(String(asset.id));
   }
 
@@ -2435,12 +2843,14 @@
 
   function buildProgressEntry(taskDate, entry, latest) {
     const article = document.createElement("article");
-    article.className = `progress-entry${latest ? " is-latest" : ""}${entry.legacy ? " is-legacy" : ""}`;
+    const supplemental = progressIsSupplemental(entry, taskDate);
+    article.className = `progress-entry${latest ? " is-latest" : ""}${entry.legacy ? " is-legacy" : ""}${supplemental ? " is-supplemental" : ""}`;
     const header = document.createElement("header");
     header.className = "progress-entry-header";
     const time = document.createElement("time");
     time.dateTime = entry.createdAt || "";
-    time.textContent = completionTime(entry.createdAt) || "已记录";
+    const timeLabel = completionTime(entry.createdAt) || "已记录";
+    time.textContent = supplemental ? `次日补充 · ${timeLabel}` : timeLabel;
     const percent = document.createElement("span");
     percent.className = "progress-entry-percent";
     percent.textContent = `${progressPercent(entry)}%`;
@@ -2484,7 +2894,10 @@
     const entries = taskProgressEntries(task);
     list.replaceChildren();
     section.hidden = entries.length === 0;
-    $("#record-progress-count").textContent = `${entries.length} 次更新`;
+    const supplementCount = taskSupplementEntries(task).length;
+    $("#record-progress-count").textContent = supplementCount
+      ? `${entries.length - supplementCount} 次当日 · ${supplementCount} 次补充`
+      : `${entries.length} 次更新`;
     if (!entries.length) return;
     const latest = entries[entries.length - 1];
     list.appendChild(buildProgressEntry(task.date, latest, true));
@@ -2546,13 +2959,15 @@
     statusElement.classList.add(status === "completed" ? "is-completed" : (status === "incomplete" ? "is-incomplete" : "is-pending"));
     statusElement.textContent = taskResultLabel(task, false);
     $("#record-daily-title").textContent = task.text;
-    $("#record-daily-progress").textContent = hasResult ? `完成程度 ${taskCompletionPercent(task)}%` : "尚未记录结果";
+    $("#record-daily-progress").textContent = hasResult ? taskCompletionSummary(task) : "尚未记录结果";
     $("#record-daily-feedback-label").textContent = "备注";
     $("#proof-view-text").textContent = taskResultNote(task) || "未填写文字反馈。";
     $("#record-daily-feedback").hidden = !hasResult;
     const latest = latestProgressEntry(task);
     $("#proof-view-time").textContent = hasResult
-      ? `最终结果 · ${completionTime(task.resultRecordedAt || task.completedAt) || "已记录"}`
+      ? (task.resultLockSource === "automatic"
+        ? "当日 24:00 · 自动锁定"
+        : `最终结果 · ${completionTime(task.resultRecordedAt || task.completedAt) || "已记录"}`)
       : (latest ? `最近更新 · ${completionTime(latest.createdAt) || "已记录"}` : "等待反馈");
     renderProgressTimeline(task);
     if (taskHasProgress(task)) {
@@ -2603,8 +3018,9 @@
     if (task) renderDailyRecord(task);
     const hasFocus = renderFocusRecord(key);
     const hasPrivate = renderPrivateRecord(key, scope);
-    const canAddProgress = Boolean(task && scope === "owner" && canManageActiveWorkspace());
+    const canAddProgress = Boolean(task && scope === "owner" && canManageActiveWorkspace() && taskCanAddProgress(task));
     $("#record-add-progress").hidden = !canAddProgress;
+    $("#record-add-progress").textContent = task && task.progressEntryMode === "supplement" ? "补充昨日进度" : "继续补充进度";
     $("#record-add-progress").dataset.taskDate = canAddProgress ? key : "";
     const sectionCount = Number(Boolean(stage)) + Number(Boolean(task)) + Number(hasFocus) + Number(hasPrivate);
     $("#proof-view-title").textContent = sectionCount > 1
@@ -2621,13 +3037,209 @@
     openDateRecord(task.date, task, completion ? completion.stageId : null, scope);
   }
 
+  function openGoalEditor() {
+    if (!canManageActiveWorkspace()) return;
+    const goal = state.activeGoal;
+    if ($("#goal-route-dialog").open) closeDialog($("#goal-route-dialog"));
+    $("#goal-form").reset();
+    $("#goal-id-input").value = goal ? String(goal.id) : "";
+    $("#goal-title-input").value = goal ? goal.title : "";
+    $("#goal-description-input").value = goal ? (goal.description || "") : "";
+    const color = goal ? goal.colorKey : "mist";
+    $$(`input[name="goalColor"]`).forEach((input) => { input.checked = input.value === color; });
+    $("#goal-dialog-title").textContent = goal ? "编辑长期目标" : "设定长期目标";
+    $("#save-goal-button").textContent = goal ? "保存修改" : "开始这个长期目标";
+    const adopt = !goal && state.activeStage && (state.activeStage.goalId === null || state.activeStage.goalId === undefined);
+    $("#goal-adopt-stage-field").hidden = !adopt;
+    setMessage($("#goal-dialog-message"), "");
+    updateCharacterCount($("#goal-title-input"));
+    updateCharacterCount($("#goal-description-input"));
+    showDialog($("#goal-dialog"));
+    window.setTimeout(() => $("#goal-title-input").focus(), 0);
+  }
+
+
+  async function saveGoal(event) {
+    event.preventDefault();
+    if (!canManageActiveWorkspace()) return;
+    const id = $("#goal-id-input").value;
+    const title = $("#goal-title-input").value.trim();
+    const description = $("#goal-description-input").value.trim();
+    const selectedColor = $(`input[name="goalColor"]:checked`);
+    if (!title) {
+      setMessage($("#goal-dialog-message"), "请填写长期目标名称。");
+      $("#goal-title-input").focus();
+      return;
+    }
+    const body = { title, description, colorKey: selectedColor ? selectedColor.value : "mist" };
+    if (!id && !$("#goal-adopt-stage-field").hidden) {
+      const weight = Number($("#goal-adopt-stage-weight").value);
+      if (!Number.isInteger(weight) || weight < 1 || weight > 100) {
+        setMessage($("#goal-dialog-message"), "当前阶段占比必须是 1 到 100 的整数。");
+        return;
+      }
+      body.activeStageWeight = weight;
+    }
+    const button = $("#save-goal-button");
+    setLoading(button, true);
+    setMessage($("#goal-dialog-message"), "");
+    try {
+      await api(id ? `/api/goals/${encodeURIComponent(id)}` : "/api/goals", {
+        method: id ? "PUT" : "POST",
+        body,
+      });
+      closeDialog($("#goal-dialog"));
+      await loadData();
+      toast(id ? "长期目标已更新。" : "长期方向已经写清楚。", "success");
+    } catch (error) {
+      setMessage($("#goal-dialog-message"), error.message);
+    } finally {
+      setLoading(button, false);
+    }
+  }
+
+
+  function openGoalRoute() {
+    if (!state.activeGoal) {
+      if (canManageActiveWorkspace()) openGoalEditor();
+      return;
+    }
+    renderGoalRoute();
+    showDialog($("#goal-route-dialog"));
+  }
+
+
+  async function completeActiveGoal() {
+    const goal = state.activeGoal;
+    if (!canManageActiveWorkspace() || !goal || !goal.canComplete) return;
+    const confirmed = await confirmAction(`确认完成长期目标“${goal.title}”？完成后目标与阶段路线会归档。`, "完成长期目标");
+    if (!confirmed) return;
+    try {
+      await api(`/api/goals/${encodeURIComponent(String(goal.id))}/complete`, { method: "POST", body: {} });
+      closeDialog($("#goal-route-dialog"));
+      await loadData();
+      toast("长期目标已经完成并归档。", "success");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+
+  function arrangeGoalNextToday() {
+    const next = nextGoalSubgoal();
+    if (!next || !canManageActiveWorkspace()) return;
+    const today = dateKeyInShanghai();
+    if (taskFor(today)) {
+      toast("今天已经有任务，不会覆盖现有安排。", "error");
+      return;
+    }
+    if ($("#goal-route-dialog").open) closeDialog($("#goal-route-dialog"));
+    openTaskEditor(today, next.title);
+  }
+
+
+  function resetSubgoalEditor() {
+    $("#subgoal-form").dataset.editId = "";
+    $("#subgoal-title-input").value = "";
+    $("#add-subgoal-button").textContent = "添加";
+    $("#cancel-subgoal-edit").hidden = true;
+    setMessage($("#subgoal-message"), "");
+  }
+
+
+  async function saveSubgoal(event) {
+    event.preventDefault();
+    const stage = activeGoalStage();
+    if (!canManageActiveWorkspace() || !stage) return;
+    const title = $("#subgoal-title-input").value.trim();
+    if (!title) {
+      setMessage($("#subgoal-message"), "请写下一个明确的子目标。");
+      return;
+    }
+    const editId = $("#subgoal-form").dataset.editId;
+    const button = $("#add-subgoal-button");
+    setLoading(button, true);
+    try {
+      await api(editId ? `/api/subgoals/${encodeURIComponent(editId)}` : `/api/stages/${encodeURIComponent(String(stage.id))}/subgoals`, {
+        method: editId ? "PUT" : "POST",
+        body: { title },
+      });
+      resetSubgoalEditor();
+      await loadData();
+      toast(editId ? "子目标已更新。" : "下一小步已经加入路线。", "success");
+    } catch (error) {
+      setMessage($("#subgoal-message"), error.message);
+    } finally {
+      setLoading(button, false);
+    }
+  }
+
+
+  async function handleSubgoalAction(event) {
+    const button = event.target.closest("[data-subgoal-action]");
+    if (!button || !canManageActiveWorkspace()) return;
+    const stage = activeGoalStage();
+    if (!stage) return;
+    const id = Number(button.dataset.subgoalId);
+    const subgoals = Array.isArray(stage.subgoals) ? stage.subgoals : [];
+    const index = subgoals.findIndex((item) => item.id === id);
+    if (index < 0) return;
+    const subgoal = subgoals[index];
+    const action = button.dataset.subgoalAction;
+    if (action === "edit") {
+      $("#subgoal-form").dataset.editId = String(id);
+      $("#subgoal-title-input").value = subgoal.title;
+      $("#add-subgoal-button").textContent = "保存";
+      $("#cancel-subgoal-edit").hidden = false;
+      $("#subgoal-title-input").focus();
+      return;
+    }
+    try {
+      if (action === "toggle") {
+        await api(`/api/subgoals/${encodeURIComponent(String(id))}`, {
+          method: "PUT",
+          body: { completed: !subgoal.completed },
+        });
+      } else if (action === "delete") {
+        const confirmed = await confirmAction(`删除子目标“${subgoal.title}”？`, "删除子目标");
+        if (!confirmed) return;
+        await api(`/api/subgoals/${encodeURIComponent(String(id))}`, { method: "DELETE" });
+      } else if (action === "up" || action === "down") {
+        const target = action === "up" ? index - 1 : index + 1;
+        if (target < 0 || target >= subgoals.length) return;
+        const ids = subgoals.map((item) => item.id);
+        [ids[index], ids[target]] = [ids[target], ids[index]];
+        await api(`/api/stages/${encodeURIComponent(String(stage.id))}/subgoals/reorder`, {
+          method: "POST",
+          body: { ids },
+        });
+      }
+      resetSubgoalEditor();
+      await loadData();
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+
   function openStageEditor() {
     if (!canManageActiveWorkspace()) return;
+    if ($("#goal-route-dialog").open) closeDialog($("#goal-route-dialog"));
     const stage = state.activeStage;
     $("#stage-form").reset();
     $("#stage-id-input").value = stage ? String(stage.id) : "";
     $("#stage-title-input").value = stage ? stage.title : "";
     $("#stage-description-input").value = stage ? (stage.description || "") : "";
+    const goal = state.activeGoal;
+    const weightField = $("#stage-weight-field");
+    weightField.hidden = !goal;
+    if (goal) {
+      const currentWeight = stage && String(stage.goalId) === String(goal.id) ? Number(stage.weightPercent || 0) : 0;
+      const available = Math.max(1, Number(goal.remainingPercent || 0) + currentWeight);
+      $("#stage-weight-input").max = String(available);
+      $("#stage-weight-input").value = String(currentWeight || Math.min(25, available));
+      $("#stage-weight-help").textContent = `最多 ${available}% · 阶段完成后才计入长期进度。`;
+    }
     $("#stage-dialog-title").textContent = stage ? "编辑当前阶段" : "设定当前阶段";
     $("#save-stage-button").textContent = stage ? "保存修改" : "开始这个阶段";
     setMessage($("#stage-dialog-message"), "");
@@ -2648,13 +3260,24 @@
       $("#stage-title-input").focus();
       return;
     }
+    const body = { title, description };
+    if (!$("#stage-weight-field").hidden) {
+      const weightPercent = Number($("#stage-weight-input").value);
+      const maximum = Number($("#stage-weight-input").max);
+      if (!Number.isInteger(weightPercent) || weightPercent < 1 || weightPercent > maximum) {
+        setMessage($("#stage-dialog-message"), `阶段占比必须是 1 到 ${maximum} 的整数。`);
+        $("#stage-weight-input").focus();
+        return;
+      }
+      body.weightPercent = weightPercent;
+    }
     const button = $("#save-stage-button");
     setLoading(button, true);
     setMessage($("#stage-dialog-message"), "");
     try {
       await api(id ? `/api/stages/${encodeURIComponent(id)}` : "/api/stages", {
         method: id ? "PUT" : "POST",
-        body: { title, description },
+        body,
       });
       closeDialog($("#stage-dialog"));
       await loadData();
@@ -2668,6 +3291,7 @@
 
   function openStageCompletion() {
     if (!canManageActiveWorkspace() || !state.activeStage) return;
+    if ($("#goal-route-dialog").open) closeDialog($("#goal-route-dialog"));
     clearStageImagePreview();
     $("#stage-complete-form").reset();
     $("#stage-complete-id").value = String(state.activeStage.id);
@@ -2997,6 +3621,7 @@
   function platformSpaceRow(rawSpace) {
     const space = normalizeSpace(Object.assign({}, rawSpace, {
       access: rawSpace && rawSpace.access ? rawSpace.access : "viewer",
+      platformPreview: true,
     }));
     if (!space) return null;
     const row = document.createElement("article");
@@ -3044,37 +3669,15 @@
       if (!spaceById(space.publicId)) state.spaces.push(space);
       await switchWorkspace(space.publicId, "visitor", true);
     });
-    const mascot = document.createElement("button");
-    mascot.className = "menu-button";
-    mascot.type = "button";
-    const mascotEnabled = Boolean(rawSpace && rawSpace.appearance && rawSpace.appearance.mascotEnabled);
-    mascot.textContent = mascotEnabled ? "移除小精灵" : "添加小精灵";
-    mascot.addEventListener("click", async () => {
-      more.open = false;
-      setLoading(mascot, true);
-      try {
-        await api(`/api/platform/spaces/${encodeURIComponent(space.publicId)}/mascot`, {
-          method: "POST",
-          body: { enabled: !mascotEnabled },
-        });
-        await loadPlatformOverview();
-        toast(mascotEnabled ? "已移除这个端的小精灵。" : "已为这个端添加小精灵。", "success");
-      } catch (error) {
-        toast(error.message, "error");
-      } finally {
-        setLoading(mascot, false);
-      }
-    });
-    const more = document.createElement("details");
-    more.className = "platform-more-menu";
-    const moreTrigger = document.createElement("summary");
-    moreTrigger.className = "button button-quiet button-small platform-more-trigger";
-    moreTrigger.textContent = "更多";
-    moreTrigger.setAttribute("aria-label", `${space.name} 的更多操作`);
-    const morePanel = document.createElement("div");
-    morePanel.className = "platform-more-panel";
-    morePanel.appendChild(mascot);
     if (!space.isBlueSpace) {
+      const more = document.createElement("details");
+      more.className = "platform-more-menu";
+      const moreTrigger = document.createElement("summary");
+      moreTrigger.className = "button button-quiet button-small platform-more-trigger";
+      moreTrigger.textContent = "更多";
+      moreTrigger.setAttribute("aria-label", `${space.name} 的更多操作`);
+      const morePanel = document.createElement("div");
+      morePanel.className = "platform-more-panel";
       const remove = document.createElement("button");
       remove.className = "menu-button menu-button-danger";
       remove.type = "button";
@@ -3088,9 +3691,11 @@
         });
       });
       morePanel.appendChild(remove);
+      more.append(moreTrigger, morePanel);
+      actions.append(preview, more);
+    } else {
+      actions.appendChild(preview);
     }
-    more.append(moreTrigger, morePanel);
-    actions.append(preview, more);
     row.append(identity, meta, actions);
     return row;
   }
@@ -3747,16 +4352,26 @@
   }
 
   function configureMessageWidget() {
-    const blockedPlatformPreview = isPlatformAdmin() && state.access !== "owner";
     const supportedSurface = (state.access === "owner" && state.mode === "owner")
       || (state.access === "viewer" && state.mode === "visitor");
     const visible = Boolean(
       state.user
       && state.activeSpaceId
       && supportedSurface
-      && !blockedPlatformPreview
       && (!activeSpace() || activeSpace().connectionStatus !== "revoked"),
     );
+    const platformPreview = Boolean(
+      isPlatformAdmin()
+      && state.access === "viewer"
+      && activeSpace()
+      && activeSpace().platformPreview,
+    );
+    $("#message-toggle-label").textContent = state.access === "owner"
+      ? "访客留言"
+      : (platformPreview ? "给此端留言" : "留言");
+    $("#message-panel-title").textContent = state.access === "owner"
+      ? "访客留言"
+      : (platformPreview ? "给此端留言" : "留言");
     $("#message-widget").hidden = !visible;
     if (!visible) {
       $("#message-panel").hidden = true;
@@ -4129,7 +4744,23 @@
       closeDialog($("#proof-view-dialog"));
       openProgressEditor(key);
     });
-    $("#create-stage-button").addEventListener("click", openStageEditor);
+    $("#owner-goal-primary").addEventListener("click", openGoalEditor);
+    $("#owner-goal-route").addEventListener("click", openGoalRoute);
+    $("#visitor-goal-route").addEventListener("click", openGoalRoute);
+    $("#owner-goal-today").addEventListener("click", arrangeGoalNextToday);
+    $("#goal-route-stage-button").addEventListener("click", openStageEditor);
+    $("#edit-goal-button").addEventListener("click", openGoalEditor);
+    $("#complete-goal-button").addEventListener("click", completeActiveGoal);
+    $("#goal-route-edit-stage").addEventListener("click", openStageEditor);
+    $("#goal-route-complete-stage").addEventListener("click", openStageCompletion);
+    $("#goal-form").addEventListener("submit", saveGoal);
+    $("#subgoal-form").addEventListener("submit", saveSubgoal);
+    $("#cancel-subgoal-edit").addEventListener("click", resetSubgoalEditor);
+    $("#goal-route-subgoals").addEventListener("click", handleSubgoalAction);
+    $("#create-stage-button").addEventListener("click", () => {
+      if (state.activeGoal) openStageEditor();
+      else openGoalEditor();
+    });
     $("#edit-stage-button").addEventListener("click", openStageEditor);
     $("#complete-stage-button").addEventListener("click", openStageCompletion);
     $("#owner-stage-expand").addEventListener("click", () => toggleStageExpansion("owner"));

@@ -58,6 +58,14 @@ class DailySealApiTests(unittest.TestCase):
         _TEMP_DATA.cleanup()
 
     def setUp(self):
+        self._business_date = "2026-07-17"
+
+        def test_business_date_provider(task_date_hint=None):
+            if isinstance(task_date_hint, str):
+                self._business_date = task_date_hint
+            return self._business_date
+
+        server.app.config["BUSINESS_DATE_PROVIDER"] = test_business_date_provider
         # Every test begins with one owner using a forced-change temporary
         # password. This keeps test ordering irrelevant.
         connection = sqlite3.connect(str(server.DB_PATH))
@@ -73,6 +81,7 @@ class DailySealApiTests(unittest.TestCase):
                 DELETE FROM spaces;
                 DELETE FROM platform_meta;
                 DELETE FROM stages;
+                DELETE FROM long_term_goals;
                 DELETE FROM task_progress_assets;
                 DELETE FROM task_progress;
                 DELETE FROM tasks;
@@ -266,11 +275,20 @@ class DailySealApiTests(unittest.TestCase):
             headers={"X-CSRF-Token": self.csrf(client)},
         )
 
-    def create_stage(self, client=None, title="Phase One", description="Finish the target"):
+    def create_stage(
+        self,
+        client=None,
+        title="Phase One",
+        description="Finish the target",
+        weight_percent=None,
+    ):
         client = client or self.client
+        body = {"title": title, "description": description}
+        if weight_percent is not None:
+            body["weightPercent"] = weight_percent
         return client.post(
             "/api/stages",
-            json={"title": title, "description": description},
+            json=body,
             headers={"X-CSRF-Token": self.csrf(client)},
         )
 
@@ -965,6 +983,140 @@ class DailySealApiTests(unittest.TestCase):
         self.assertEqual(exported_task["resultNote"], "Imported reason stays public.")
         self.assertIsNotNone(exported_task["resultRecordedAt"])
 
+    def test_midnight_freezes_90_percent_and_next_day_supplement_stays_separate(self):
+        self.login_unlocked_owner()
+        task_date = "2026-07-27"
+        next_date = "2026-07-28"
+        business_date = {"value": task_date}
+        server.app.config["BUSINESS_DATE_PROVIDER"] = (
+            lambda _task_date_hint=None: business_date["value"]
+        )
+        token = self.csrf()
+        before_midnight = int(
+            server.datetime(2026, 7, 27, 23, 50, tzinfo=server.CHINA_STANDARD_TIME).timestamp()
+        )
+        after_midnight = int(
+            server.datetime(2026, 7, 28, 0, 30, tzinfo=server.CHINA_STANDARD_TIME).timestamp()
+        )
+
+        with patch.object(server, "now_ts", return_value=before_midnight):
+            self.assertEqual(
+                self.put_task(self.client, task_date=task_date).status_code, 200
+            )
+            progress = self.client.post(
+                f"/api/tasks/{task_date}/progress",
+                json={
+                    "note": "午夜前做到九成",
+                    "progressPercent": 90,
+                    "links": [],
+                },
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(progress.status_code, 201, progress.get_data(as_text=True))
+        self.assertFalse(progress.get_json()["progress"]["supplemental"])
+        self.assertEqual(progress.get_json()["progress"]["recordDate"], task_date)
+
+        business_date["value"] = next_date
+        frozen = {
+            task["date"]: task for task in self.client.get("/api/data").get_json()["tasks"]
+        }[task_date]
+        self.assertEqual(frozen["resultStatus"], "incomplete")
+        self.assertEqual(frozen["completionPercent"], 90)
+        self.assertFalse(frozen["done"])
+        self.assertTrue(frozen["resultLocked"])
+        self.assertEqual(frozen["resultLockSource"], "automatic")
+        self.assertEqual(frozen["progressEntryMode"], "supplement")
+        self.assertTrue(frozen["canAddProgress"])
+        self.assertFalse(frozen["canRecordResult"])
+
+        with patch.object(server, "now_ts", return_value=after_midnight):
+            supplemented = self.client.post(
+                f"/api/tasks/{task_date}/progress",
+                json={
+                    "note": "次日凌晨补完",
+                    "progressPercent": 100,
+                    "links": [],
+                },
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(
+            supplemented.status_code, 201, supplemented.get_data(as_text=True)
+        )
+        supplemented_task = supplemented.get_json()["task"]
+        supplement_entry = supplemented.get_json()["progress"]
+        self.assertTrue(supplement_entry["supplemental"])
+        self.assertEqual(supplement_entry["recordDate"], next_date)
+        self.assertEqual(supplemented_task["resultStatus"], "incomplete")
+        self.assertEqual(supplemented_task["completionPercent"], 90)
+        self.assertFalse(supplemented_task["done"])
+        self.assertTrue(supplemented_task["supplemented"])
+        self.assertEqual(supplemented_task["supplementCompletionPercent"], 100)
+        self.assertEqual(supplemented_task["supplementRecordDate"], next_date)
+        self.assertEqual(supplemented_task["supplementProgressCount"], 1)
+        self.assertFalse(supplemented_task["resultIsStale"])
+
+        result_after_midnight = self.client.post(
+            f"/api/tasks/{task_date}/result",
+            data={
+                "resultStatus": "completed",
+                "completionPercent": "100",
+                "resultNote": "不能改写昨天结果",
+            },
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(result_after_midnight.status_code, 409)
+        self.assertEqual(
+            result_after_midnight.get_json()["code"], "result_window_closed"
+        )
+
+        business_date["value"] = "2026-07-29"
+        too_late = self.client.post(
+            f"/api/tasks/{task_date}/progress",
+            json={
+                "note": "隔日不应再允许",
+                "progressPercent": 100,
+                "links": [],
+            },
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(too_late.status_code, 409)
+        self.assertEqual(too_late.get_json()["code"], "supplement_window_closed")
+
+    def test_midnight_automatically_marks_100_percent_as_completed(self):
+        self.login_unlocked_owner()
+        task_date = "2026-08-03"
+        business_date = {"value": task_date}
+        server.app.config["BUSINESS_DATE_PROVIDER"] = (
+            lambda _task_date_hint=None: business_date["value"]
+        )
+        token = self.csrf()
+        before_midnight = int(
+            server.datetime(2026, 8, 3, 23, 59, tzinfo=server.CHINA_STANDARD_TIME).timestamp()
+        )
+        with patch.object(server, "now_ts", return_value=before_midnight):
+            self.assertEqual(
+                self.put_task(self.client, task_date=task_date).status_code, 200
+            )
+            progress = self.client.post(
+                f"/api/tasks/{task_date}/progress",
+                json={
+                    "note": "午夜前已经达到目标",
+                    "progressPercent": 100,
+                    "links": [],
+                },
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(progress.status_code, 201, progress.get_data(as_text=True))
+
+        business_date["value"] = "2026-08-04"
+        frozen = {
+            task["date"]: task for task in self.client.get("/api/data").get_json()["tasks"]
+        }[task_date]
+        self.assertEqual(frozen["resultStatus"], "completed")
+        self.assertEqual(frozen["completionPercent"], 100)
+        self.assertTrue(frozen["done"])
+        self.assertTrue(frozen["resultLocked"])
+        self.assertEqual(frozen["resultLockSource"], "automatic")
     def test_later_progress_marks_final_result_stale_until_result_is_reconfirmed(self):
         self.login_unlocked_owner()
         task_date = server.business_today_key()
@@ -1633,8 +1785,7 @@ class DailySealApiTests(unittest.TestCase):
         self.login_unlocked_owner(owner)
         today = "2026-07-27"
         future = "2026-07-28"
-        for task_date in (today, future):
-            self.assertEqual(self.put_task(owner, task_date=task_date).status_code, 200)
+        self.assertEqual(self.put_task(owner, task_date=today).status_code, 200)
         current_progress = self.create_progress(
             owner,
             task_date=today,
@@ -1652,6 +1803,7 @@ class DailySealApiTests(unittest.TestCase):
         current_file_url = next(
             asset["proofFileUrl"] for asset in current_file["assets"] if asset["kind"] == "file"
         )
+        self.assertEqual(self.put_task(owner, task_date=future).status_code, 200)
         future_progress = self.create_progress(
             owner,
             task_date=future,
@@ -1677,7 +1829,9 @@ class DailySealApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             tasks = {task["date"]: task for task in response.get_json()["tasks"]}
             self.assertEqual(set(tasks), {today})
-            self.assertEqual(tasks[today]["resultStatus"], "pending")
+            self.assertEqual(tasks[today]["resultStatus"], "incomplete")
+            self.assertEqual(tasks[today]["completionPercent"], 45)
+            self.assertTrue(tasks[today]["resultLocked"])
             self.assertEqual(tasks[today]["progressEntries"][0]["note"], "今天公开的进度备注")
             self.assertEqual(len(tasks[today]["progressEntries"][0]["assets"]), 3)
             visible = viewer.get(current_file_url)
@@ -1693,8 +1847,7 @@ class DailySealApiTests(unittest.TestCase):
         self.login_unlocked_owner(owner)
         today = "2026-07-27"
         future = "2026-07-28"
-        for task_date in (today, future):
-            self.assertEqual(self.put_task(owner, task_date=task_date).status_code, 200)
+        self.assertEqual(self.put_task(owner, task_date=future).status_code, 200)
 
         # Insert the future reference first so authorization cannot depend on
         # whichever matching row SQLite happens to return first.
@@ -1720,6 +1873,7 @@ class DailySealApiTests(unittest.TestCase):
             task_date=future,
         ).get_json()["asset"]
 
+        self.assertEqual(self.put_task(owner, task_date=today).status_code, 200)
         today_progress = self.create_progress(
             owner,
             task_date=today,
@@ -1893,36 +2047,40 @@ class DailySealApiTests(unittest.TestCase):
                 2,
             )
 
-    def test_export_import_preserves_stale_and_fresh_result_confirmation_positions(self):
+    def test_export_import_preserves_cutoff_snapshots_and_lock_sources(self):
         self.login_unlocked_owner()
         stale_date = "2026-07-23"
         fresh_date = "2026-07-24"
         token = self.csrf()
-        same_time = server.now_ts() + 10
-        for task_date in (stale_date, fresh_date):
-            self.assertEqual(self.put_task(self.client, task_date=task_date).status_code, 200)
-            with patch.object(server, "now_ts", return_value=same_time):
-                created = self.client.post(
-                    f"/api/tasks/{task_date}/progress",
-                    json={
-                        "note": f"Initial progress {task_date}",
-                        "progressPercent": 50,
-                        "links": [],
-                    },
-                    headers={"X-CSRF-Token": token},
-                )
-                self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
-                result = self.client.post(
-                    f"/api/tasks/{task_date}/result",
-                    data={
-                        "resultStatus": "incomplete",
-                        "completionPercent": "60",
-                        "resultNote": f"Result for {task_date}",
-                    },
-                    headers={"X-CSRF-Token": token},
-                )
-                self.assertEqual(result.status_code, 200, result.get_data(as_text=True))
-        with patch.object(server, "now_ts", return_value=same_time):
+        stale_time = int(
+            server.datetime(2026, 7, 23, 12, tzinfo=server.CHINA_STANDARD_TIME).timestamp()
+        )
+        fresh_time = int(
+            server.datetime(2026, 7, 24, 12, tzinfo=server.CHINA_STANDARD_TIME).timestamp()
+        )
+
+        self.assertEqual(self.put_task(self.client, task_date=stale_date).status_code, 200)
+        with patch.object(server, "now_ts", return_value=stale_time):
+            created = self.client.post(
+                f"/api/tasks/{stale_date}/progress",
+                json={
+                    "note": "Initial progress",
+                    "progressPercent": 50,
+                    "links": [],
+                },
+                headers={"X-CSRF-Token": token},
+            )
+            self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+            result = self.client.post(
+                f"/api/tasks/{stale_date}/result",
+                data={
+                    "resultStatus": "incomplete",
+                    "completionPercent": "60",
+                    "resultNote": "Result before later progress",
+                },
+                headers={"X-CSRF-Token": token},
+            )
+            self.assertEqual(result.status_code, 200, result.get_data(as_text=True))
             later = self.client.post(
                 f"/api/tasks/{stale_date}/progress",
                 json={
@@ -1935,12 +2093,43 @@ class DailySealApiTests(unittest.TestCase):
         self.assertEqual(later.status_code, 201, later.get_data(as_text=True))
         self.assertTrue(later.get_json()["task"]["resultIsStale"])
 
+        # Advancing to the next Beijing day freezes the stale result from the
+        # latest same-day progress instead of keeping a stale manual snapshot.
+        self.assertEqual(self.put_task(self.client, task_date=fresh_date).status_code, 200)
+        with patch.object(server, "now_ts", return_value=fresh_time):
+            current = self.client.post(
+                f"/api/tasks/{fresh_date}/progress",
+                json={
+                    "note": "Fresh day progress",
+                    "progressPercent": 50,
+                    "links": [],
+                },
+                headers={"X-CSRF-Token": token},
+            )
+            self.assertEqual(current.status_code, 201, current.get_data(as_text=True))
+            fresh_result = self.client.post(
+                f"/api/tasks/{fresh_date}/result",
+                data={
+                    "resultStatus": "incomplete",
+                    "completionPercent": "60",
+                    "resultNote": "Fresh result",
+                },
+                headers={"X-CSRF-Token": token},
+            )
+            self.assertEqual(
+                fresh_result.status_code, 200, fresh_result.get_data(as_text=True)
+            )
+
         exported = json.loads(self.client.get("/api/export").get_data(as_text=True))
         stale_export = exported["tasks"][stale_date]
         fresh_export = exported["tasks"][fresh_date]
-        self.assertTrue(stale_export["resultIsStale"])
+        self.assertFalse(stale_export["resultIsStale"])
+        self.assertTrue(stale_export["resultLocked"])
+        self.assertEqual(stale_export["resultLockSource"], "automatic")
+        self.assertEqual(stale_export["completionPercent"], 75)
+        self.assertEqual(stale_export["resultConfirmedProgressCount"], 2)
         self.assertFalse(fresh_export["resultIsStale"])
-        self.assertEqual(stale_export["resultConfirmedProgressCount"], 1)
+        self.assertFalse(fresh_export["resultLocked"])
         self.assertEqual(fresh_export["resultConfirmedProgressCount"], 1)
         recorded_times = {
             stale_date: stale_export["resultRecordedAt"],
@@ -1975,8 +2164,12 @@ class DailySealApiTests(unittest.TestCase):
         restored_tasks = {
             task["date"]: task for task in self.client.get("/api/data").get_json()["tasks"]
         }
-        self.assertTrue(restored_tasks[stale_date]["resultIsStale"])
+        self.assertFalse(restored_tasks[stale_date]["resultIsStale"])
+        self.assertTrue(restored_tasks[stale_date]["resultLocked"])
+        self.assertEqual(restored_tasks[stale_date]["resultLockSource"], "automatic")
+        self.assertEqual(restored_tasks[stale_date]["completionPercent"], 75)
         self.assertFalse(restored_tasks[fresh_date]["resultIsStale"])
+        self.assertFalse(restored_tasks[fresh_date]["resultLocked"])
         self.assertEqual(
             restored_tasks[stale_date]["resultRecordedAt"], recorded_times[stale_date]
         )
@@ -1984,12 +2177,11 @@ class DailySealApiTests(unittest.TestCase):
             restored_tasks[fresh_date]["resultRecordedAt"], recorded_times[fresh_date]
         )
         self.assertEqual(
-            restored_tasks[stale_date]["resultConfirmedProgressCount"], 1
+            restored_tasks[stale_date]["resultConfirmedProgressCount"], 2
         )
         self.assertEqual(
             restored_tasks[fresh_date]["resultConfirmedProgressCount"], 1
         )
-
     def test_progress_asset_and_task_deletion_remove_only_their_physical_files(self):
         self.login_unlocked_owner()
         task_date = "2026-07-30"
@@ -2821,10 +3013,19 @@ class DailySealApiTests(unittest.TestCase):
             row = connection.execute(
                 "SELECT task_date, text, created_at, proof_text, proof_url, "
                 "proof_original_name, proof_size, result_version, "
-                "result_confirmed_progress_id FROM tasks"
+                "result_confirmed_progress_id, result_locked_at, result_lock_source, "
+                "result_status, completion_percent FROM tasks"
             ).fetchone()
             stage_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(stages)").fetchall()
+            }
+            goal_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(long_term_goals)").fetchall()
+            }
+            subgoal_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(stage_subgoals)").fetchall()
             }
             stage_row = connection.execute(
                 "SELECT proof_original_name, proof_size FROM stages"
@@ -2864,8 +3065,14 @@ class DailySealApiTests(unittest.TestCase):
         self.assertIn("proof_size", columns)
         self.assertIn("result_version", columns)
         self.assertIn("result_confirmed_progress_id", columns)
+        self.assertIn("result_locked_at", columns)
+        self.assertIn("result_lock_source", columns)
         self.assertIn("proof_original_name", stage_columns)
         self.assertIn("proof_size", stage_columns)
+        self.assertIn("goal_id", stage_columns)
+        self.assertIn("weight_percent", stage_columns)
+        self.assertTrue({"title", "description", "color_key", "status"}.issubset(goal_columns))
+        self.assertTrue({"stage_id", "title", "position", "status"}.issubset(subgoal_columns))
         self.assertIn("distractions", stat_columns)
         self.assertEqual(row["task_date"], "2026-01-15")
         self.assertEqual(row["text"], "legacy task")
@@ -2874,8 +3081,14 @@ class DailySealApiTests(unittest.TestCase):
         self.assertIsNone(row["proof_url"])
         self.assertEqual(row["proof_original_name"], "证明图片.jpg")
         self.assertEqual(row["proof_size"], len(legacy_image))
-        self.assertEqual(row["result_version"], 0)
-        self.assertIsNone(row["result_confirmed_progress_id"])
+        self.assertEqual(row["result_version"], 1)
+        self.assertEqual(row["result_confirmed_progress_id"], progress_id)
+        self.assertEqual(row["result_status"], "completed")
+        self.assertEqual(row["completion_percent"], 100)
+        self.assertEqual(row["result_lock_source"], "recorded")
+        self.assertEqual(
+            row["result_locked_at"], server.task_deadline_timestamp("2026-01-15")
+        )
         self.assertEqual(stage_row["proof_original_name"], "证明图片.jpg")
         self.assertEqual(stage_row["proof_size"], len(legacy_image))
         self.assertEqual(stat_row["stat_date"], "2026-01-15")
@@ -2883,6 +3096,7 @@ class DailySealApiTests(unittest.TestCase):
         self.assertEqual(stat_row["note"], "legacy private note")
         self.assertEqual(stat_row["distractions"], "")
         self.assertIn("client_key", progress_columns)
+        self.assertIn("record_date", progress_columns)
         self.assertTrue(
             {"client_key", "source_sha256", "source_size"}.issubset(asset_columns)
         )
@@ -3010,8 +3224,9 @@ class DailySealApiTests(unittest.TestCase):
     def test_viewer_cannot_see_future_tasks_or_future_proofs(self):
         owner_client = server.app.test_client()
         self.login_unlocked_owner(owner_client)
+        today = server.business_today_key()
         future_date = server.validate_date_key(
-            (server.date.fromisoformat(server.business_today_key()) + server.timedelta(days=1)).isoformat()
+            (server.date.fromisoformat(today) + server.timedelta(days=1)).isoformat()
         )
         self.assertEqual(
             self.put_task(owner_client, task_date=future_date, text="private future plan").status_code,
@@ -3030,9 +3245,10 @@ class DailySealApiTests(unittest.TestCase):
 
         viewer_client = server.app.test_client()
         self.assertEqual(self.register_viewer(viewer_client).status_code, 200)
-        viewer_payload = viewer_client.get("/api/data").get_json()
+        with patch.object(server, "business_today_key", return_value=today):
+            viewer_payload = viewer_client.get("/api/data").get_json()
+            hidden_proof = viewer_client.get(proof_url)
         self.assertNotIn(future_date, {item["date"] for item in viewer_payload["tasks"]})
-        hidden_proof = viewer_client.get(proof_url)
         self.assertEqual(hidden_proof.status_code, 404)
         self.assertEqual(hidden_proof.get_json()["code"], "not_found")
 
@@ -3232,6 +3448,201 @@ class DailySealApiTests(unittest.TestCase):
             self.assertIn("frame-ancestors 'none'", csp)
             self.assertEqual(response.headers["Cache-Control"], "no-store")
             self.assertNotIn("Strict-Transport-Security", response.headers)
+
+    def test_long_term_goal_validation_adopts_legacy_stage_and_is_read_only_to_viewers(self):
+        self.login_unlocked_owner()
+        legacy_stage = self.create_stage(title="已有当前阶段")
+        self.assertEqual(legacy_stage.status_code, 201)
+        stage_id = legacy_stage.get_json()["stage"]["id"]
+
+        missing_csrf = self.client.post(
+            "/api/goals",
+            json={"title": "高考目标", "colorKey": "mist"},
+        )
+        self.assertEqual(missing_csrf.status_code, 403)
+        for body in (
+            {"title": "x" * 31, "colorKey": "mist"},
+            {"title": "有效目标", "description": "x" * 121, "colorKey": "mist"},
+            {"title": "有效目标", "colorKey": "neon"},
+        ):
+            invalid = self.client.post(
+                "/api/goals",
+                json=body,
+                headers={"X-CSRF-Token": self.csrf()},
+            )
+            self.assertEqual(invalid.status_code, 400, body)
+
+        missing_weight = self.client.post(
+            "/api/goals",
+            json={"title": "高考目标", "colorKey": "mist"},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(missing_weight.status_code, 400)
+        created = self.client.post(
+            "/api/goals",
+            json={
+                "title": "高考目标",
+                "description": "达到本科线 450 分",
+                "colorKey": "mist",
+                "activeStageWeight": 30,
+            },
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+        stage = self.client.get(f"/api/stages/{stage_id}").get_json()["stage"]
+        self.assertEqual(stage["goalId"], created.get_json()["goal"]["id"])
+        self.assertEqual(stage["weightPercent"], 30)
+
+        subgoal = self.client.post(
+            f"/api/stages/{stage_id}/subgoals",
+            json={"title": "先完成第一小步"},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(subgoal.status_code, 201)
+        subgoal_id = subgoal.get_json()["subgoal"]["id"]
+        missing_subgoal_csrf = self.client.put(
+            f"/api/subgoals/{subgoal_id}", json={"completed": True}
+        )
+        self.assertEqual(missing_subgoal_csrf.status_code, 403)
+
+        viewer = server.app.test_client()
+        self.assertEqual(self.register_viewer(viewer).status_code, 200)
+        visible = viewer.get("/api/goals")
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(visible.get_json()["activeGoal"]["title"], "高考目标")
+        viewer_write = viewer.put(
+            f"/api/subgoals/{subgoal_id}",
+            json={"completed": True},
+            headers={"X-CSRF-Token": self.csrf(viewer)},
+        )
+        self.assertEqual(viewer_write.status_code, 403)
+        self.assertEqual(viewer_write.get_json()["code"], "read_only")
+
+        exported = self.client.get("/api/export").get_json()
+        self.assertEqual(exported["goals"][0]["title"], "高考目标")
+        self.assertEqual(exported["stages"][0]["subgoals"][0]["id"], subgoal_id)
+
+    def test_long_term_goal_weighted_stages_and_subgoals_drive_progress(self):
+        self.login_unlocked_owner()
+        created_goal = self.client.post(
+            "/api/goals",
+            json={
+                "title": "高考达到本科线 450 分",
+                "description": "把每个阶段完成后，再把对应比例计入长期进度。",
+                "colorKey": "sage",
+            },
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(created_goal.status_code, 201, created_goal.get_data(as_text=True))
+        goal = created_goal.get_json()["goal"]
+        goal_id = goal["id"]
+        self.assertEqual(goal["progressPercent"], 0)
+        self.assertEqual(goal["remainingPercent"], 100)
+        self.assertFalse(goal["canComplete"])
+
+        missing_weight = self.create_stage(title="基础补齐")
+        self.assertEqual(missing_weight.status_code, 400)
+        first_stage = self.create_stage(
+            title="基础补齐", description="先补齐基础知识", weight_percent=40
+        )
+        self.assertEqual(first_stage.status_code, 201, first_stage.get_data(as_text=True))
+        stage_id = first_stage.get_json()["stage"]["id"]
+        self.assertEqual(first_stage.get_json()["stage"]["goalId"], goal_id)
+        self.assertEqual(first_stage.get_json()["stage"]["weightPercent"], 40)
+
+        subgoal_ids = []
+        for title in ("完成函数专题", "整理立体几何错题"):
+            response = self.client.post(
+                f"/api/stages/{stage_id}/subgoals",
+                json={"title": title},
+                headers={"X-CSRF-Token": self.csrf()},
+            )
+            self.assertEqual(response.status_code, 201, response.get_data(as_text=True))
+            subgoal_ids.append(response.get_json()["subgoal"]["id"])
+
+        blocked = self.client.post(
+            f"/api/stages/{stage_id}/complete",
+            json={"proofText": "还没有完成全部子目标"},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.get_json()["code"], "stage_subgoals_incomplete")
+
+        first_done = self.client.put(
+            f"/api/subgoals/{subgoal_ids[0]}",
+            json={"completed": True},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(first_done.status_code, 200)
+        stage_halfway = self.client.get(f"/api/stages/{stage_id}").get_json()["stage"]
+        self.assertEqual(stage_halfway["subgoalProgressPercent"], 50)
+        still_zero = self.client.get("/api/goals").get_json()["activeGoal"]
+        self.assertEqual(still_zero["progressPercent"], 0)
+        self.assertEqual(still_zero["nextSubgoal"]["id"], subgoal_ids[1])
+
+        reordered = self.client.post(
+            f"/api/stages/{stage_id}/subgoals/reorder",
+            json={"ids": [subgoal_ids[1], subgoal_ids[0]]},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(reordered.status_code, 200, reordered.get_data(as_text=True))
+        self.assertEqual(
+            [item["id"] for item in reordered.get_json()["subgoals"]],
+            [subgoal_ids[1], subgoal_ids[0]],
+        )
+        edited = self.client.put(
+            f"/api/subgoals/{subgoal_ids[1]}",
+            json={"title": "整理几何错题", "completed": True},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(edited.status_code, 200, edited.get_data(as_text=True))
+
+        first_complete = self.client.post(
+            f"/api/stages/{stage_id}/complete",
+            json={"proofText": "基础阶段已经完成"},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(first_complete.status_code, 200, first_complete.get_data(as_text=True))
+        after_first = self.client.get("/api/goals").get_json()["activeGoal"]
+        self.assertEqual(after_first["progressPercent"], 40)
+        self.assertEqual(after_first["remainingPercent"], 60)
+
+        too_large = self.create_stage(title="超出剩余比例", weight_percent=61)
+        self.assertEqual(too_large.status_code, 409)
+        self.assertEqual(too_large.get_json()["code"], "goal_weight_exceeded")
+        second_stage = self.create_stage(title="模拟冲刺", weight_percent=60)
+        self.assertEqual(second_stage.status_code, 201, second_stage.get_data(as_text=True))
+        second_id = second_stage.get_json()["stage"]["id"]
+        second_subgoal = self.client.post(
+            f"/api/stages/{second_id}/subgoals",
+            json={"title": "完成三次全真模拟"},
+            headers={"X-CSRF-Token": self.csrf()},
+        ).get_json()["subgoal"]
+        self.client.put(
+            f"/api/subgoals/{second_subgoal['id']}",
+            json={"completed": True},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        second_complete = self.client.post(
+            f"/api/stages/{second_id}/complete",
+            json={"proofText": "模拟阶段完成"},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(second_complete.status_code, 200, second_complete.get_data(as_text=True))
+
+        ready = self.client.get("/api/goals").get_json()["activeGoal"]
+        self.assertEqual(ready["allocatedPercent"], 100)
+        self.assertEqual(ready["progressPercent"], 100)
+        self.assertTrue(ready["canComplete"])
+        completed_goal = self.client.post(
+            f"/api/goals/{goal_id}/complete",
+            json={},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(completed_goal.status_code, 200, completed_goal.get_data(as_text=True))
+        goals = self.client.get("/api/goals").get_json()
+        self.assertIsNone(goals["activeGoal"])
+        self.assertEqual(goals["completedGoals"][0]["progressPercent"], 100)
 
     def test_stage_lifecycle_is_persistent_single_active_and_completion_is_idempotent(self):
         self.login_unlocked_owner()

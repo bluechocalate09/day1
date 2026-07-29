@@ -56,6 +56,14 @@ class Day1NewApiTests(unittest.TestCase):
         _TEMP_DATA.cleanup()
 
     def setUp(self):
+        self._business_date = self.TASK_DATE
+
+        def test_business_date_provider(task_date_hint=None):
+            if isinstance(task_date_hint, str):
+                self._business_date = task_date_hint
+            return self._business_date
+
+        server.app.config["BUSINESS_DATE_PROVIDER"] = test_business_date_provider
         # Reset both the platform database and Blue's legacy content store.
         connection = sqlite3.connect(str(server.DB_PATH))
         try:
@@ -583,6 +591,113 @@ class Day1NewApiTests(unittest.TestCase):
             manager_b["space"]["publicId"],
         )
 
+    def test_viewer_disconnects_only_one_space_and_can_restore_message_history(self):
+        manager_a = self.register_manager("断开空间 A")
+        manager_b = self.register_manager("保留空间 B")
+        code_a = self.viewer_code(manager_a)
+        code_b = self.viewer_code(manager_b)
+        visitor = self.register_viewer(code_a, "disconnect")
+        self.connect_viewer(visitor, code_b)
+
+        listed = visitor["client"].get("/api/spaces")
+        listed_by_id = {
+            item["publicId"]: item for item in listed.get_json()["spaces"]
+        }
+        self.assertTrue(listed_by_id[manager_a["space"]["publicId"]]["canDisconnect"])
+        self.assertTrue(listed_by_id[manager_b["space"]["publicId"]]["canDisconnect"])
+
+        message = visitor["client"].post(
+            "/api/messages",
+            json={"body": "断开前留下的对话"},
+            headers=self.headers(
+                visitor["client"], manager_a["space"]["publicId"], csrf=True
+            ),
+        )
+        self.assertEqual(message.status_code, 201, message.get_data(as_text=True))
+
+        missing_csrf = visitor["client"].delete(
+            f"/api/spaces/connections/{manager_a['space']['publicId']}"
+        )
+        self.assertEqual(missing_csrf.status_code, 403)
+        self.assertEqual(missing_csrf.get_json()["code"], "csrf_failed")
+
+        owner_attempt = manager_a["client"].delete(
+            f"/api/spaces/connections/{manager_a['space']['publicId']}",
+            headers=self.headers(manager_a["client"], csrf=True),
+        )
+        self.assertEqual(owner_attempt.status_code, 403)
+        self.assertEqual(
+            owner_attempt.get_json()["code"], "owned_space_not_disconnectable"
+        )
+
+        disconnected = visitor["client"].delete(
+            f"/api/spaces/connections/{manager_a['space']['publicId']}",
+            headers=self.headers(visitor["client"], csrf=True),
+        )
+        self.assertEqual(
+            disconnected.status_code, 200, disconnected.get_data(as_text=True)
+        )
+        payload = disconnected.get_json()
+        self.assertTrue(payload["disconnected"])
+        self.assertEqual(
+            payload["disconnectedSpaceId"], manager_a["space"]["publicId"]
+        )
+        self.assertEqual(payload["defaultSpaceId"], manager_b["space"]["publicId"])
+        self.assertEqual(
+            [item["publicId"] for item in payload["spaces"]],
+            [manager_b["space"]["publicId"]],
+        )
+        self.assertEqual(
+            self.get_data(visitor, manager_a["space"]["publicId"]).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.get_data(visitor, manager_b["space"]["publicId"]).status_code,
+            200,
+        )
+
+        with self.platform_db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM messages WHERE visitor_user_id = ?",
+                    (self.user_id(visitor["email"]),),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT id FROM viewer_connections WHERE user_id = ? "
+                    "AND space_id = (SELECT id FROM spaces WHERE public_id = ?)",
+                    (
+                        self.user_id(visitor["email"]),
+                        manager_a["space"]["publicId"],
+                    ),
+                ).fetchone()
+            )
+
+        second_disconnect = visitor["client"].delete(
+            f"/api/spaces/connections/{manager_a['space']['publicId']}",
+            headers=self.headers(visitor["client"], csrf=True),
+        )
+        self.assertEqual(second_disconnect.status_code, 200)
+        self.assertFalse(second_disconnect.get_json()["disconnected"])
+
+        unknown_disconnect = visitor["client"].delete(
+            "/api/spaces/connections/not-a-real-space",
+            headers=self.headers(visitor["client"], csrf=True),
+        )
+        self.assertEqual(unknown_disconnect.status_code, 200)
+        self.assertFalse(unknown_disconnect.get_json()["disconnected"])
+
+        self.connect_viewer(visitor, code_a)
+        restored = visitor["client"].get(
+            "/api/messages",
+            headers=self.headers(visitor["client"], manager_a["space"]["publicId"]),
+        )
+        self.assertEqual(
+            self.message_bodies(restored), ["断开前留下的对话"]
+        )
+
     def test_viewer_code_refresh_requires_exact_confirmation_and_revokes_every_connection(self):
         manager_a = self.register_manager("刷新空间 A")
         manager_b = self.register_manager("保留空间 B")
@@ -675,7 +790,7 @@ class Day1NewApiTests(unittest.TestCase):
         self.assertEqual(revoked_entry["connectionStatus"], "revoked")
         self.assertIn("刷新识别码", revoked_entry["revokedReason"])
 
-    def test_platform_overview_is_allowlisted_and_only_blue_controls_mascots(self):
+    def test_platform_overview_is_allowlisted_and_all_spaces_have_mascots(self):
         manager = self.register_manager("概览管理端")
         manager_code = self.viewer_code(manager)
         visitor = self.register_viewer(manager_code, "overviewvisitor")
@@ -765,35 +880,41 @@ class Day1NewApiTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, raw_overview)
 
+        self.assertTrue(
+            all(
+                item["appearance"]["mascotEnabled"]
+                for item in payload["spaces"]
+            )
+        )
         manager_space = next(
             item
             for item in payload["spaces"]
             if item["publicId"] == manager["space"]["publicId"]
         )
-        self.assertFalse(manager_space["appearance"]["mascotEnabled"])
+        self.assertTrue(manager_space["appearance"]["mascotEnabled"])
 
-        manager_attempt = manager["client"].post(
-            f"/api/platform/spaces/{manager['space']['publicId']}/mascot",
-            json={"enabled": True},
-            headers=self.headers(manager["client"], csrf=True),
-        )
-        visitor_attempt = visitor["client"].post(
-            f"/api/platform/spaces/{manager['space']['publicId']}/mascot",
-            json={"enabled": True},
-            headers=self.headers(visitor["client"], csrf=True),
-        )
-        self.assertEqual(manager_attempt.status_code, 404)
-        self.assertEqual(visitor_attempt.status_code, 404)
+        for client in (manager["client"], visitor["client"], self.blue):
+            unavailable = client.post(
+                f"/api/platform/spaces/{manager['space']['publicId']}/mascot",
+                json={"enabled": False},
+                headers=self.headers(client, csrf=True),
+            )
+            self.assertEqual(unavailable.status_code, 404)
 
-        enabled = self.blue.post(
-            f"/api/platform/spaces/{manager['space']['publicId']}/mascot",
-            json={"enabled": True},
-            headers=self.headers(self.blue, csrf=True),
-        )
-        self.assertEqual(enabled.status_code, 200, enabled.get_data(as_text=True))
-        self.assertTrue(
-            enabled.get_json()["space"]["appearance"]["mascotEnabled"]
-        )
+        with self.platform_db() as connection:
+            connection.execute(
+                "UPDATE spaces SET mascot_enabled = 0 WHERE public_id = ?",
+                (manager["space"]["publicId"],),
+            )
+            connection.commit()
+        server.init_db()
+        with self.platform_db() as connection:
+            upgraded = connection.execute(
+                "SELECT mascot_enabled FROM spaces WHERE public_id = ?",
+                (manager["space"]["publicId"],),
+            ).fetchone()["mascot_enabled"]
+        self.assertEqual(upgraded, 1)
+
         manager_spaces = manager["client"].get("/api/spaces").get_json()["spaces"]
         self.assertTrue(manager_spaces[0]["appearance"]["mascotEnabled"])
         blue_spaces = self.blue.get("/api/spaces").get_json()["spaces"]
@@ -1391,6 +1512,7 @@ class Day1NewApiTests(unittest.TestCase):
         static_dir = WORK_DIR / "app" / "static"
         html = (static_dir / "index.html").read_text(encoding="utf-8")
         script = (static_dir / "app.js").read_text(encoding="utf-8")
+        theme_script = (static_dir / "theme.js").read_text(encoding="utf-8")
         styles = (static_dir / "app.css").read_text(encoding="utf-8")
 
         for element_id in (
@@ -1413,8 +1535,31 @@ class Day1NewApiTests(unittest.TestCase):
             "ip-block-address",
             "ip-block-note",
             "ip-block-submit",
+            "owner-goal-banner",
+            "owner-goal-progressbar",
+            "owner-goal-route",
+            "visitor-goal-banner",
+            "goal-route-dialog",
+            "goal-route-stages",
+            "goal-route-subgoals",
+            "goal-dialog",
+            "goal-form",
+            "goal-title-input",
+            "goal-description-input",
+            "goal-adopt-stage-weight",
+            "stage-weight-input",
+            "subgoal-form",
+            "subgoal-title-input",
         ):
             self.assertIn(f'id="{element_id}"', html)
+
+        danger_start = html.index('<details id="workspace-danger-zone"')
+        danger_tag_end = html.index(">", danger_start)
+        self.assertNotIn(" open", html[danger_start:danger_tag_end])
+        self.assertLess(html.index('id="data-tools"'), danger_start)
+        self.assertIn('id="visitor-heading" class="visitor-heading visitor-heading-with-mascot"', html)
+        self.assertIn('id="visitor-mascot" class="visitor-mascot" aria-hidden="true">', html)
+        self.assertNotIn("visitor-day1-seal", html)
 
         for visible_copy in (
             "删除此管理端",
@@ -1426,6 +1571,11 @@ class Day1NewApiTests(unittest.TestCase):
             "共享网络可能包含多位访客",
             "永久删除管理端",
             "加入黑名单",
+            "长期方向",
+            "目标路线",
+            "安排到今天",
+            "占长期目标的比例",
+            "添加一个明确的小目标",
         ):
             self.assertIn(visible_copy, html)
 
@@ -1438,14 +1588,61 @@ class Day1NewApiTests(unittest.TestCase):
             "/api/platform/spaces/",
             "/api/platform/ip-access",
             "/api/platform/ip-blocks",
+            "/api/spaces/connections/",
+            "workspace-option-disconnect",
+            "canDisconnect",
+            "platformPreview",
+            "给此端留言",
+            "/api/goals",
+            "/api/subgoals/",
+            "/subgoals/reorder",
+            "activeGoal",
+            "weightPercent",
+            "progressPercent",
         ):
             self.assertIn(script_contract, script)
+        self.assertNotIn("blockedPlatformPreview", script)
+
+        self.assertNotIn("添加小精灵", script)
+        self.assertNotIn("移除小精灵", script)
+        self.assertNotIn("/mascot", script)
+        self.assertNotIn("visitor-heading-with-seal", script + styles)
+        self.assertNotIn("visitor-day1-seal", html + script + styles)
+
+        self.assertIn('<meta name="color-scheme" content="light dark">', html)
+        self.assertIn('<script src="/static/theme.js"></script>', html)
+        self.assertLess(
+            html.index('<script src="/static/theme.js"></script>'),
+            html.index('<link rel="stylesheet" href="/static/app.css">'),
+        )
+        for theme_contract in (
+            "DAY_START_HOUR = 7",
+            "NIGHT_START_HOUR = 19",
+            "new Date()",
+            "getHours()",
+            'root.dataset.theme = theme',
+            'meta[name="theme-color"]',
+            "visibilitychange",
+        ):
+            self.assertIn(theme_contract, theme_script)
+        self.assertIn('html[data-theme="dark"]', styles)
+        self.assertIn("color-scheme: dark", styles)
+        self.assertIn("--bg: #20211f", styles)
 
         for selector in (
             ".danger-zone-card",
+            "#workspace-danger-zone { order: 8; }",
+            ".visitor-heading-with-mascot",
             ".platform-access-grid",
             ".platform-security-list",
             ".button-danger",
+            ".workspace-option-row",
+            ".workspace-option-disconnect",
+            ".goal-banner",
+            ".goal-route-drawer.dialog",
+            ".goal-route-subgoal",
+            ".goal-color-options",
+            '[data-goal-color="sage"]',
         ):
             self.assertIn(selector, styles)
 
@@ -1526,7 +1723,40 @@ class Day1NewApiTests(unittest.TestCase):
                 "/api/messages",
                 headers=self.headers(self.blue, manager["space"]["publicId"]),
             )
-            self.assertEqual(blue_preview.status_code, 404)
+            self.assertEqual(
+                blue_preview.status_code, 200, blue_preview.get_data(as_text=True)
+            )
+            self.assertEqual(blue_preview.get_json()["mode"], "viewer")
+            self.assertEqual(self.message_bodies(blue_preview), [])
+            blue_message = self.blue.post(
+                "/api/messages",
+                json={"body": "Blue 以自己的身份留言"},
+                headers=self.headers(
+                    self.blue, manager["space"]["publicId"], csrf=True
+                ),
+            )
+            self.assertEqual(
+                blue_message.status_code, 201, blue_message.get_data(as_text=True)
+            )
+            blue_conversation = self.blue.get(
+                "/api/messages",
+                headers=self.headers(self.blue, manager["space"]["publicId"]),
+            )
+            self.assertEqual(
+                self.message_bodies(blue_conversation),
+                ["Blue 以自己的身份留言"],
+            )
+            blue_cannot_reply_as_manager = self.blue.post(
+                f"/api/messages/{visitor_one_id}/reply",
+                json={"body": "不能越权回复别人的访客"},
+                headers=self.headers(
+                    self.blue, manager["space"]["publicId"], csrf=True
+                ),
+            )
+            self.assertEqual(blue_cannot_reply_as_manager.status_code, 403)
+            self.assertEqual(
+                blue_cannot_reply_as_manager.get_json()["code"], "read_only"
+            )
 
         at_2000 = self.cst_timestamp(20, 0, 0)
         with patch.object(server, "now_ts", return_value=at_2000):
@@ -1545,7 +1775,7 @@ class Day1NewApiTests(unittest.TestCase):
                 opened.get_json()["window"]["closesAt"].endswith("21:00:00+08:00")
             )
             self.assertTrue(opened.get_json()["contentAvailable"])
-            self.assertEqual(len(opened.get_json()["conversations"]), 2)
+            self.assertEqual(len(opened.get_json()["conversations"]), 3)
             reply = manager["client"].post(
                 f"/api/messages/{visitor_one_id}/reply",
                 json={"body": "20 点回复访客一"},
@@ -1571,6 +1801,47 @@ class Day1NewApiTests(unittest.TestCase):
             self.assertIn("20 点回复访客一", self.message_bodies(visitor_one_view))
             self.assertNotIn(
                 "20 点回复访客一", self.message_bodies(visitor_two_view)
+            )
+            blue_id = self.user_id(self.BLUE_EMAIL)
+            blue_reply = manager["client"].post(
+                f"/api/messages/{blue_id}/reply",
+                json={"body": "20 点回复 Blue"},
+                headers=self.headers(
+                    manager["client"],
+                    manager["space"]["publicId"],
+                    csrf=True,
+                ),
+            )
+            self.assertEqual(
+                blue_reply.status_code, 201, blue_reply.get_data(as_text=True)
+            )
+            blue_view = self.blue.get(
+                "/api/messages",
+                headers=self.headers(self.blue, manager["space"]["publicId"]),
+            )
+            self.assertEqual(
+                self.message_bodies(blue_view),
+                ["Blue 以自己的身份留言", "20 点回复 Blue"],
+            )
+            visitor_one_after_blue_reply = visitor_one["client"].get(
+                "/api/messages",
+                headers=self.headers(
+                    visitor_one["client"], manager["space"]["publicId"]
+                ),
+            )
+            visitor_two_after_blue_reply = visitor_two["client"].get(
+                "/api/messages",
+                headers=self.headers(
+                    visitor_two["client"], manager["space"]["publicId"]
+                ),
+            )
+            self.assertNotIn(
+                "20 点回复 Blue",
+                self.message_bodies(visitor_one_after_blue_reply),
+            )
+            self.assertNotIn(
+                "20 点回复 Blue",
+                self.message_bodies(visitor_two_after_blue_reply),
             )
 
         at_2059 = self.cst_timestamp(20, 59, 59)
