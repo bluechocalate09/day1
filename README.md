@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <code>Python 3.11+</code> · <code>Flask</code> · <code>SQLite</code> · <code>原生前端</code> · <code>74 项自动化测试</code>
+  <code>Python 3.11+</code> · <code>Flask</code> · <code>SQLite</code> · <code>原生前端</code>
 </p>
 
 ## Day1 是什么
@@ -69,7 +69,7 @@ Day1 帮你把宏观方向变成每天可执行的一步：先写下长期目标
 | `deploy/` | VPS 服务、Nginx 与历史发布脚本 |
 | `.github/workflows/` | 测试与 GitHub Release 自动化 |
 | `docs/assets/` | GitHub 项目展示资源 |
-| `RELEASE_NOTES.md` | 当前版本的更新说明与验证状态 |
+| `RELEASE_NOTES.md` | 当前版本的完整更新说明 |
 
 `deploy/` 中的脚本保留特定版本的历史路径。再次使用前，应先核对路径、域名、注册开关与备份策略。
 
@@ -103,19 +103,9 @@ $env:DAILY_SEAL_REGISTRATION_ENABLED = "1"
 
 空间目录键完全由服务端生成。备份与恢复必须在服务停止后整体处理数据目录，不能只复制中央数据库。
 
-## 验证
-
-```powershell
-.\.venv\Scripts\python -m unittest discover -s tests -p "test*.py" -v
-```
-
-当前版本共 74 项自动化测试，覆盖登录与空间权限、北京时间跨日锁定、次日补充、长期目标与阶段权重、导入导出、附件边界与去重、并发更新、旧数据库迁移、管理邀请、访客断连、多端隔离、留言时间窗和孤立文件清理。
-
-桌面、iPad、手机与 320px 极窄屏已完成真实交互检查。
-
 ## 发布与数据边界
 
-推送到 `main` 后，GitHub Actions 会运行完整测试并检查 `RELEASE_NOTES.md`；验证通过后才创建 GitHub Release。版本号使用 `v年.月.日.运行标识`。
+推送到 `main` 后，GitHub Actions 会运行完整测试并检查 `RELEASE_NOTES.md`；全部通过后自动创建 GitHub Release。版本号使用 `v年.月.日.运行标识`。
 
 仓库只保存程序代码和公开展示资源。数据库、账号、私人记录、附件、证书、服务器备份、种子文件与其他凭据必须始终留在仓库外。
 

@@ -34,12 +34,12 @@ jobs:
         shell: bash
         run: python -m unittest discover -s tests -p "test*.py" -v
 
-      - name: Validate release notes
+      - name: Check release notes
         shell: bash
         run: |
           set -Eeuo pipefail
           test -s RELEASE_NOTES.md
-          grep -Fq "# Blue Day1" RELEASE_NOTES.md
+          grep -Fq "# Day1" RELEASE_NOTES.md
 
       - name: Choose version number
         shell: bash
@@ -67,5 +67,5 @@ jobs:
 
           gh release create "${TAG_NAME}" \
             --target "${GITHUB_SHA}" \
-            --title "Blue Day1 ${TAG_NAME}" \
+            --title "Day1 ${TAG_NAME}" \
             --notes-file RELEASE_NOTES.md
