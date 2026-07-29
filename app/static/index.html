@@ -3,10 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#f5f6f2">
   <meta name="description" content="Blue — 安静、清晰的每日行动记录。">
   <title>Blue Day1</title>
+  <script src="/static/theme.js"></script>
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/app.js" defer></script>
 </head>
@@ -25,7 +26,7 @@
         <p class="eyebrow">BLUE DAY1</p>
         <h1 id="auth-brand-title">把重要的事，安静地做完。</h1>
         <p class="auth-intro-copy">把一天拆成看得见的小步，疲惫时也知道下一步往哪里走。</p>
-        <p class="auth-trust-note">进度、结果与证据清楚留存；访客账号始终只读。</p>
+        <p class="auth-trust-note">每个管理端彼此独立；访客始终只读，只能查看被邀请的端。</p>
       </section>
 
       <section class="auth-card" aria-labelledby="auth-title">
@@ -64,9 +65,42 @@
         <section id="register-panel" class="auth-panel" role="tabpanel" aria-labelledby="register-tab" data-auth-panel="register" hidden>
           <div class="notice notice-readonly">
             <span class="notice-icon" aria-hidden="true">i</span>
-            <p><strong>注册账号仅可查看</strong><br>不能新增、修改、删除或导出任何记录。</p>
+            <p><strong id="register-notice-title">用识别码加入一个 Day1</strong><br><span id="register-notice-copy">注册后只能查看对方公开的记录，并给管理者留言。</span></p>
           </div>
           <form id="register-form" class="form-stack" novalidate>
+            <fieldset class="registration-kind" aria-label="选择注册用途">
+              <legend class="visually-hidden">选择注册用途</legend>
+              <label class="registration-kind-option is-active">
+                <input id="register-kind-viewer" name="registrationKind" type="radio" value="viewer" checked>
+                <span><strong>访客预览</strong><small>加入别人分享的端</small></span>
+              </label>
+              <label class="registration-kind-option">
+                <input id="register-kind-manager" name="registrationKind" type="radio" value="manager">
+                <span><strong>创建管理端</strong><small>管理自己的 Day1</small></span>
+              </label>
+            </fieldset>
+            <div id="viewer-registration-fields" class="registration-fields">
+              <div class="field">
+                <label for="register-viewer-code">预览识别码</label>
+                <input id="register-viewer-code" name="viewerCode" type="text" inputmode="text" autocomplete="off" maxlength="128" spellcheck="false" placeholder="输入管理者分享的识别码">
+                <p class="field-help">识别码只用于连接对应的预览端。</p>
+              </div>
+            </div>
+            <div id="manager-registration-fields" class="registration-fields" hidden>
+              <div class="field">
+                <label for="register-manager-invite">管理邀请码</label>
+                <input id="register-manager-invite" name="managerInviteCode" type="text" inputmode="text" autocomplete="one-time-code" maxlength="128" spellcheck="false" placeholder="输入 Blue 发出的管理邀请码">
+              </div>
+              <div class="field">
+                <label for="register-space-name">管理端名称</label>
+                <input id="register-space-name" name="spaceName" type="text" autocomplete="organization" maxlength="60" placeholder="例如：小林的 Day1">
+                <p class="field-help">会显示在访客的端切换列表中。</p>
+              </div>
+            </div>
+            <div class="field">
+              <label for="register-display-name">你的名称</label>
+              <input id="register-display-name" name="displayName" type="text" autocomplete="name" maxlength="40" placeholder="用于账户与留言署名" required>
+            </div>
             <div class="field">
               <label for="register-email">邮箱</label>
               <input id="register-email" name="email" type="email" inputmode="email" autocomplete="username" maxlength="254" placeholder="name@example.com" required>
@@ -83,11 +117,11 @@
               <label for="register-password-confirm">确认密码</label>
               <input id="register-password-confirm" name="passwordConfirm" type="password" autocomplete="new-password" minlength="10" maxlength="128" placeholder="再次输入密码" required>
             </div>
-            <button id="register-submit" class="button button-primary button-block" type="submit" data-loading-label="正在创建…">创建只读账号</button>
+            <button id="register-submit" class="button button-primary button-block" type="submit" data-loading-label="正在创建…">创建访客账号</button>
           </form>
         </section>
 
-        <p class="auth-footnote">登录即表示你了解：访客账号只用于查看管理者公开的任务与完成结果。</p>
+        <p class="auth-footnote">管理端之间彼此隔离；只有端的所有者能够修改其中的记录。</p>
       </section>
     </main>
 
@@ -103,6 +137,39 @@
           </a>
 
           <div class="header-actions">
+            <details id="workspace-menu" class="workspace-menu">
+              <summary id="workspace-menu-button" class="workspace-trigger" aria-label="切换当前端">
+                <span id="workspace-mark" class="workspace-mark" aria-hidden="true">B</span>
+                <span class="workspace-trigger-copy">
+                  <strong id="active-workspace-name">当前端</strong>
+                  <small id="active-workspace-access">正在载入</small>
+                </span>
+                <span class="chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div id="workspace-menu-panel" class="workspace-menu-panel">
+                <div class="workspace-menu-heading">
+                  <p><strong>切换端</strong><span>只会改变当前查看的内容</span></p>
+                  <button class="icon-button workspace-add-button" type="button" aria-label="输入识别码连接新端" data-open-connect-space>＋</button>
+                </div>
+                <div id="workspace-list" class="workspace-list" aria-label="可切换的端">
+                  <p class="workspace-list-empty">还没有可切换的端。</p>
+                </div>
+                <div id="workspace-view-actions-mobile" class="workspace-view-actions-mobile" role="group" aria-label="当前端查看模式" hidden>
+                  <button class="view-switch is-active" type="button" aria-pressed="true" data-switch-view="owner">管理</button>
+                  <button class="view-switch" type="button" aria-pressed="false" data-switch-view="visitor">访客预览</button>
+                </div>
+                <div id="platform-entry-wrap" class="workspace-platform-entry" hidden>
+                  <div class="menu-separator"></div>
+                  <button id="open-platform-overview" class="workspace-option workspace-option-platform" type="button">
+                    <span class="workspace-option-mark" aria-hidden="true">P</span>
+                    <span><strong>平台概览</strong><small>查看管理端与登录用户</small></span>
+                    <span aria-hidden="true">›</span>
+                  </button>
+                </div>
+                <button class="menu-button workspace-connect-button" type="button" data-open-connect-space>输入识别码连接新端</button>
+              </div>
+            </details>
+
             <div id="view-switcher" class="view-switcher" role="group" aria-label="查看模式" hidden>
               <button id="manage-view-button" class="view-switch is-active" type="button" aria-pressed="true" data-switch-view="owner">管理</button>
               <button id="preview-view-button" class="view-switch" type="button" aria-pressed="false" data-switch-view="visitor">访客预览</button>
@@ -122,6 +189,7 @@
                   <p><strong id="account-email">—</strong><span id="account-role-label">只读访客</span></p>
                 </div>
                 <div class="menu-separator"></div>
+                <button id="account-platform-overview" class="menu-button" type="button" hidden>平台概览</button>
                 <button id="open-password-dialog" class="menu-button" type="button">修改密码</button>
                 <button id="logout-button" class="menu-button menu-button-danger" type="button">退出登录</button>
               </div>
@@ -132,7 +200,7 @@
 
       <div id="preview-banner" class="preview-banner" role="status" hidden>
         <div class="preview-banner-inner">
-          <p><strong>访客预览</strong><span>这是其他账号看到的只读页面。</span></p>
+          <p><strong id="preview-banner-title">访客预览</strong><span id="preview-banner-copy">这是其他账号看到的只读页面。</span></p>
           <button id="exit-preview-button" class="button button-small button-quiet" type="button" data-switch-view="owner">返回管理</button>
         </div>
       </div>
@@ -152,6 +220,26 @@
               <span><strong id="owner-streak-count" data-bind="streak-count">0</strong> 天连续完成</span>
             </div>
           </div>
+
+          <section id="owner-goal-banner" class="goal-banner is-empty" data-goal-color="mist" aria-labelledby="owner-goal-title">
+            <div class="goal-banner-main">
+              <p class="goal-banner-kicker">长期方向</p>
+              <h2 id="owner-goal-title">还没有设定长期目标</h2>
+              <p id="owner-goal-description" class="goal-banner-description">把最终想抵达的位置写清楚，今天会更容易找到方向。</p>
+              <p id="owner-goal-next" class="goal-banner-next" hidden><span>下一步</span><strong>—</strong></p>
+              <div class="goal-banner-actions">
+                <button id="owner-goal-primary" class="button button-primary button-small" type="button">设定长期目标</button>
+                <button id="owner-goal-today" class="button button-quiet button-small" type="button" hidden>安排到今天</button>
+                <button id="owner-goal-route" class="text-button" type="button" hidden>查看路线</button>
+              </div>
+            </div>
+            <div class="goal-banner-progress">
+              <div class="goal-banner-progress-heading"><span>长期进度</span><strong id="owner-goal-percent">0%</strong></div>
+              <div id="owner-goal-progressbar" class="goal-progress-track" role="progressbar" aria-label="长期目标进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+              <p id="owner-goal-stage">完成阶段后，进度会累加到这里。</p>
+            </div>
+            <figure class="goal-banner-mascot" aria-hidden="true"><img src="/static/blue-mascot.png" alt=""></figure>
+          </section>
 
           <div class="owner-layout">
             <div class="owner-primary-column">
@@ -219,6 +307,7 @@
                   <span class="heatmap-scale"><span class="heatmap-scale-swatches" aria-hidden="true"><i class="progress-0"></i><i class="progress-1"></i><i class="progress-2"></i><i class="progress-3"></i><i class="progress-4"></i><i class="progress-5"></i></span>完成程度</span>
                   <span><i class="is-stage-complete" aria-hidden="true"></i>阶段完成</span>
                   <span><i class="is-focus-record" aria-hidden="true"></i>专注记录</span>
+                  <span><i class="is-supplemented" aria-hidden="true"></i>次日补充</span>
                 </div>
 
                 <div class="history-list-section">
@@ -237,7 +326,7 @@
               <section id="owner-stage-card" class="card stage-card" aria-labelledby="owner-stage-heading">
                 <header class="card-header stage-card-header">
                   <div>
-                    <p class="card-kicker">更长的目标</p>
+                    <p class="card-kicker">阶段目标</p>
                     <h2 id="owner-stage-heading">当前阶段</h2>
                   </div>
                   <span id="owner-stage-status" class="stage-status">未设定</span>
@@ -251,6 +340,7 @@
                     <div><dt>开始</dt><dd id="owner-stage-start">—</dd></div>
                     <div><dt>已进行</dt><dd id="owner-stage-days">—</dd></div>
                   </dl>
+                  <p id="owner-stage-subgoal-summary" class="stage-subgoal-summary">还没有添加子目标</p>
                   <div class="stage-actions">
                     <button id="edit-stage-button" class="button button-quiet button-small" type="button">编辑</button>
                     <button id="complete-stage-button" class="button button-stage button-small" type="button">完成阶段</button>
@@ -319,6 +409,30 @@
                 </form>
               </section>
 
+              <details id="access-tools" class="card data-card access-card">
+                <summary class="data-card-summary">
+                  <div>
+                    <p class="card-kicker">访客连接</p>
+                    <h2 id="access-tools-title">分享预览</h2>
+                  </div>
+                  <span class="data-summary-action">展开</span>
+                </summary>
+                <div class="data-tools-body">
+                  <p class="muted">把识别码发给访客。他们只能查看公开记录，并给你留言。</p>
+                  <div class="viewer-code-box">
+                    <span>当前识别码</span>
+                    <code id="viewer-code-value" aria-live="polite">展开后载入</code>
+                  </div>
+                  <p id="viewer-code-connections" class="field-help">—</p>
+                  <div class="data-actions access-actions">
+                    <button id="copy-viewer-code" class="button button-secondary button-block" type="button" disabled>复制识别码</button>
+                    <button id="open-refresh-viewer-code" class="button button-quiet button-block" type="button" disabled>刷新识别码</button>
+                  </div>
+                  <div id="viewer-code-message" class="form-message" role="status" aria-live="polite" hidden></div>
+                  <p class="data-footnote">刷新后，所有使用旧识别码建立的访客连接会立即失效。</p>
+                </div>
+              </details>
+
               <details id="data-tools" class="card data-card">
                 <summary class="data-card-summary">
                   <div>
@@ -335,9 +449,24 @@
                   </div>
                   <div class="data-actions">
                     <button id="import-legacy-data" class="button button-secondary button-block" type="button" data-action="import-legacy">迁移本机旧记录</button>
-                    <a id="export-data" class="button button-quiet button-block" href="/api/export" download data-action="export">导出文字与索引</a>
+                    <button id="export-data" class="button button-quiet button-block" type="button" data-action="export">导出文字与索引</button>
                   </div>
                   <p class="data-footnote">JSON 不重复打包照片和文件本体；它们仍只保存在服务器。迁移不会覆盖现有任务。</p>
+                </div>
+              </details>
+
+              <details id="workspace-danger-zone" class="card data-card danger-zone-card" hidden>
+                <summary class="data-card-summary">
+                  <div>
+                    <p class="card-kicker">端设置</p>
+                    <h2>危险操作</h2>
+                  </div>
+                  <span class="data-summary-action">展开</span>
+                </summary>
+                <div class="data-tools-body">
+                  <p class="muted">删除后，管理账号、任务、阶段、附件、留言和访客连接都会一并清除，无法恢复。</p>
+                  <button id="open-delete-own-space" class="button button-danger button-block" type="button">删除此管理端</button>
+                  <p class="data-footnote">为防止误触，下一步需要完整输入包含端名的确认句。</p>
                 </div>
               </details>
             </aside>
@@ -345,9 +474,9 @@
         </section>
 
         <section id="visitor-view" class="dashboard-view visitor-view" data-view="visitor" aria-labelledby="visitor-page-title" hidden>
-          <div class="visitor-heading visitor-heading-with-mascot">
+          <div id="visitor-heading" class="visitor-heading visitor-heading-with-mascot">
             <div class="visitor-heading-copy">
-              <p id="visitor-date-label" class="eyebrow">BLUE <span class="visitor-readonly-label">只读记录</span></p>
+              <p id="visitor-date-label" class="eyebrow"><span id="visitor-product-tag" class="product-tag">Blue Day1</span><span id="visitor-record-kicker" hidden>公开轨迹</span><span class="visitor-readonly-label">只读记录</span></p>
               <h1 id="visitor-page-title">Blue 的每日记录</h1>
               <p id="visitor-context-line">沿着今天留下的轨迹，看看事情正走到哪里。</p>
             </div>
@@ -355,6 +484,21 @@
               <img src="/static/blue-mascot.png" alt="">
             </figure>
           </div>
+
+          <section id="visitor-goal-banner" class="goal-banner goal-banner-readonly" data-goal-color="mist" aria-labelledby="visitor-goal-title" hidden>
+            <div class="goal-banner-main">
+              <p class="goal-banner-kicker">长期方向</p>
+              <h2 id="visitor-goal-title">—</h2>
+              <p id="visitor-goal-description" class="goal-banner-description"></p>
+              <p id="visitor-goal-next" class="goal-banner-next" hidden><span>下一步</span><strong>—</strong></p>
+              <div class="goal-banner-actions"><button id="visitor-goal-route" class="text-button" type="button">查看路线</button></div>
+            </div>
+            <div class="goal-banner-progress">
+              <div class="goal-banner-progress-heading"><span>长期进度</span><strong id="visitor-goal-percent">0%</strong></div>
+              <div id="visitor-goal-progressbar" class="goal-progress-track" role="progressbar" aria-label="长期目标进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+              <p id="visitor-goal-stage">—</p>
+            </div>
+          </section>
 
           <div class="visitor-layout">
             <article id="visitor-today-task" class="card task-card visitor-task-card" data-task-scope="visitor-today">
@@ -383,7 +527,7 @@
             <section id="visitor-stage-card" class="card stage-card visitor-stage-card" aria-labelledby="visitor-stage-heading">
               <header class="card-header stage-card-header">
                 <div>
-                  <p class="card-kicker">更长的目标</p>
+                  <p class="card-kicker">阶段目标</p>
                   <h2 id="visitor-stage-heading">当前阶段</h2>
                 </div>
                 <span id="visitor-stage-status" class="stage-status">未设定</span>
@@ -396,6 +540,7 @@
                   <div><dt>开始</dt><dd id="visitor-stage-start">—</dd></div>
                   <div><dt>已进行</dt><dd id="visitor-stage-days">—</dd></div>
                 </dl>
+                <p id="visitor-stage-subgoal-summary" class="stage-subgoal-summary">还没有添加子目标</p>
               </div>
               <div id="visitor-stage-empty" class="stage-empty stage-empty-readonly">
                 <p><strong>目前没有进行中的阶段</strong></p>
@@ -434,6 +579,7 @@
                 <span class="heatmap-scale"><span class="heatmap-scale-swatches" aria-hidden="true"><i class="progress-0"></i><i class="progress-1"></i><i class="progress-2"></i><i class="progress-3"></i><i class="progress-4"></i><i class="progress-5"></i></span>完成程度</span>
                 <span><i class="is-stage-complete" aria-hidden="true"></i>阶段完成</span>
                 <span><i class="is-focus-record" aria-hidden="true"></i>专注记录</span>
+                <span><i class="is-supplemented" aria-hidden="true"></i>次日补充</span>
               </div>
 
               <ol id="visitor-history-list" class="history-list visitor-history-list" data-history-list="visitor">
@@ -443,11 +589,128 @@
             </section>
           </div>
         </section>
+
+        <section id="platform-view" class="dashboard-view platform-view" data-view="platform" aria-labelledby="platform-page-title" hidden>
+          <div class="page-heading platform-heading">
+            <div>
+              <p class="eyebrow">BLUE · 平台只读治理</p>
+              <h1 id="platform-page-title">平台概览</h1>
+              <p class="page-heading-copy">查看管理端与登录用户；他人的记录只能以访客视角预览。</p>
+            </div>
+            <button id="create-manager-invite" class="button button-primary" type="button">生成管理邀请码</button>
+          </div>
+
+          <div id="platform-message" class="page-message" role="status" aria-live="polite" hidden></div>
+
+          <section class="platform-metrics" aria-label="平台统计">
+            <article class="platform-metric"><span>管理端</span><strong id="platform-space-count">—</strong></article>
+            <article class="platform-metric"><span>登录用户</span><strong id="platform-user-count">—</strong></article>
+            <article class="platform-metric"><span>访客连接</span><strong id="platform-connection-count">—</strong></article>
+          </section>
+
+          <section class="card platform-card" aria-labelledby="platform-list-title">
+            <header class="card-header platform-card-header">
+              <div>
+                <p class="card-kicker">平台范围</p>
+                <h2 id="platform-list-title">管理端与用户</h2>
+              </div>
+              <div class="platform-tabs" role="tablist" aria-label="平台列表">
+                <button id="platform-spaces-tab" class="platform-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="platform-spaces-panel" data-platform-tab="spaces">管理端</button>
+                <button id="platform-users-tab" class="platform-tab" type="button" role="tab" aria-selected="false" aria-controls="platform-users-panel" data-platform-tab="users">登录用户</button>
+                <button id="platform-access-tab" class="platform-tab" type="button" role="tab" aria-selected="false" aria-controls="platform-access-panel" data-platform-tab="access">访问安全</button>
+              </div>
+            </header>
+            <section id="platform-spaces-panel" class="platform-panel" role="tabpanel" aria-labelledby="platform-spaces-tab">
+              <div id="platform-spaces-list" class="platform-list">
+                <p class="history-empty">正在载入管理端…</p>
+              </div>
+            </section>
+            <section id="platform-users-panel" class="platform-panel" role="tabpanel" aria-labelledby="platform-users-tab" hidden>
+              <div id="platform-users-list" class="platform-list">
+                <p class="history-empty">正在载入登录用户…</p>
+              </div>
+            </section>
+            <section id="platform-access-panel" class="platform-panel platform-access-panel" role="tabpanel" aria-labelledby="platform-access-tab" hidden>
+              <div class="platform-access-heading">
+                <div>
+                  <p class="card-kicker">平台范围 · 仅限制访客预览</p>
+                  <h3>访客 IP 与黑名单</h3>
+                  <p>黑名单不会影响 Blue 或管理者后台；共享同一网络的访客可能会一起受限。</p>
+                </div>
+                <button id="open-manual-ip-block" class="button button-secondary button-small" type="button">手动添加 IP</button>
+              </div>
+              <div class="platform-access-grid">
+                <section aria-labelledby="platform-recent-visitors-title">
+                  <header class="platform-access-section-heading">
+                    <h4 id="platform-recent-visitors-title">最近访问</h4>
+                    <span>最多显示 100 条</span>
+                  </header>
+                  <div id="platform-visitor-ip-list" class="platform-security-list">
+                    <p class="history-empty">正在载入访客地址…</p>
+                  </div>
+                </section>
+                <section aria-labelledby="platform-blacklist-title">
+                  <header class="platform-access-section-heading">
+                    <h4 id="platform-blacklist-title">黑名单</h4>
+                    <span id="platform-blacklist-count">0 条</span>
+                  </header>
+                  <div id="platform-ip-block-list" class="platform-security-list">
+                    <p class="history-empty">黑名单为空。</p>
+                  </div>
+                </section>
+              </div>
+            </section>
+          </section>
+        </section>
+
+        <section id="connection-lost-view" class="dashboard-view connection-lost-view" data-view="connection-lost" aria-labelledby="connection-lost-title" hidden>
+          <article class="card connection-lost-card">
+            <span id="connection-lost-mark" class="connection-lost-mark" aria-hidden="true">×</span>
+            <p id="connection-lost-kicker" class="eyebrow">BlueDay1 · 预览连接</p>
+            <h1 id="connection-lost-title">这个预览连接已失效</h1>
+            <p id="connection-lost-reason">管理者已经刷新识别码。你的账号和其他已连接的端不受影响，请向管理者获取新的识别码。</p>
+            <div class="connection-lost-actions">
+              <button id="connection-lost-primary" class="button button-primary" type="button">输入新识别码</button>
+              <button id="switch-after-connection-lost" class="button button-quiet" type="button">切换其他端</button>
+            </div>
+          </article>
+        </section>
       </main>
 
       <footer class="site-footer">
-        <p>Blue <span aria-hidden="true">·</span> 看清下一步，安静地继续</p>
+        <p><span id="footer-workspace-name">Blue</span> <span aria-hidden="true">·</span> 看清下一步，安静地继续</p>
       </footer>
+
+      <aside id="message-widget" class="message-widget" aria-label="留言" hidden>
+        <section id="message-panel" class="message-panel" aria-labelledby="message-panel-title" hidden>
+          <header class="message-panel-header">
+            <div>
+              <p class="card-kicker">当前端</p>
+              <h2 id="message-panel-title">留言</h2>
+            </div>
+            <button id="close-message-panel" class="dialog-close" type="button" aria-label="收起留言">×</button>
+          </header>
+          <div id="message-window-status" class="message-window-status">
+            <span class="message-window-dot" aria-hidden="true"></span>
+            <p><strong id="message-window-label">正在确认回复时段</strong><small id="message-window-copy">请稍候…</small></p>
+          </div>
+          <div id="message-panel-message" class="form-message" role="status" aria-live="polite" hidden></div>
+          <div id="message-conversation-list" class="message-conversation-list" hidden></div>
+          <div id="message-thread" class="message-thread" aria-live="polite">
+            <p class="message-empty">这里会安静地保存你与管理端之间的留言。</p>
+          </div>
+          <form id="message-form" class="message-compose" novalidate>
+            <label id="message-compose-label" class="visually-hidden" for="message-input">写下留言</label>
+            <textarea id="message-input" name="body" rows="2" maxlength="1000" placeholder="写下一句话…" required></textarea>
+            <button id="send-message-button" class="button button-primary" type="submit" data-loading-label="发送中…">发送</button>
+          </form>
+        </section>
+        <button id="message-toggle" class="message-toggle" type="button" aria-expanded="false" aria-controls="message-panel">
+          <span class="message-toggle-mark" aria-hidden="true"></span>
+          <span id="message-toggle-label">留言</span>
+          <span id="message-unread-count" class="message-unread-count" hidden>0</span>
+        </button>
+      </aside>
     </section>
   </div>
 
@@ -579,6 +842,71 @@
     </form>
   </dialog>
 
+  <dialog id="goal-route-dialog" class="dialog goal-route-drawer" aria-labelledby="goal-route-title">
+    <article class="goal-route-shell">
+      <header class="dialog-header goal-route-header">
+        <div><p class="card-kicker">长期方向</p><h2 id="goal-route-title">目标路线</h2><p class="dialog-description">从最终方向，走到当前这一小步。</p></div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="goal-route-dialog">×</button>
+      </header>
+      <div class="goal-route-progress">
+        <div><span>长期进度</span><strong id="goal-route-percent">0%</strong></div>
+        <div id="goal-route-progressbar" class="goal-progress-track" role="progressbar" aria-label="长期目标进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+        <p id="goal-route-allocation">—</p>
+      </div>
+      <section class="goal-route-goal" aria-labelledby="goal-route-goal-title">
+        <p class="goal-route-label">长期目标</p>
+        <h3 id="goal-route-goal-title">—</h3>
+        <p id="goal-route-goal-description"></p>
+      </section>
+      <section class="goal-route-stages-section" aria-labelledby="goal-route-stages-title">
+        <div class="goal-route-section-heading"><div><p class="goal-route-label">阶段路线</p><h3 id="goal-route-stages-title">从方向到行动</h3></div><button id="goal-route-stage-button" class="button button-secondary button-small" type="button" hidden>开始新阶段</button></div>
+        <ol id="goal-route-stages" class="goal-route-stages"><li class="goal-route-empty">完成的阶段会依次留在这里。</li></ol>
+      </section>
+      <section id="goal-route-current" class="goal-route-current" aria-labelledby="goal-route-current-title" hidden>
+        <div class="goal-route-section-heading"><div><p class="goal-route-label">当前阶段</p><h3 id="goal-route-current-title">—</h3></div><strong id="goal-route-subgoal-count">0/0</strong></div>
+        <div class="goal-route-current-actions" data-goal-owner-only>
+          <button id="goal-route-edit-stage" class="button button-quiet button-small" type="button">编辑阶段</button>
+          <button id="goal-route-complete-stage" class="button button-stage button-small" type="button">完成阶段</button>
+        </div>
+        <ol id="goal-route-subgoals" class="goal-route-subgoals"></ol>
+        <form id="subgoal-form" class="subgoal-form" novalidate data-goal-owner-only>
+          <label class="visually-hidden" for="subgoal-title-input">新的子目标</label>
+          <input id="subgoal-title-input" type="text" maxlength="60" placeholder="添加一个明确的小目标…" required>
+          <button id="add-subgoal-button" class="button button-secondary button-small" type="submit">添加</button>
+          <button id="cancel-subgoal-edit" class="button button-quiet button-small" type="button" hidden>取消</button>
+        </form>
+        <div id="subgoal-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      </section>
+      <div id="goal-route-owner-actions" class="goal-route-owner-actions" hidden>
+        <button id="edit-goal-button" class="button button-quiet" type="button">编辑长期目标</button>
+        <button id="complete-goal-button" class="button button-primary" type="button">完成长期目标</button>
+      </div>
+    </article>
+  </dialog>
+
+  <dialog id="goal-dialog" class="dialog" aria-labelledby="goal-dialog-title">
+    <form id="goal-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div><p class="card-kicker">长期方向</p><h2 id="goal-dialog-title">设定长期目标</h2><p class="dialog-description">写下最终想抵达的位置，阶段会负责把它拆小。</p></div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="goal-dialog">×</button>
+      </header>
+      <input id="goal-id-input" type="hidden">
+      <div class="field"><label for="goal-title-input">目标名称</label><input id="goal-title-input" type="text" maxlength="30" placeholder="例如：高考达到本科线 450 分" required><p class="field-help field-help-end"><span data-character-count="goal-title-input">0</span> / 30</p></div>
+      <div class="field"><label for="goal-description-input">简短描述 <span class="label-optional">可选</span></label><textarea id="goal-description-input" rows="3" maxlength="120" placeholder="写下为什么重要，以及完成时是什么样子…"></textarea><p class="field-help field-help-end"><span data-character-count="goal-description-input">0</span> / 120</p></div>
+      <fieldset class="goal-color-field"><legend>横幅颜色</legend><div class="goal-color-options">
+        <label><input type="radio" name="goalColor" value="mist" checked><span data-color="mist">雾蓝</span></label>
+        <label><input type="radio" name="goalColor" value="sage"><span data-color="sage">沉静绿</span></label>
+        <label><input type="radio" name="goalColor" value="gold"><span data-color="gold">暖金</span></label>
+        <label><input type="radio" name="goalColor" value="violet"><span data-color="violet">柔紫</span></label>
+        <label><input type="radio" name="goalColor" value="clay"><span data-color="clay">砖红</span></label>
+        <label><input type="radio" name="goalColor" value="slate"><span data-color="slate">中性灰</span></label>
+      </div></fieldset>
+      <div id="goal-adopt-stage-field" class="field" hidden><label for="goal-adopt-stage-weight">当前阶段所占比例</label><div class="percent-input"><input id="goal-adopt-stage-weight" type="number" min="1" max="100" value="25" inputmode="numeric"><span>%</span></div><p class="field-help">现有当前阶段会自动归入这个长期目标。</p></div>
+      <div id="goal-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions"><button class="button button-quiet" type="button" data-close-dialog="goal-dialog">取消</button><button id="save-goal-button" class="button button-primary" type="submit" data-loading-label="正在保存…">保存长期目标</button></footer>
+    </form>
+  </dialog>
+
   <dialog id="stage-dialog" class="dialog" aria-labelledby="stage-dialog-title">
     <form id="stage-form" class="dialog-form" method="dialog" novalidate>
       <header class="dialog-header">
@@ -599,6 +927,11 @@
         <label for="stage-description-input">阶段说明 <span class="label-optional">可选</span></label>
         <textarea id="stage-description-input" name="description" rows="5" maxlength="5000" aria-describedby="stage-description-count" placeholder="写下范围、完成标准或想提醒自己的事…"></textarea>
         <p id="stage-description-count" class="field-help field-help-end"><span data-character-count="stage-description-input">0</span> / 5000</p>
+      </div>
+      <div id="stage-weight-field" class="field" hidden>
+        <label for="stage-weight-input">占长期目标的比例</label>
+        <div class="percent-input"><input id="stage-weight-input" name="weightPercent" type="number" min="1" max="100" value="25" inputmode="numeric" required><span>%</span></div>
+        <p id="stage-weight-help" class="field-help">阶段完成后，这一比例才会计入长期进度。</p>
       </div>
       <div id="stage-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
       <footer class="dialog-actions">
@@ -707,7 +1040,7 @@
           <section id="record-progress-section" class="record-progress-section" aria-labelledby="record-progress-title" hidden>
             <header class="record-progress-heading">
               <div>
-                <p class="card-kicker">当天轨迹</p>
+                <p class="card-kicker">进度轨迹</p>
                 <h4 id="record-progress-title">进度记录</h4>
               </div>
               <span id="record-progress-count" class="record-duration">0 次更新</span>
@@ -803,6 +1136,136 @@
       <footer class="dialog-actions">
         <button id="confirm-cancel" class="button button-quiet" type="button" data-close-dialog="confirm-dialog">取消</button>
         <button id="confirm-submit" class="button button-danger" type="submit">确认</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="connect-space-dialog" class="dialog dialog-compact" aria-labelledby="connect-space-title">
+    <form id="connect-space-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">预览连接</p>
+          <h2 id="connect-space-title">连接一个 Day1</h2>
+          <p class="dialog-description">输入管理者给你的预览识别码。</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="connect-space-dialog">×</button>
+      </header>
+      <div class="field">
+        <label for="connect-space-code">预览识别码</label>
+        <input id="connect-space-code" name="viewerCode" type="text" inputmode="text" autocomplete="off" maxlength="128" spellcheck="false" placeholder="粘贴识别码" required>
+      </div>
+      <div id="connect-space-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="connect-space-dialog">取消</button>
+        <button id="connect-space-submit" class="button button-primary" type="submit" data-loading-label="正在连接…">连接预览端</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="refresh-viewer-code-dialog" class="dialog dialog-compact" aria-labelledby="refresh-viewer-code-title">
+    <form id="refresh-viewer-code-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">访客连接</p>
+          <h2 id="refresh-viewer-code-title">刷新预览识别码</h2>
+          <p class="dialog-description">刷新后，使用旧识别码连接的访客会立即失去访问权限。</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="refresh-viewer-code-dialog">×</button>
+      </header>
+      <div class="notice notice-warning">
+        <span class="notice-icon" aria-hidden="true">!</span>
+        <p><strong id="refresh-viewer-code-impact">将断开所有现有访客连接</strong><br>这不会删除访客账号或他们连接的其他端。</p>
+      </div>
+      <div class="field">
+        <label for="refresh-viewer-code-confirmation">请输入下方整句以继续</label>
+        <p id="refresh-viewer-code-phrase" class="confirmation-phrase">我确认刷新并知道会断开所有访客端连接</p>
+        <input id="refresh-viewer-code-confirmation" name="confirmation" type="text" autocomplete="off" maxlength="80" aria-describedby="refresh-viewer-code-phrase" placeholder="完整输入确认句" required>
+      </div>
+      <div id="refresh-viewer-code-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="refresh-viewer-code-dialog">取消</button>
+        <button id="refresh-viewer-code-submit" class="button button-danger" type="submit" data-loading-label="正在刷新…" disabled>刷新并断开连接</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="delete-space-dialog" class="dialog dialog-compact" aria-labelledby="delete-space-title">
+    <form id="delete-space-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">不可撤销</p>
+          <h2 id="delete-space-title">删除管理端</h2>
+          <p class="dialog-description">正在删除：<strong id="delete-space-name">—</strong></p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="delete-space-dialog">×</button>
+      </header>
+      <div class="notice notice-danger">
+        <span class="notice-icon" aria-hidden="true">!</span>
+        <p><strong>管理账号和整个端都会永久删除</strong><br>任务、阶段、进度、附件、留言、访客连接及登录会话都会一并清除。</p>
+      </div>
+      <div class="field">
+        <label for="delete-space-confirmation">请输入下方整句以继续</label>
+        <p id="delete-space-phrase" class="confirmation-phrase">—</p>
+        <input id="delete-space-confirmation" name="confirmation" type="text" autocomplete="off" maxlength="120" aria-describedby="delete-space-phrase" placeholder="完整输入确认句" required>
+      </div>
+      <div id="delete-space-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="delete-space-dialog">取消</button>
+        <button id="delete-space-submit" class="button button-danger" type="submit" data-loading-label="正在删除…" disabled>永久删除管理端</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="ip-block-dialog" class="dialog dialog-compact" aria-labelledby="ip-block-title">
+    <form id="ip-block-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">访问安全</p>
+          <h2 id="ip-block-title">加入访客黑名单</h2>
+          <p class="dialog-description">该地址将无法进入任何访客预览，但不会影响管理端后台。</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="ip-block-dialog">×</button>
+      </header>
+      <div class="notice notice-warning">
+        <span class="notice-icon" aria-hidden="true">!</span>
+        <p><strong>共享网络可能包含多位访客</strong><br>学校、宿舍或家庭网络中的其他访客也可能一起受限。</p>
+      </div>
+      <div class="field">
+        <label for="ip-block-address">IPv4 或 IPv6 地址</label>
+        <input id="ip-block-address" name="ip" type="text" inputmode="text" autocomplete="off" maxlength="64" spellcheck="false" placeholder="例如 203.0.113.10" required>
+      </div>
+      <div class="field">
+        <label for="ip-block-note">备注 <span>可选</span></label>
+        <input id="ip-block-note" name="note" type="text" autocomplete="off" maxlength="120" placeholder="例如：重复发送无关留言">
+      </div>
+      <div id="ip-block-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="ip-block-dialog">取消</button>
+        <button id="ip-block-submit" class="button button-danger" type="submit" data-loading-label="正在加入…">加入黑名单</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="manager-invite-dialog" class="dialog dialog-compact" aria-labelledby="manager-invite-title">
+    <form id="manager-invite-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">Blue 平台</p>
+          <h2 id="manager-invite-title">生成管理邀请码</h2>
+          <p class="dialog-description">邀请码用于注册一个独立管理端。</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="manager-invite-dialog">×</button>
+      </header>
+      <div id="manager-invite-result" class="invite-result" hidden>
+        <span>新管理邀请码</span>
+        <code id="manager-invite-code">—</code>
+        <button id="copy-manager-invite" class="button button-secondary button-block" type="button">复制邀请码</button>
+      </div>
+      <p id="manager-invite-empty" class="muted">生成后请通过安全方式交给受邀者。</p>
+      <div id="manager-invite-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="manager-invite-dialog">关闭</button>
+        <button id="generate-manager-invite" class="button button-primary" type="submit" data-loading-label="正在生成…">生成邀请码</button>
       </footer>
     </form>
   </dialog>

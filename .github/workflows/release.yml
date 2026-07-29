@@ -32,7 +32,14 @@ jobs:
 
       - name: Run integration tests
         shell: bash
-        run: python -m unittest discover -s tests -p "test_app.py" -v
+        run: python -m unittest discover -s tests -p "test*.py" -v
+
+      - name: Check release notes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -s RELEASE_NOTES.md
+          grep -Fq "# Day1" RELEASE_NOTES.md
 
       - name: Choose version number
         shell: bash
@@ -61,4 +68,4 @@ jobs:
           gh release create "${TAG_NAME}" \
             --target "${GITHUB_SHA}" \
             --title "Day1 ${TAG_NAME}" \
-            --generate-notes
+            --notes-file RELEASE_NOTES.md

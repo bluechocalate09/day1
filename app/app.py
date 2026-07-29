@@ -1,12 +1,15 @@
 import argparse
+import base64
 import csv
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -15,10 +18,12 @@ import uuid
 import warnings
 import zipfile
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, g, jsonify, request, send_file
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -29,8 +34,11 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DAILY_SEAL_DATA_DIR", BASE_DIR / "data"))
 DB_PATH = DATA_DIR / "daily-seal.db"
 UPLOAD_DIR = DATA_DIR / "uploads"
+SPACES_DIR = DATA_DIR / "spaces"
+SPACE_TRASH_DIR = SPACES_DIR / ".trash"
 COOKIE_SECURE = os.environ.get("DAILY_SEAL_COOKIE_SECURE", "1") != "0"
 REGISTRATION_ENABLED = os.environ.get("DAILY_SEAL_REGISTRATION_ENABLED", "1") != "0"
+BLUE_ADMIN_EMAIL = os.environ.get("DAILY_SEAL_BLUE_EMAIL", "").strip().lower()
 SESSION_COOKIE = "ds_session"
 CSRF_COOKIE = "ds_csrf"
 SESSION_SECONDS = 7 * 24 * 60 * 60
@@ -86,14 +94,104 @@ MAX_STAGE_TITLE_LENGTH = 200
 MAX_STAGE_DESCRIPTION_LENGTH = 5000
 MAX_STAGE_PROOF_TEXT_LENGTH = 1000
 MAX_STAGE_PROOF_URL_LENGTH = 2048
+MAX_GOAL_TITLE_LENGTH = 30
+MAX_GOAL_DESCRIPTION_LENGTH = 120
+MAX_SUBGOAL_TITLE_LENGTH = 60
+GOAL_COLOR_KEYS = {"mist", "sage", "gold", "violet", "clay", "slate"}
 MAX_TASK_RESULT_NOTE_LENGTH = 1000
 MAX_TASK_PROGRESS_NOTE_LENGTH = 1000
+MAX_DISPLAY_NAME_LENGTH = 40
+MAX_SPACE_NAME_LENGTH = 60
+MAX_MESSAGE_LENGTH = 1000
+MAX_IP_BLOCK_NOTE_LENGTH = 120
 MAX_ORIGINAL_FILENAME_BYTES = 240
 MAX_PROOF_IMAGE_PIXELS = 60_000_000
 MAX_NON_JPEG_IMAGE_PIXELS = 20_000_000
+VISITOR_IP_BLOCKED_REASON = (
+    "当前网络地址已被 Blue 平台加入访客黑名单，暂时无法访问预览端。"
+    "这不会影响管理端登录；如有疑问请联系 Blue。"
+)
 Image.MAX_IMAGE_PIXELS = MAX_PROOF_IMAGE_PIXELS
 RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 IMAGE_PROCESS_LOCK = threading.Lock()
+SPACE_LOCKS_GUARD = threading.Lock()
+SPACE_LIFECYCLE_GATES = {}
+
+
+class SpaceLifecycleGate:
+    """Allow concurrent requests while giving workspace deletion exclusivity."""
+
+    def __init__(self):
+        self._condition = threading.Condition(threading.RLock())
+        self._reader_count = 0
+        self._reader_holds = {}
+        self._writer_ident = None
+        self._writer_depth = 0
+        self._waiting_writers = 0
+
+    def acquire_read(self):
+        ident = threading.get_ident()
+        with self._condition:
+            while self._writer_ident is not None or self._waiting_writers:
+                self._condition.wait()
+            self._reader_count += 1
+            self._reader_holds[ident] = self._reader_holds.get(ident, 0) + 1
+
+    def release_read(self):
+        ident = threading.get_ident()
+        with self._condition:
+            holds = self._reader_holds.get(ident, 0)
+            if holds < 1:
+                raise RuntimeError("Workspace read lease is not held")
+            if holds == 1:
+                self._reader_holds.pop(ident, None)
+            else:
+                self._reader_holds[ident] = holds - 1
+            self._reader_count -= 1
+            if self._reader_count == 0:
+                self._condition.notify_all()
+
+    def acquire_write(self, upgrade_read=False):
+        ident = threading.get_ident()
+        with self._condition:
+            if self._writer_ident == ident:
+                self._writer_depth += 1
+                return
+            self._waiting_writers += 1
+            try:
+                if upgrade_read:
+                    holds = self._reader_holds.get(ident, 0)
+                    if holds != 1:
+                        raise RuntimeError(
+                            "Workspace read lease cannot be upgraded"
+                        )
+                    self._reader_holds.pop(ident, None)
+                    self._reader_count -= 1
+                    self._condition.notify_all()
+                while self._writer_ident is not None or self._reader_count:
+                    self._condition.wait()
+                self._writer_ident = ident
+                self._writer_depth = 1
+            finally:
+                self._waiting_writers -= 1
+
+    def release_write(self):
+        ident = threading.get_ident()
+        with self._condition:
+            if self._writer_ident != ident or self._writer_depth < 1:
+                raise RuntimeError("Workspace write lease is not held")
+            self._writer_depth -= 1
+            if self._writer_depth == 0:
+                self._writer_ident = None
+                self._condition.notify_all()
+
+    @contextmanager
+    def write(self, upgrade_read=False):
+        self.acquire_write(upgrade_read=upgrade_read)
+        try:
+            yield
+        finally:
+            self.release_write()
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
@@ -101,13 +199,16 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config.update(MAX_CONTENT_LENGTH=12 * 1024 * 1024, JSON_AS_ASCII=False)
 
 
-SCHEMA = """
+PLATFORM_SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('owner', 'viewer')),
+    display_name TEXT NOT NULL DEFAULT '',
+    is_platform_admin INTEGER NOT NULL DEFAULT 0
+        CHECK (is_platform_admin IN (0, 1)),
     must_change_password INTEGER NOT NULL DEFAULT 0 CHECK (must_change_password IN (0, 1)),
     created_at INTEGER NOT NULL,
     last_login_at INTEGER
@@ -119,7 +220,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL,
-    user_agent_hash TEXT NOT NULL
+    user_agent_hash TEXT NOT NULL,
+    client_ip TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
@@ -132,6 +234,94 @@ CREATE TABLE IF NOT EXISTS auth_events (
     success INTEGER NOT NULL CHECK (success IN (0, 1))
 );
 CREATE INDEX IF NOT EXISTS idx_auth_events_lookup ON auth_events(kind, ip, email, occurred_at);
+CREATE TABLE IF NOT EXISTS platform_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS spaces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    public_id TEXT NOT NULL UNIQUE,
+    owner_user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    storage_key TEXT NOT NULL UNIQUE,
+    viewer_secret TEXT NOT NULL,
+    viewer_code_version INTEGER NOT NULL DEFAULT 1
+        CHECK (viewer_code_version >= 1),
+    viewer_code_hash TEXT NOT NULL UNIQUE,
+    mascot_enabled INTEGER NOT NULL DEFAULT 1
+        CHECK (mascot_enabled IN (0, 1)),
+    is_blue_space INTEGER NOT NULL DEFAULT 0
+        CHECK (is_blue_space IN (0, 1)),
+    status TEXT NOT NULL DEFAULT 'ready'
+        CHECK (status IN ('provisioning', 'ready')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_spaces_single_blue
+    ON spaces(is_blue_space) WHERE is_blue_space = 1;
+CREATE INDEX IF NOT EXISTS idx_spaces_status ON spaces(status, id);
+CREATE TABLE IF NOT EXISTS manager_invites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_hash TEXT NOT NULL UNIQUE,
+    code_hint TEXT NOT NULL,
+    created_by_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER,
+    used_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_manager_invites_status
+    ON manager_invites(expires_at, used_at, revoked_at);
+CREATE TABLE IF NOT EXISTS viewer_connections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    space_id INTEGER NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+    code_version INTEGER NOT NULL CHECK (code_version >= 1),
+    connected_at INTEGER NOT NULL,
+    last_ip TEXT NOT NULL DEFAULT '',
+    last_seen_at INTEGER,
+    revoked_at INTEGER,
+    revoked_reason TEXT,
+    UNIQUE(user_id, space_id)
+);
+CREATE INDEX IF NOT EXISTS idx_viewer_connections_space
+    ON viewer_connections(space_id, revoked_at, user_id);
+CREATE TABLE IF NOT EXISTS ip_blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip TEXT NOT NULL UNIQUE,
+    note TEXT NOT NULL DEFAULT '',
+    created_by_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ip_blocks_created
+    ON ip_blocks(created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS space_deletion_jobs (
+    job_id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    quarantine_name TEXT NOT NULL,
+    owner_user_id INTEGER NOT NULL,
+    owner_email TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_error TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    space_id INTEGER NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+    visitor_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sender_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sender_kind TEXT NOT NULL CHECK (sender_kind IN ('visitor', 'manager')),
+    body TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND 1000),
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation
+    ON messages(space_id, visitor_user_id, created_at, id);
+"""
+
+
+CONTENT_SCHEMA = """
+PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS tasks (
     task_date TEXT PRIMARY KEY,
     text TEXT NOT NULL,
@@ -145,6 +335,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     result_version INTEGER NOT NULL DEFAULT 0 CHECK (result_version >= 0),
     result_confirmed_progress_id INTEGER
         CHECK (result_confirmed_progress_id IS NULL OR result_confirmed_progress_id >= 0),
+    result_locked_at INTEGER,
+    result_lock_source TEXT
+        CHECK (result_lock_source IS NULL OR result_lock_source IN ('recorded', 'automatic')),
     created_at INTEGER NOT NULL,
     completed_at INTEGER,
     proof_text TEXT,
@@ -161,6 +354,7 @@ CREATE TABLE IF NOT EXISTS task_progress (
     note TEXT NOT NULL DEFAULT '' CHECK (length(note) <= 1000),
     progress_percent INTEGER NOT NULL
         CHECK (progress_percent >= 0 AND progress_percent <= 100),
+    record_date TEXT,
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task_progress_date
@@ -211,8 +405,31 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     distractions TEXT NOT NULL DEFAULT '',
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS long_term_goals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 30),
+    description TEXT NOT NULL DEFAULT '' CHECK (length(description) <= 120),
+    color_key TEXT NOT NULL DEFAULT 'mist'
+        CHECK (color_key IN ('mist', 'sage', 'gold', 'violet', 'clay', 'slate')),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
+    started_at INTEGER NOT NULL,
+    started_date TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    completed_date TEXT,
+    CHECK (
+        (status = 'active' AND completed_at IS NULL AND completed_date IS NULL)
+        OR
+        (status = 'completed' AND completed_at IS NOT NULL AND completed_date IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_long_term_goals_single_active
+    ON long_term_goals(status) WHERE status = 'active';
 CREATE TABLE IF NOT EXISTS stages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id INTEGER REFERENCES long_term_goals(id) ON DELETE SET NULL,
+    weight_percent INTEGER
+        CHECK (weight_percent IS NULL OR (weight_percent >= 1 AND weight_percent <= 100)),
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
@@ -237,7 +454,28 @@ CREATE TABLE IF NOT EXISTS stages (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_stages_single_active
     ON stages(status) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_stages_completed_date ON stages(completed_date);
+CREATE TABLE IF NOT EXISTS stage_subgoals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage_id INTEGER NOT NULL REFERENCES stages(id) ON DELETE CASCADE,
+    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 60),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    CHECK (
+        (status = 'pending' AND completed_at IS NULL)
+        OR
+        (status = 'completed' AND completed_at IS NOT NULL)
+    ),
+    UNIQUE(stage_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_stage_subgoals_stage
+    ON stage_subgoals(stage_id, position, id);
 """
+
+
+SCHEMA = PLATFORM_SCHEMA + CONTENT_SCHEMA
 
 
 def now_ts():
@@ -250,28 +488,177 @@ def utc_iso(timestamp):
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="seconds")
 
 
-def business_today_key():
-    """Daily Seal follows China Standard Time regardless of server location."""
-    return (datetime.now(timezone.utc) + timedelta(hours=8)).date().isoformat()
+CHINA_STANDARD_TIME = timezone(timedelta(hours=8), "CST")
+
+
+def business_today_key(task_date_hint=None):
+    """Return Day1's date in China Standard Time.
+
+    Tests and maintenance jobs may inject a deterministic date provider through
+    Flask config. Production ignores ``task_date_hint`` and follows Beijing time.
+    """
+    provider = app.config.get("BUSINESS_DATE_PROVIDER")
+    if callable(provider):
+        provided = provider(task_date_hint)
+        try:
+            parsed = date.fromisoformat(provided)
+        except (TypeError, ValueError):
+            raise RuntimeError("BUSINESS_DATE_PROVIDER returned an invalid date")
+        if not 2020 <= parsed.year <= 2100:
+            raise RuntimeError("BUSINESS_DATE_PROVIDER returned an invalid date")
+        return parsed.isoformat()
+    return datetime.fromtimestamp(now_ts(), CHINA_STANDARD_TIME).date().isoformat()
+
+
+def business_date_for_timestamp(timestamp):
+    return datetime.fromtimestamp(timestamp, CHINA_STANDARD_TIME).date().isoformat()
+
+
+def task_deadline_timestamp(task_date):
+    next_date = date.fromisoformat(task_date) + timedelta(days=1)
+    return int(
+        datetime(
+            next_date.year,
+            next_date.month,
+            next_date.day,
+            tzinfo=CHINA_STANDARD_TIME,
+        ).timestamp()
+    )
+
+
+def task_progress_mode(task_date, current_date=None):
+    """Return ``day``, ``supplement`` or ``None`` for a progress write."""
+    current_date = current_date or business_today_key()
+    parsed_task_date = date.fromisoformat(task_date)
+    parsed_current_date = date.fromisoformat(current_date)
+    if parsed_task_date == parsed_current_date:
+        return "day"
+    if parsed_task_date == parsed_current_date - timedelta(days=1):
+        return "supplement"
+    return None
+
+
+def finalize_expired_tasks(database, current_date=None):
+    """Freeze every past task at its Beijing 24:00 snapshot.
+
+    A fresh manually recorded result is retained. If no result was recorded, or
+    same-day progress changed after that result, the latest progress written
+    before midnight determines the frozen percentage. Progress written after
+    midnight is excluded and remains supplemental evidence.
+    """
+    current_date = current_date or business_today_key()
+    rows = database.execute(
+        "SELECT * FROM tasks WHERE task_date < ? AND result_locked_at IS NULL "
+        "ORDER BY task_date",
+        (current_date,),
+    ).fetchall()
+    changed = 0
+    for row in rows:
+        deadline = task_deadline_timestamp(row["task_date"])
+        latest = database.execute(
+            "SELECT id, progress_percent, created_at FROM task_progress "
+            "WHERE task_date = ? "
+            "AND COALESCE(record_date, date(created_at, 'unixepoch', '+8 hours')) <= ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (row["task_date"], row["task_date"]),
+        ).fetchone()
+        latest_id = latest["id"] if latest else 0
+        confirmed_id = row["result_confirmed_progress_id"]
+        result_recorded_at = row["result_recorded_at"]
+        has_recorded_result = row["result_status"] in {"completed", "incomplete"}
+        if isinstance(confirmed_id, int):
+            result_is_stale = bool(latest and latest_id > confirmed_id)
+        else:
+            result_is_stale = bool(
+                latest
+                and result_recorded_at
+                and latest["created_at"] > result_recorded_at
+            )
+
+        if has_recorded_result and not result_is_stale:
+            result_status = row["result_status"]
+            completion_percent = row["completion_percent"]
+            lock_source = "recorded"
+            confirmed_snapshot = confirmed_id if isinstance(confirmed_id, int) else latest_id
+        else:
+            completion_percent = latest["progress_percent"] if latest else 0
+            result_status = "completed" if completion_percent == 100 else "incomplete"
+            lock_source = "automatic"
+            confirmed_snapshot = latest_id
+
+        completion_percent = min(100, max(0, int(completion_percent or 0)))
+        if result_status == "completed":
+            completion_percent = 100
+        elif completion_percent == 100:
+            result_status = "completed"
+        else:
+            result_status = "incomplete"
+        completed_at = row["completed_at"]
+        if result_status == "completed" and not completed_at:
+            completed_at = deadline
+        if result_status != "completed":
+            completed_at = None
+
+        cursor = database.execute(
+            "UPDATE tasks SET done = ?, result_status = ?, completion_percent = ?, "
+            "result_recorded_at = COALESCE(result_recorded_at, ?), "
+            "result_version = result_version + 1, "
+            "result_confirmed_progress_id = ?, result_locked_at = ?, "
+            "result_lock_source = ?, completed_at = ? "
+            "WHERE task_date = ? AND result_locked_at IS NULL",
+            (
+                1 if result_status == "completed" else 0,
+                result_status,
+                completion_percent,
+                deadline,
+                confirmed_snapshot,
+                deadline,
+                lock_source,
+                completed_at,
+                row["task_date"],
+            ),
+        )
+        changed += cursor.rowcount
+    return changed
+
+
+def connect_sqlite(path):
+    connection = sqlite3.connect(str(path), timeout=15)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 15000")
+    return connection
 
 
 def get_db():
     if "db" not in g:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(str(DB_PATH), timeout=15)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 15000")
-        g.db = connection
+        SPACES_DIR.mkdir(parents=True, exist_ok=True)
+        g.db = connect_sqlite(DB_PATH)
     return g.db
+
+
+def space_lifecycle_gate(public_id):
+    """Return the process-local reader/writer gate for one workspace."""
+    if not isinstance(public_id, str) or not public_id:
+        raise RuntimeError("Invalid workspace identifier")
+    with SPACE_LOCKS_GUARD:
+        return SPACE_LIFECYCLE_GATES.setdefault(public_id, SpaceLifecycleGate())
 
 
 @app.teardown_appcontext
 def close_db(_error=None):
+    content_connection = g.pop("content_db", None)
+    if content_connection is not None and content_connection is not g.get("db"):
+        content_connection.close()
     connection = g.pop("db", None)
     if connection is not None:
         connection.close()
+    lifecycle_gate = g.pop("space_lifecycle_gate", None)
+    read_held = g.pop("space_lifecycle_read_held", False)
+    if lifecycle_gate is not None and read_held:
+        lifecycle_gate.release_read()
 
 
 def ensure_column(connection, table, column, definition):
@@ -289,7 +676,9 @@ def ensure_column(connection, table, column, definition):
             raise
 
 
-def backfill_legacy_attachment_metadata(connection, table, key_column):
+def backfill_legacy_attachment_metadata(
+    connection, table, key_column, upload_dir=UPLOAD_DIR
+):
     rows = connection.execute(
         f"SELECT {key_column}, proof_file, proof_mime, proof_original_name, proof_size "
         f"FROM {table} WHERE proof_file IS NOT NULL"
@@ -308,7 +697,7 @@ def backfill_legacy_attachment_metadata(connection, table, key_column):
         size = row[4]
         if size is None:
             try:
-                size = (UPLOAD_DIR / filename).stat().st_size
+                size = (upload_dir / filename).stat().st_size
             except OSError:
                 size = None
         connection.execute(
@@ -320,103 +709,664 @@ def backfill_legacy_attachment_metadata(connection, table, key_column):
         )
 
 
+def migrate_content_schema(connection, upload_dir):
+    """Apply additive content migrations to one isolated Day1 workspace."""
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    connection.executescript(CONTENT_SCHEMA)
+    ensure_column(connection, "tasks", "proof_url", "TEXT")
+    ensure_column(
+        connection,
+        "tasks",
+        "result_status",
+        "TEXT NOT NULL DEFAULT 'pending' "
+        "CHECK (result_status IN ('pending', 'completed', 'incomplete'))",
+    )
+    ensure_column(
+        connection,
+        "tasks",
+        "completion_percent",
+        "INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (completion_percent >= 0 AND completion_percent <= 100)",
+    )
+    ensure_column(connection, "tasks", "result_note", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(connection, "tasks", "result_recorded_at", "INTEGER")
+    ensure_column(
+        connection,
+        "tasks",
+        "result_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    # Legacy rows remain NULL so serialization can infer their historical
+    # result snapshot. New confirmations store an exact progress id.
+    ensure_column(connection, "tasks", "result_confirmed_progress_id", "INTEGER")
+    ensure_column(connection, "tasks", "result_locked_at", "INTEGER")
+    ensure_column(
+        connection,
+        "tasks",
+        "result_lock_source",
+        "TEXT CHECK (result_lock_source IS NULL OR "
+        "result_lock_source IN ('recorded', 'automatic'))",
+    )
+    connection.execute(
+        "UPDATE tasks SET result_version = 0 WHERE result_version IS NULL"
+    )
+    ensure_column(connection, "tasks", "proof_original_name", "TEXT")
+    ensure_column(
+        connection,
+        "tasks",
+        "proof_size",
+        "INTEGER CHECK (proof_size IS NULL OR proof_size >= 0)",
+    )
+    ensure_column(connection, "stages", "proof_original_name", "TEXT")
+    ensure_column(
+        connection,
+        "stages",
+        "proof_size",
+        "INTEGER CHECK (proof_size IS NULL OR proof_size >= 0)",
+    )
+    ensure_column(
+        connection,
+        "stages",
+        "goal_id",
+        "INTEGER REFERENCES long_term_goals(id) ON DELETE SET NULL",
+    )
+    ensure_column(
+        connection,
+        "stages",
+        "weight_percent",
+        "INTEGER CHECK (weight_percent IS NULL OR "
+        "(weight_percent >= 1 AND weight_percent <= 100))",
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stages_goal "
+        "ON stages(goal_id, started_at, id)"
+    )
+    ensure_column(
+        connection,
+        "daily_stats",
+        "distractions",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    ensure_column(connection, "task_progress", "client_key", "TEXT")
+    ensure_column(connection, "task_progress", "record_date", "TEXT")
+    connection.execute(
+        "UPDATE task_progress "
+        "SET record_date = date(created_at, 'unixepoch', '+8 hours') "
+        "WHERE record_date IS NULL"
+    )
+    ensure_column(connection, "task_progress_assets", "client_key", "TEXT")
+    ensure_column(connection, "task_progress_assets", "source_sha256", "TEXT")
+    ensure_column(connection, "task_progress_assets", "source_size", "INTEGER")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_progress_client_key "
+        "ON task_progress(task_date, client_key) WHERE client_key IS NOT NULL"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_progress_assets_client_key "
+        "ON task_progress_assets(progress_id, client_key) WHERE client_key IS NOT NULL"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_progress_assets_source "
+        "ON task_progress_assets(source_sha256, source_size) "
+        "WHERE kind = 'file' AND source_sha256 IS NOT NULL"
+    )
+    connection.execute(
+        "UPDATE tasks SET result_status = 'completed', completion_percent = 100, "
+        "result_note = CASE WHEN result_note = '' THEN COALESCE(proof_text, '') "
+        "ELSE result_note END, "
+        "result_recorded_at = COALESCE(result_recorded_at, completed_at, created_at) "
+        "WHERE done = 1 AND result_status = 'pending'"
+    )
+    backfill_legacy_attachment_metadata(
+        connection, "tasks", "task_date", upload_dir
+    )
+    backfill_legacy_attachment_metadata(connection, "stages", "id", upload_dir)
+    finalize_expired_tasks(connection)
+    connection.commit()
+    cleanup_orphaned_uploads(connection, upload_dir)
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.commit()
+
+
+def normalized_code(value):
+    if not isinstance(value, str):
+        return None
+    code = re.sub(r"\s+", "", value).upper()
+    if not 12 <= len(code) <= 80 or not re.fullmatch(r"[A-Z0-9-]+", code):
+        return None
+    return code
+
+
+def code_hash(value):
+    normalized = normalized_code(value)
+    return hashlib.sha256(normalized.encode("ascii")).hexdigest() if normalized else None
+
+
+def viewer_code_for(secret, version):
+    digest = hmac.new(
+        secret.encode("ascii"),
+        f"blue-day1-viewer:{int(version)}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    body = base64.b32encode(digest[:8]).decode("ascii").rstrip("=")
+    return f"DAY1-{body[:4]}-{body[4:8]}-{body[8:13]}"
+
+
+def new_viewer_secret():
+    return secrets.token_urlsafe(32)
+
+
+def space_storage_paths(space):
+    if bool(space["is_blue_space"]):
+        return DB_PATH, UPLOAD_DIR
+    storage_key = space["storage_key"]
+    if not isinstance(storage_key, str) or not re.fullmatch(r"[a-f0-9]{32}", storage_key):
+        raise RuntimeError("Invalid workspace storage key")
+    root = SPACES_DIR / storage_key
+    return root / "content.db", root / "uploads"
+
+
+def initialize_space_storage(space, require_existing=False):
+    content_path, upload_dir = space_storage_paths(space)
+    if require_existing and not content_path.is_file():
+        raise RuntimeError("Ready workspace content database is missing")
+    content_path.parent.mkdir(parents=True, exist_ok=True)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    connection = connect_sqlite(content_path)
+    try:
+        migrate_content_schema(connection, upload_dir)
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if quick_check != "ok" or foreign_key_errors:
+            raise RuntimeError("Workspace content database integrity check failed")
+    finally:
+        connection.close()
+
+
+def default_display_name(email):
+    local = email.split("@", 1)[0].strip() if isinstance(email, str) else ""
+    return (local or "Day1 用户")[:MAX_DISPLAY_NAME_LENGTH]
+
+
+def ensure_platform_state(connection):
+    """Create the Blue workspace once and snapshot legacy viewers once."""
+    users = connection.execute(
+        "SELECT id, email, display_name FROM users ORDER BY created_at, id"
+    ).fetchall()
+    for user in users:
+        if not (user["display_name"] or "").strip():
+            connection.execute(
+                "UPDATE users SET display_name = ? WHERE id = ?",
+                (default_display_name(user["email"]), user["id"]),
+            )
+
+    blue = connection.execute(
+        "SELECT * FROM spaces WHERE is_blue_space = 1 LIMIT 1"
+    ).fetchone()
+    if not blue:
+        owners = connection.execute(
+            "SELECT id, email FROM users WHERE role = 'owner' "
+            "ORDER BY created_at, id"
+        ).fetchall()
+        if not owners:
+            connection.commit()
+            return None
+        if BLUE_ADMIN_EMAIL:
+            owner = next(
+                (
+                    candidate
+                    for candidate in owners
+                    if candidate["email"].lower() == BLUE_ADMIN_EMAIL
+                ),
+                None,
+            )
+            if owner is None:
+                raise RuntimeError(
+                    "DAILY_SEAL_BLUE_EMAIL does not match an owner account"
+                )
+        elif len(owners) == 1:
+            owner = owners[0]
+        else:
+            raise RuntimeError(
+                "Multiple legacy owners found; set DAILY_SEAL_BLUE_EMAIL before migration"
+            )
+        secret = new_viewer_secret()
+        viewer_code = viewer_code_for(secret, 1)
+        current = now_ts()
+        public_id = secrets.token_urlsafe(12)
+        connection.execute(
+            "UPDATE users SET is_platform_admin = 1, display_name = 'Blue' "
+            "WHERE id = ?",
+            (owner["id"],),
+        )
+        connection.execute(
+            "INSERT INTO spaces("
+            "public_id, owner_user_id, name, storage_key, viewer_secret, "
+            "viewer_code_version, viewer_code_hash, mascot_enabled, is_blue_space, "
+            "status, created_at, updated_at"
+            ") VALUES (?, ?, 'Blue', 'blue', ?, 1, ?, 1, 1, 'ready', ?, ?)",
+            (
+                public_id,
+                owner["id"],
+                secret,
+                code_hash(viewer_code),
+                current,
+                current,
+            ),
+        )
+        blue = connection.execute(
+            "SELECT * FROM spaces WHERE is_blue_space = 1"
+        ).fetchone()
+    else:
+        connection.execute(
+            "UPDATE users SET is_platform_admin = 1 WHERE id = ?",
+            (blue["owner_user_id"],),
+        )
+
+    migrated = connection.execute(
+        "SELECT 1 FROM platform_meta WHERE key = 'legacy_viewer_connections_v1'"
+    ).fetchone()
+    if not migrated:
+        connection.execute(
+            "INSERT OR IGNORE INTO viewer_connections("
+            "user_id, space_id, code_version, connected_at, last_seen_at"
+            ") SELECT id, ?, ?, ?, ? FROM users WHERE role = 'viewer'",
+            (
+                blue["id"],
+                blue["viewer_code_version"],
+                now_ts(),
+                now_ts(),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO platform_meta(key, value) "
+            "VALUES ('legacy_viewer_connections_v1', ?)",
+            (str(now_ts()),),
+        )
+    connection.commit()
+    return blue
+
+
 def init_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(DB_PATH), timeout=15)
+    SPACES_DIR.mkdir(parents=True, exist_ok=True)
+    connection = connect_sqlite(DB_PATH)
     try:
-        connection.execute("PRAGMA busy_timeout = 15000")
-        connection.executescript(SCHEMA)
-        ensure_column(connection, "tasks", "proof_url", "TEXT")
+        connection.executescript(PLATFORM_SCHEMA)
+        ensure_column(connection, "users", "display_name", "TEXT NOT NULL DEFAULT ''")
         ensure_column(
             connection,
-            "tasks",
-            "result_status",
-            "TEXT NOT NULL DEFAULT 'pending' "
-            "CHECK (result_status IN ('pending', 'completed', 'incomplete'))",
-        )
-        ensure_column(
-            connection,
-            "tasks",
-            "completion_percent",
+            "users",
+            "is_platform_admin",
             "INTEGER NOT NULL DEFAULT 0 "
-            "CHECK (completion_percent >= 0 AND completion_percent <= 100)",
+            "CHECK (is_platform_admin IN (0, 1))",
         )
-        ensure_column(connection, "tasks", "result_note", "TEXT NOT NULL DEFAULT ''")
-        ensure_column(connection, "tasks", "result_recorded_at", "INTEGER")
         ensure_column(
             connection,
-            "tasks",
-            "result_version",
-            "INTEGER NOT NULL DEFAULT 0",
+            "sessions",
+            "client_ip",
+            "TEXT NOT NULL DEFAULT ''",
         )
-        # Keep legacy rows NULL so serialization can use their historical
-        # timestamp relationship. Every new result confirmation stores an
-        # exact progress-id snapshot (0 means there was no progress yet).
         ensure_column(
             connection,
-            "tasks",
-            "result_confirmed_progress_id",
+            "viewer_connections",
+            "last_ip",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        ensure_column(
+            connection,
+            "viewer_connections",
+            "last_seen_at",
             "INTEGER",
         )
         connection.execute(
-            "UPDATE tasks SET result_version = 0 WHERE result_version IS NULL"
-        )
-        ensure_column(connection, "tasks", "proof_original_name", "TEXT")
-        ensure_column(
-            connection,
-            "tasks",
-            "proof_size",
-            "INTEGER CHECK (proof_size IS NULL OR proof_size >= 0)",
-        )
-        ensure_column(connection, "stages", "proof_original_name", "TEXT")
-        ensure_column(
-            connection,
-            "stages",
-            "proof_size",
-            "INTEGER CHECK (proof_size IS NULL OR proof_size >= 0)",
-        )
-        ensure_column(
-            connection,
-            "daily_stats",
-            "distractions",
-            "TEXT NOT NULL DEFAULT ''",
-        )
-        # These columns were added after the timeline tables first shipped.
-        # Build their indexes only after additive migration so an older live
-        # database can start without SCHEMA referring to a missing column.
-        ensure_column(connection, "task_progress", "client_key", "TEXT")
-        ensure_column(connection, "task_progress_assets", "client_key", "TEXT")
-        ensure_column(connection, "task_progress_assets", "source_sha256", "TEXT")
-        ensure_column(connection, "task_progress_assets", "source_size", "INTEGER")
-        connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_progress_client_key "
-            "ON task_progress(task_date, client_key) WHERE client_key IS NOT NULL"
+            "UPDATE viewer_connections SET last_seen_at = connected_at "
+            "WHERE last_seen_at IS NULL"
         )
         connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_progress_assets_client_key "
-            "ON task_progress_assets(progress_id, client_key) WHERE client_key IS NOT NULL"
+            "CREATE INDEX IF NOT EXISTS idx_viewer_connections_ip "
+            "ON viewer_connections(last_ip, last_seen_at DESC)"
         )
+        migrate_content_schema(connection, UPLOAD_DIR)
+        ensure_platform_state(connection)
+        # Mascots are part of every Day1 preview, not a per-space setting.
+        # Keep the legacy column for database compatibility while upgrading
+        # existing spaces that were created before the shared appearance.
         connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_task_progress_assets_source "
-            "ON task_progress_assets(source_sha256, source_size) "
-            "WHERE kind = 'file' AND source_sha256 IS NOT NULL"
+            "UPDATE spaces SET mascot_enabled = 1 WHERE mascot_enabled != 1"
         )
-        connection.execute(
-            "UPDATE tasks SET result_status = 'completed', completion_percent = 100, "
-            "result_note = CASE WHEN result_note = '' THEN COALESCE(proof_text, '') "
-            "ELSE result_note END, "
-            "result_recorded_at = COALESCE(result_recorded_at, completed_at, created_at) "
-            "WHERE done = 1 AND result_status = 'pending'"
-        )
-        backfill_legacy_attachment_metadata(connection, "tasks", "task_date")
-        backfill_legacy_attachment_metadata(connection, "stages", "id")
+        reconcile_space_deletion_storage(connection)
+        spaces = connection.execute(
+            "SELECT * FROM spaces WHERE is_blue_space = 0"
+        ).fetchall()
+        for space in spaces:
+            try:
+                initialize_space_storage(
+                    space,
+                    require_existing=space["status"] == "ready",
+                )
+            except Exception:
+                # A provisioning workspace is never exposed until its storage
+                # becomes ready. A ready workspace failing here must fail
+                # startup instead of silently serving a different database.
+                if space["status"] == "ready":
+                    raise
+            else:
+                if space["status"] == "provisioning":
+                    connection.execute(
+                        "UPDATE spaces SET status = 'ready', updated_at = ? WHERE id = ?",
+                        (now_ts(), space["id"]),
+                    )
         connection.commit()
-        cleanup_orphaned_uploads(connection)
         connection.execute("PRAGMA journal_mode = WAL")
         connection.commit()
     finally:
         connection.close()
+
+
+def normalize_plain_label(value, maximum):
+    if not isinstance(value, str):
+        return None
+    label = re.sub(r"\s+", " ", value).strip()
+    if not label or len(label) > maximum:
+        return None
+    if any(unicodedata.category(character).startswith("C") for character in label):
+        return None
+    return label
+
+
+def normalize_display_name(value, email=None):
+    if value in (None, "") and email:
+        return default_display_name(email)
+    return normalize_plain_label(value, MAX_DISPLAY_NAME_LENGTH)
+
+
+def normalize_space_name(value):
+    name = normalize_plain_label(value, MAX_SPACE_NAME_LENGTH)
+    if not name:
+        return None
+    reserved = re.sub(r"[\s_-]+", "", name).casefold()
+    if reserved in {"blue", "blueday1", "blue平台"}:
+        return None
+    return name
+
+
+def normalize_ip(value):
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if (
+        not candidate
+        or len(candidate) > 64
+        or "%" in candidate
+        or any(character.isspace() for character in candidate)
+    ):
+        return None
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.compressed.lower()
+
+
+def normalize_ip_block_note(value):
+    if value in (None, ""):
+        return ""
+    return normalize_plain_label(value, MAX_IP_BLOCK_NOTE_LENGTH)
+
+
+def remove_empty_space_storage(storage_key):
+    """Best-effort cleanup for an unreferenced, newly provisioned empty store."""
+    if not isinstance(storage_key, str) or not re.fullmatch(r"[a-f0-9]{32}", storage_key):
+        return
+    root = SPACES_DIR / storage_key
+    uploads = root / "uploads"
+    try:
+        for name in ("content.db-shm", "content.db-wal", "content.db"):
+            (root / name).unlink(missing_ok=True)
+        if uploads.is_dir() and not any(uploads.iterdir()):
+            uploads.rmdir()
+        if root.is_dir() and not any(root.iterdir()):
+            root.rmdir()
+    except OSError:
+        pass
+
+
+def validated_space_storage_root(storage_key):
+    if not isinstance(storage_key, str) or not re.fullmatch(r"[a-f0-9]{32}", storage_key):
+        raise RuntimeError("Invalid workspace storage key")
+    base = SPACES_DIR.resolve(strict=False)
+    root = SPACES_DIR / storage_key
+    if root.resolve(strict=False).parent != base or root.is_symlink():
+        raise RuntimeError("Unsafe workspace storage path")
+    return root
+
+
+def validated_quarantine_path(name):
+    if not isinstance(name, str) or not re.fullmatch(
+        r"[a-f0-9]{32}-[a-f0-9]{32}", name
+    ):
+        raise RuntimeError("Invalid workspace quarantine path")
+    base = SPACE_TRASH_DIR.resolve(strict=False)
+    target = SPACE_TRASH_DIR / name
+    if target.resolve(strict=False).parent != base or target.is_symlink():
+        raise RuntimeError("Unsafe workspace quarantine path")
+    return target
+
+
+def reconcile_space_deletion_storage(connection):
+    """Recover interrupted workspace deletion and remove unreferenced stores."""
+    SPACES_DIR.mkdir(parents=True, exist_ok=True)
+    if SPACE_TRASH_DIR.is_symlink():
+        raise RuntimeError("Workspace trash path must not be a symlink")
+    SPACE_TRASH_DIR.mkdir(parents=True, exist_ok=True)
+
+    jobs = {
+        row["quarantine_name"]: row
+        for row in connection.execute(
+            "SELECT * FROM space_deletion_jobs ORDER BY created_at, job_id"
+        ).fetchall()
+    }
+    for entry in list(SPACE_TRASH_DIR.iterdir()):
+        if entry.is_symlink() or not entry.is_dir():
+            raise RuntimeError("Unexpected workspace deletion artifact")
+        match = re.fullmatch(r"([a-f0-9]{32})-([a-f0-9]{32})", entry.name)
+        if not match:
+            raise RuntimeError("Unexpected workspace deletion directory")
+        storage_key = match.group(1)
+        space = connection.execute(
+            "SELECT public_id FROM spaces WHERE storage_key = ?", (storage_key,)
+        ).fetchone()
+        root = validated_space_storage_root(storage_key)
+        try:
+            if space:
+                if root.exists():
+                    shutil.rmtree(entry)
+                else:
+                    os.replace(entry, root)
+            else:
+                shutil.rmtree(entry)
+        except OSError as cleanup_error:
+            # A committed deletion must remain inaccessible even if the host
+            # temporarily refuses the physical cleanup (for example because
+            # of a transient filesystem error). Keep the job for the next
+            # startup instead of taking the whole application offline.
+            if not space and entry.name in jobs:
+                connection.execute(
+                    "UPDATE space_deletion_jobs SET last_error = ? "
+                    "WHERE quarantine_name = ?",
+                    (str(cleanup_error)[:500], entry.name),
+                )
+                jobs.pop(entry.name, None)
+                continue
+            raise
+        else:
+            connection.execute(
+                "DELETE FROM space_deletion_jobs WHERE quarantine_name = ?",
+                (entry.name,),
+            )
+            jobs.pop(entry.name, None)
+
+    for name, job in jobs.items():
+        space = connection.execute(
+            "SELECT public_id FROM spaces WHERE storage_key = ?",
+            (job["storage_key"],),
+        ).fetchone()
+        root = validated_space_storage_root(job["storage_key"])
+        if space and not root.is_dir():
+            raise RuntimeError("Workspace storage recovery is incomplete")
+        connection.execute(
+            "DELETE FROM space_deletion_jobs WHERE job_id = ?", (job["job_id"],)
+        )
+
+    referenced = {
+        row["storage_key"]
+        for row in connection.execute(
+            "SELECT storage_key FROM spaces WHERE is_blue_space = 0"
+        ).fetchall()
+    }
+    for entry in list(SPACES_DIR.iterdir()):
+        if entry == SPACE_TRASH_DIR:
+            continue
+        if not re.fullmatch(r"[a-f0-9]{32}", entry.name):
+            continue
+        if entry.name in referenced:
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            raise RuntimeError("Unexpected unreferenced workspace storage path")
+        shutil.rmtree(entry)
+    connection.commit()
+
+
+def space_delete_confirmation(space_name):
+    return f"我确认删除{space_name}并知道会清除全部内容"
+
+
+def delete_non_blue_space(space_public_id):
+    """Delete one non-Blue owner and its isolated storage with crash recovery."""
+    database = get_db()
+    lifecycle_gate = space_lifecycle_gate(space_public_id)
+    upgrade_read = (
+        g.get("space_lifecycle_gate") is lifecycle_gate
+        and bool(g.get("space_lifecycle_read_held"))
+    )
+    with lifecycle_gate.write(upgrade_read=upgrade_read):
+        if upgrade_read:
+            # The write lease consumed this request's read lease. Teardown
+            # must not try to release it a second time.
+            g.space_lifecycle_read_held = False
+        space = database.execute(
+            "SELECT spaces.*, users.email AS owner_email "
+            "FROM spaces JOIN users ON users.id = spaces.owner_user_id "
+            "WHERE spaces.public_id = ? AND spaces.status = 'ready'",
+            (space_public_id,),
+        ).fetchone()
+        if not space:
+            raise LookupError("workspace_not_found")
+        if bool(space["is_blue_space"]) or bool(
+            database.execute(
+                "SELECT is_platform_admin FROM users WHERE id = ?",
+                (space["owner_user_id"],),
+            ).fetchone()["is_platform_admin"]
+        ):
+            raise PermissionError("blue_workspace")
+
+        root = validated_space_storage_root(space["storage_key"])
+        content_path = root / "content.db"
+        if not root.is_dir() or not content_path.is_file():
+            raise RuntimeError("Workspace storage is unavailable")
+        if SPACE_TRASH_DIR.is_symlink():
+            raise RuntimeError("Workspace trash path must not be a symlink")
+        SPACE_TRASH_DIR.mkdir(parents=True, exist_ok=True)
+        job_id = uuid.uuid4().hex
+        quarantine_name = f"{space['storage_key']}-{job_id}"
+        quarantine = validated_quarantine_path(quarantine_name)
+        if quarantine.exists():
+            raise RuntimeError("Workspace quarantine collision")
+
+        os.replace(root, quarantine)
+        try:
+            database.execute("PRAGMA secure_delete = ON")
+            database.execute("BEGIN IMMEDIATE")
+            current = database.execute(
+                "SELECT spaces.*, users.email AS owner_email, "
+                "users.is_platform_admin AS owner_is_platform_admin "
+                "FROM spaces JOIN users ON users.id = spaces.owner_user_id "
+                "WHERE spaces.public_id = ? AND spaces.status = 'ready'",
+                (space_public_id,),
+            ).fetchone()
+            if (
+                not current
+                or bool(current["is_blue_space"])
+                or bool(current["owner_is_platform_admin"])
+                or current["storage_key"] != space["storage_key"]
+            ):
+                raise sqlite3.IntegrityError("workspace changed during deletion")
+            database.execute(
+                "INSERT INTO space_deletion_jobs("
+                "job_id, public_id, storage_key, quarantine_name, owner_user_id, "
+                "owner_email, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    current["public_id"],
+                    current["storage_key"],
+                    quarantine_name,
+                    current["owner_user_id"],
+                    current["owner_email"],
+                    now_ts(),
+                ),
+            )
+            database.execute(
+                "DELETE FROM manager_invites WHERE used_by_user_id = ?",
+                (current["owner_user_id"],),
+            )
+            database.execute(
+                "DELETE FROM auth_events WHERE email = ? COLLATE NOCASE",
+                (current["owner_email"],),
+            )
+            deleted = database.execute(
+                "DELETE FROM users WHERE id = ? AND is_platform_admin = 0",
+                (current["owner_user_id"],),
+            )
+            if deleted.rowcount != 1:
+                raise sqlite3.IntegrityError("workspace owner was not deleted")
+            database.commit()
+        except Exception:
+            database.rollback()
+            try:
+                if quarantine.is_dir() and not root.exists():
+                    os.replace(quarantine, root)
+            except OSError as restore_error:
+                warnings.warn(
+                    f"Workspace deletion restore pending: {restore_error}",
+                    RuntimeWarning,
+                )
+            raise
+
+        storage_cleaned = True
+        try:
+            shutil.rmtree(quarantine)
+        except OSError as cleanup_error:
+            storage_cleaned = False
+            database.execute(
+                "UPDATE space_deletion_jobs SET last_error = ? WHERE job_id = ?",
+                (str(cleanup_error)[:500], job_id),
+            )
+            database.commit()
+        else:
+            database.execute(
+                "DELETE FROM space_deletion_jobs WHERE job_id = ?", (job_id,)
+            )
+            database.commit()
+        return {
+            "publicId": space_public_id,
+            "name": space["name"],
+            "storageCleaned": storage_cleaned,
+        }
 
 
 def normalize_email(value):
@@ -484,9 +1434,20 @@ def create_session(user_id):
     database = get_db()
     database.execute("DELETE FROM sessions WHERE expires_at <= ?", (current,))
     database.execute(
-        "INSERT INTO sessions(token_hash, user_id, csrf_token, created_at, expires_at, last_seen_at, user_agent_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (token_hash(raw_token), user_id, csrf_token, current, current + SESSION_SECONDS, current, user_agent_hash())
+        "INSERT INTO sessions("
+        "token_hash, user_id, csrf_token, created_at, expires_at, last_seen_at, "
+        "user_agent_hash, client_ip"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            token_hash(raw_token),
+            user_id,
+            csrf_token,
+            current,
+            current + SESSION_SECONDS,
+            current,
+            user_agent_hash(),
+            client_ip(),
+        ),
     )
     rows = database.execute(
         "SELECT token_hash FROM sessions WHERE user_id = ? ORDER BY created_at DESC, rowid DESC", (user_id,)
@@ -519,8 +1480,10 @@ def load_session():
     database = get_db()
     current = now_ts()
     row = database.execute(
-        "SELECT s.token_hash, s.csrf_token, s.expires_at, s.last_seen_at, s.user_agent_hash, "
-        "u.id, u.email, u.role, u.must_change_password "
+        "SELECT s.token_hash, s.csrf_token, s.expires_at, s.last_seen_at, "
+        "s.user_agent_hash, s.client_ip AS session_client_ip, "
+        "u.id, u.email, u.display_name, u.role, u.is_platform_admin, "
+        "u.must_change_password "
         "FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
         (token_hash(raw_token),)
     ).fetchone()
@@ -538,16 +1501,230 @@ def load_session():
     g.current_user = {
         "id": row["id"],
         "email": row["email"],
+        "display_name": row["display_name"] or default_display_name(row["email"]),
         "role": row["role"],
+        "is_platform_admin": bool(row["is_platform_admin"]),
         "must_change_password": bool(row["must_change_password"]),
     }
-    if current - row["last_seen_at"] > 300:
-        database.execute("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?", (current, row["token_hash"]))
+    current_ip = client_ip()
+    if current - row["last_seen_at"] > 300 or row["session_client_ip"] != current_ip:
+        database.execute(
+            "UPDATE sessions SET last_seen_at = ?, client_ip = ? "
+            "WHERE token_hash = ?",
+            (current, current_ip, row["token_hash"]),
+        )
         database.commit()
 
 
 def api_error(message, status=400, code="bad_request"):
     return jsonify({"ok": False, "error": message, "code": code}), status
+
+
+def serialize_space(
+    space,
+    access,
+    connection_status="active",
+    revoked_reason=None,
+    can_disconnect=False,
+):
+    return {
+        "publicId": space["public_id"],
+        "name": space["name"],
+        "access": access,
+        "isOwn": access == "owner",
+        "isBlueSpace": bool(space["is_blue_space"]),
+        "connectionStatus": connection_status,
+        "revokedReason": revoked_reason,
+        "canDisconnect": bool(can_disconnect),
+        "appearance": {"mascotEnabled": True},
+    }
+
+
+def user_spaces(user=None):
+    user = user or g.current_user
+    if not user:
+        return []
+    database = get_db()
+    rows = []
+    own = database.execute(
+        "SELECT * FROM spaces WHERE owner_user_id = ? AND status = 'ready'",
+        (user["id"],),
+    ).fetchall()
+    rows.extend(serialize_space(row, "owner") for row in own)
+    connections = database.execute(
+        "SELECT spaces.*, viewer_connections.revoked_at, "
+        "viewer_connections.revoked_reason, viewer_connections.code_version "
+        "FROM viewer_connections JOIN spaces "
+        "ON spaces.id = viewer_connections.space_id "
+        "WHERE viewer_connections.user_id = ? AND spaces.status = 'ready' "
+        "AND spaces.owner_user_id != ? "
+        "ORDER BY viewer_connections.revoked_at IS NOT NULL, "
+        "viewer_connections.connected_at DESC, spaces.id",
+        (user["id"], user["id"]),
+    ).fetchall()
+    blocked_ip = visitor_ip_blocked(database)
+    for row in connections:
+        connection_active = (
+            row["revoked_at"] is None
+            and row["code_version"] == row["viewer_code_version"]
+        )
+        status = (
+            "revoked"
+            if not connection_active
+            else ("blocked" if blocked_ip else "active")
+        )
+        rows.append(
+            serialize_space(
+                row,
+                "viewer",
+                status,
+                (
+                    VISITOR_IP_BLOCKED_REASON
+                    if status == "blocked"
+                    else None
+                )
+                if connection_active
+                else (
+                    row["revoked_reason"]
+                    or "识别码已刷新，请向管理者获取新的识别码。"
+                ),
+                can_disconnect=True,
+            )
+        )
+    return rows
+
+
+def requested_space_public_id():
+    value = request.headers.get("X-Day1-Space", "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{12,64}", value):
+        return False
+    return value
+
+
+def establish_space_context(public_id=None):
+    """Resolve and authorize one workspace for the current request."""
+    if not g.current_user:
+        return api_error("请先登录。", 401, "authentication_required")
+    requested = public_id if public_id is not None else requested_space_public_id()
+    if requested is False:
+        return api_error("当前空间标识无效。", 400, "invalid_space")
+    database = get_db()
+    space = None
+    if requested:
+        space = database.execute(
+            "SELECT * FROM spaces WHERE public_id = ? AND status = 'ready'",
+            (requested,),
+        ).fetchone()
+    else:
+        space = database.execute(
+            "SELECT * FROM spaces WHERE owner_user_id = ? AND status = 'ready' "
+            "ORDER BY id LIMIT 1",
+            (g.current_user["id"],),
+        ).fetchone()
+        if not space:
+            space = database.execute(
+                "SELECT spaces.* FROM viewer_connections "
+                "JOIN spaces ON spaces.id = viewer_connections.space_id "
+                "WHERE viewer_connections.user_id = ? AND spaces.status = 'ready' "
+                "ORDER BY viewer_connections.revoked_at IS NOT NULL, "
+                "viewer_connections.connected_at DESC LIMIT 1",
+                (g.current_user["id"],),
+            ).fetchone()
+    if not space:
+        return api_error(
+            "尚未连接可查看的 Day1，请输入预览识别码。",
+            403,
+            "space_access_required",
+        )
+
+    lifecycle_gate = space_lifecycle_gate(space["public_id"])
+    lifecycle_gate.acquire_read()
+    g.space_lifecycle_gate = lifecycle_gate
+    g.space_lifecycle_read_held = True
+    space = database.execute(
+        "SELECT * FROM spaces WHERE public_id = ? AND status = 'ready'",
+        (space["public_id"],),
+    ).fetchone()
+    if not space:
+        return api_error(
+            "这个管理端已被删除，相关记录与访客连接已不再保留。",
+            410,
+            "space_deleted",
+        )
+
+    access = None
+    if space["owner_user_id"] == g.current_user["id"]:
+        access = "owner"
+    elif g.current_user["is_platform_admin"]:
+        access = "platform_preview"
+    else:
+        connection = database.execute(
+            "SELECT * FROM viewer_connections WHERE user_id = ? AND space_id = ?",
+            (g.current_user["id"], space["id"]),
+        ).fetchone()
+        if connection and (
+            connection["revoked_at"] is not None
+            or connection["code_version"] != space["viewer_code_version"]
+        ):
+            return api_error(
+                connection["revoked_reason"]
+                or "管理者已经刷新识别码。请向管理者获取新的识别码后重新连接。",
+                410,
+                "preview_access_revoked",
+            )
+        if connection:
+            current_ip = client_ip()
+            if (
+                connection["last_ip"] != current_ip
+                or connection["last_seen_at"] is None
+                or now_ts() - connection["last_seen_at"] > 300
+            ):
+                database.execute(
+                    "UPDATE viewer_connections SET last_ip = ?, last_seen_at = ? "
+                    "WHERE id = ?",
+                    (current_ip, now_ts(), connection["id"]),
+                )
+                database.commit()
+            if visitor_ip_blocked(database, current_ip):
+                return api_error(
+                    VISITOR_IP_BLOCKED_REASON,
+                    403,
+                    "visitor_ip_blocked",
+                )
+            access = "viewer"
+    if not access:
+        return api_error("未找到可查看的空间。", 404, "space_not_found")
+
+    g.current_space = space
+    g.space_access = access
+    return None
+
+
+def get_content_db():
+    if not g.get("current_space"):
+        raise RuntimeError("Workspace context has not been authorized")
+    if bool(g.current_space["is_blue_space"]):
+        return get_db()
+    if "content_db" not in g:
+        content_path, upload_dir = space_storage_paths(g.current_space)
+        if not content_path.is_file():
+            raise RuntimeError("Workspace content database is unavailable")
+        g.content_db = connect_sqlite(content_path)
+        g.content_upload_dir = upload_dir
+    return g.content_db
+
+
+def current_upload_dir():
+    if not g.get("current_space"):
+        raise RuntimeError("Workspace context has not been authorized")
+    if bool(g.current_space["is_blue_space"]):
+        return UPLOAD_DIR
+    if "content_upload_dir" not in g:
+        _content_path, upload_dir = space_storage_paths(g.current_space)
+        g.content_upload_dir = upload_dir
+    return g.content_upload_dir
 
 
 def require_auth(function):
@@ -559,12 +1736,38 @@ def require_auth(function):
     return wrapped
 
 
+def require_space(function):
+    @wraps(function)
+    @require_auth
+    def wrapped(*args, **kwargs):
+        error = establish_space_context()
+        if error:
+            return error
+        return function(*args, **kwargs)
+    return wrapped
+
+
 def require_owner(function):
     @wraps(function)
     @require_auth
     def wrapped(*args, **kwargs):
-        if g.current_user["role"] != "owner":
+        error = establish_space_context()
+        if error:
+            return error
+        if g.space_access != "owner":
             return api_error("当前账号只有查看权限。", 403, "read_only")
+        if g.current_user["must_change_password"]:
+            return api_error("请先修改临时密码。", 428, "password_change_required")
+        return function(*args, **kwargs)
+    return wrapped
+
+
+def require_platform_admin(function):
+    @wraps(function)
+    @require_auth
+    def wrapped(*args, **kwargs):
+        if not g.current_user["is_platform_admin"]:
+            return api_error("未找到请求的内容。", 404, "not_found")
         if g.current_user["must_change_password"]:
             return api_error("请先修改临时密码。", 428, "password_change_required")
         return function(*args, **kwargs)
@@ -659,10 +1862,10 @@ def proof_file_fields(row):
     size = row["proof_size"]
     if not isinstance(size, int) or isinstance(size, bool) or size < 0:
         try:
-            size = (UPLOAD_DIR / filename).stat().st_size
+            size = (current_upload_dir() / filename).stat().st_size
         except OSError:
             size = None
-    url = f"/api/proofs/{filename}"
+    url = f"/api/spaces/{g.current_space['public_id']}/proofs/{filename}"
     return {
         "proofFileUrl": url,
         "proofFileName": original_name,
@@ -690,11 +1893,14 @@ def serialize_progress_asset(row):
 
 
 def serialize_progress_entry(row, assets):
+    record_date = row["record_date"] or business_date_for_timestamp(row["created_at"])
     return {
         "id": row["id"],
         "note": row["note"] or "",
         "progressPercent": row["progress_percent"],
         "createdAt": utc_iso(row["created_at"]),
+        "recordDate": record_date,
+        "supplemental": record_date > row["task_date"],
         "assets": [serialize_progress_asset(asset) for asset in assets],
         "legacy": False,
     }
@@ -728,6 +1934,8 @@ def legacy_progress_entry(row):
         "note": "",
         "progressPercent": min(100, max(0, percent)),
         "createdAt": utc_iso(created_at),
+        "recordDate": row["task_date"],
+        "supplemental": False,
         "assets": assets,
         "legacy": True,
     }
@@ -784,22 +1992,26 @@ def serialize_task(row, progress_entries=None):
     result_note = row["result_note"] or row["proof_text"] or ""
     result_recorded_at = row["result_recorded_at"] or row["completed_at"]
     recorded_iso = utc_iso(result_recorded_at)
+    result_locked_at = row["result_locked_at"]
+    result_locked = result_locked_at is not None
     entries = list(progress_entries or [])
     actual_entries = [
         entry
         for entry in entries
         if not entry.get("legacy") and isinstance(entry.get("id"), int)
     ]
+    day_entries = [entry for entry in actual_entries if not entry.get("supplemental")]
+    supplement_entries = [entry for entry in actual_entries if entry.get("supplemental")]
     confirmed_progress_id = row["result_confirmed_progress_id"]
     if result_status == "pending":
         result_is_stale = False
         confirmed_progress_count = 0
     elif isinstance(confirmed_progress_id, int):
         result_is_stale = any(
-            entry["id"] > confirmed_progress_id for entry in actual_entries
+            entry["id"] > confirmed_progress_id for entry in day_entries
         )
         confirmed_progress_count = sum(
-            entry["id"] <= confirmed_progress_id for entry in actual_entries
+            entry["id"] <= confirmed_progress_id for entry in day_entries
         )
     else:
         # Rows created before exact progress snapshots were introduced retain
@@ -810,16 +2022,22 @@ def serialize_task(row, progress_entries=None):
                 and isinstance(entry.get("createdAt"), str)
                 and entry["createdAt"] <= recorded_iso
             )
-            for entry in actual_entries
+            for entry in day_entries
         )
         result_is_stale = bool(
             recorded_iso
             and any(
                 isinstance(entry.get("createdAt"), str)
                 and entry["createdAt"] > recorded_iso
-                for entry in actual_entries
+                for entry in day_entries
             )
         )
+    if result_locked:
+        result_is_stale = False
+
+    current_date = business_today_key()
+    progress_mode = task_progress_mode(row["task_date"], current_date)
+    latest_supplement = supplement_entries[-1] if supplement_entries else None
     payload = {
         "date": row["task_date"],
         "text": row["text"],
@@ -830,6 +2048,23 @@ def serialize_task(row, progress_entries=None):
         "resultRecordedAt": recorded_iso,
         "resultIsStale": result_is_stale,
         "resultConfirmedProgressCount": confirmed_progress_count,
+        "resultLocked": result_locked,
+        "resultLockedAt": utc_iso(result_locked_at),
+        "resultLockSource": row["result_lock_source"],
+        "canRecordResult": row["task_date"] == current_date and not result_locked,
+        "canAddProgress": progress_mode is not None,
+        "progressEntryMode": progress_mode,
+        "supplemented": bool(supplement_entries),
+        "supplementCompletionPercent": (
+            latest_supplement["progressPercent"] if latest_supplement else None
+        ),
+        "supplementRecordedAt": (
+            latest_supplement.get("createdAt") if latest_supplement else None
+        ),
+        "supplementRecordDate": (
+            latest_supplement.get("recordDate") if latest_supplement else None
+        ),
+        "supplementProgressCount": len(supplement_entries),
         "createdAt": utc_iso(row["created_at"]),
         "completedAt": utc_iso(row["completed_at"]),
         "proofText": row["proof_text"] or "",
@@ -846,6 +2081,59 @@ def serialize_task(row, progress_entries=None):
     ))
     payload["progressEntries"] = entries
     return payload
+
+
+def validate_goal_fields(payload, existing=None):
+    if not isinstance(payload, dict):
+        return None
+    title_value = payload.get("title", existing["title"] if existing is not None else None)
+    description_value = payload.get(
+        "description", existing["description"] if existing is not None else ""
+    )
+    color_value = payload.get(
+        "colorKey", existing["color_key"] if existing is not None else "mist"
+    )
+    if not all(isinstance(value, str) for value in (title_value, description_value, color_value)):
+        return None
+    title = title_value.strip()
+    description = description_value.strip()
+    color_key = color_value.strip().lower()
+    if not title or len(title) > MAX_GOAL_TITLE_LENGTH:
+        return None
+    if len(description) > MAX_GOAL_DESCRIPTION_LENGTH or color_key not in GOAL_COLOR_KEYS:
+        return None
+    return title, description, color_key
+
+
+def validate_subgoal_title(value):
+    if not isinstance(value, str):
+        return None
+    title = value.strip()
+    if not title or len(title) > MAX_SUBGOAL_TITLE_LENGTH:
+        return None
+    return title
+
+
+def validate_weight_percent(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= 100 else None
+
+
+def goal_allocated_percent(database, goal_id, exclude_stage_id=None):
+    if exclude_stage_id is None:
+        row = database.execute(
+            "SELECT COALESCE(SUM(weight_percent), 0) AS total FROM stages "
+            "WHERE goal_id = ?",
+            (goal_id,),
+        ).fetchone()
+    else:
+        row = database.execute(
+            "SELECT COALESCE(SUM(weight_percent), 0) AS total FROM stages "
+            "WHERE goal_id = ? AND id != ?",
+            (goal_id, exclude_stage_id),
+        ).fetchone()
+    return int(row["total"] or 0)
 
 
 def validate_stage_fields(payload, existing=None):
@@ -898,9 +2186,37 @@ def validate_client_record_key(value):
     return value
 
 
-def serialize_stage(row):
+def serialize_subgoal(row):
+    return {
+        "id": row["id"],
+        "stageId": row["stage_id"],
+        "title": row["title"],
+        "position": row["position"],
+        "status": row["status"],
+        "completed": row["status"] == "completed",
+        "createdAt": utc_iso(row["created_at"]),
+        "updatedAt": utc_iso(row["updated_at"]),
+        "completedAt": utc_iso(row["completed_at"]),
+    }
+
+
+def stage_subgoal_rows(database, stage_id):
+    return database.execute(
+        "SELECT * FROM stage_subgoals WHERE stage_id = ? ORDER BY position, id",
+        (stage_id,),
+    ).fetchall()
+
+
+def serialize_stage(row, database=None):
+    subgoals = [
+        serialize_subgoal(item)
+        for item in (stage_subgoal_rows(database, row["id"]) if database else [])
+    ]
+    completed_subgoals = sum(item["completed"] for item in subgoals)
     payload = {
         "id": row["id"],
+        "goalId": row["goal_id"],
+        "weightPercent": row["weight_percent"],
         "title": row["title"],
         "description": row["description"],
         "status": row["status"],
@@ -912,13 +2228,78 @@ def serialize_stage(row):
         "durationDays": row["duration_days"],
         "proofText": row["proof_text"] or "",
         "proofUrl": row["proof_url"] or "",
+        "subgoals": subgoals,
+        "subgoalCount": len(subgoals),
+        "completedSubgoalCount": completed_subgoals,
+        "subgoalProgressPercent": (
+            round(completed_subgoals * 100 / len(subgoals)) if subgoals else 0
+        ),
     }
     payload.update(proof_file_fields(row))
     return payload
 
 
+def serialize_goal(row, database):
+    stage_rows = database.execute(
+        "SELECT * FROM stages WHERE goal_id = ? ORDER BY started_at, id",
+        (row["id"],),
+    ).fetchall()
+    stages = [serialize_stage(stage, database) for stage in stage_rows]
+    allocated = sum(stage["weightPercent"] or 0 for stage in stages)
+    completed = sum(
+        (stage["weightPercent"] or 0)
+        for stage in stages
+        if stage["status"] == "completed"
+    )
+    current_stage = next(
+        (stage for stage in stages if stage["status"] == "active"), None
+    )
+    next_subgoal = None
+    if current_stage:
+        next_subgoal = next(
+            (item for item in current_stage["subgoals"] if not item["completed"]),
+            None,
+        )
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "description": row["description"],
+        "colorKey": row["color_key"],
+        "status": row["status"],
+        "startedAt": utc_iso(row["started_at"]),
+        "startDate": row["started_date"],
+        "updatedAt": utc_iso(row["updated_at"]),
+        "completedAt": utc_iso(row["completed_at"]),
+        "completionDate": row["completed_date"],
+        "allocatedPercent": allocated,
+        "remainingPercent": max(0, 100 - allocated),
+        "progressPercent": min(100, completed),
+        "canComplete": (
+            row["status"] == "active"
+            and allocated == 100
+            and completed == 100
+            and current_stage is None
+        ),
+        "currentStageId": current_stage["id"] if current_stage else None,
+        "nextSubgoal": next_subgoal,
+        "stages": stages,
+    }
+
+
 def client_ip():
-    return (request.remote_addr or "unknown")[:64]
+    return normalize_ip(request.remote_addr) or "unknown"
+
+
+def visitor_ip_blocked(database=None, ip=None):
+    canonical = normalize_ip(ip) if ip is not None else client_ip()
+    if not canonical or canonical == "unknown":
+        return False
+    database = database or get_db()
+    return bool(
+        database.execute(
+            "SELECT 1 FROM ip_blocks WHERE ip = ? LIMIT 1", (canonical,)
+        ).fetchone()
+    )
 
 
 def auth_limited(kind, email, seconds, maximum):
@@ -984,8 +2365,11 @@ def not_found(_error):
 
 @app.errorhandler(500)
 def internal_error(_error):
+    content_connection = g.get("content_db")
+    if content_connection is not None:
+        content_connection.rollback()
     connection = g.get("db")
-    if connection is not None:
+    if connection is not None and connection is not content_connection:
         connection.rollback()
     return api_error("服务器暂时无法处理请求。", 500, "server_error")
 
@@ -1001,16 +2385,32 @@ def session_info():
     if not csrf_token or len(csrf_token) < 32:
         csrf_token = secrets.token_urlsafe(32)
     user = None
+    spaces = []
+    default_space_id = None
     if g.current_user:
         user = {
             "email": g.current_user["email"],
+            "displayName": g.current_user["display_name"],
             "role": g.current_user["role"],
+            "isPlatformAdmin": g.current_user["is_platform_admin"],
             "mustChangePassword": g.current_user["must_change_password"],
         }
+        spaces = user_spaces()
+        if spaces:
+            default_space_id = next(
+                (
+                    item["publicId"]
+                    for item in spaces
+                    if item["connectionStatus"] == "active"
+                ),
+                spaces[0]["publicId"],
+            )
     response = jsonify({
         "ok": True,
         "authenticated": bool(user),
         "user": user,
+        "spaces": spaces,
+        "defaultSpaceId": default_space_id,
         "csrfToken": csrf_token,
         "registrationOpen": REGISTRATION_ENABLED,
     })
@@ -1028,25 +2428,223 @@ def register():
     payload = parse_json()
     if not payload:
         return api_error("请输入有效的注册信息。")
+    registration_kind = payload.get("registrationKind", "viewer")
     email = normalize_email(payload.get("email"))
     password = payload.get("password")
-    if not email or not validate_password(password):
+    display_name = normalize_display_name(payload.get("displayName"), email)
+    if (
+        registration_kind not in {"viewer", "manager"}
+        or not email
+        or not display_name
+        or not validate_password(password)
+    ):
         return api_error("请输入有效邮箱，密码需为 10–128 个字符。")
     if auth_limited("register", email, 3600, 5) or auth_ip_limited("register", 3600, 10):
         return api_error("注册尝试过多，请稍后再试。", 429, "rate_limited")
     database = get_db()
-    try:
-        cursor = database.execute(
-            "INSERT INTO users(email, password_hash, role, must_change_password, created_at) VALUES (?, ?, 'viewer', 0, ?)",
-            (email, hash_password(password), now_ts())
+    current = now_ts()
+    password_digest = hash_password(password)
+
+    if registration_kind == "viewer":
+        viewer_digest = code_hash(payload.get("viewerCode"))
+        space = (
+            database.execute(
+                "SELECT * FROM spaces WHERE viewer_code_hash = ? AND status = 'ready'",
+                (viewer_digest,),
+            ).fetchone()
+            if viewer_digest
+            else None
         )
-        database.commit()
-    except sqlite3.IntegrityError:
-        record_auth_event("register", email, False)
-        return api_error("该邮箱无法注册，请直接登录或更换邮箱。", 409, "email_unavailable")
+        if not space:
+            record_auth_event("register", email, False)
+            return api_error(
+                "预览识别码无效或已更新，请向管理者确认后重试。",
+                403,
+                "invalid_viewer_code",
+            )
+        try:
+            database.execute("BEGIN IMMEDIATE")
+            if visitor_ip_blocked(database):
+                database.rollback()
+                record_auth_event("register", email, False)
+                return api_error(
+                    VISITOR_IP_BLOCKED_REASON,
+                    403,
+                    "visitor_ip_blocked",
+                )
+            space = database.execute(
+                "SELECT * FROM spaces WHERE viewer_code_hash = ? AND status = 'ready'",
+                (viewer_digest,),
+            ).fetchone()
+            if not space:
+                database.rollback()
+                record_auth_event("register", email, False)
+                return api_error(
+                    "预览识别码无效或已更新，请向管理者确认后重试。",
+                    403,
+                    "invalid_viewer_code",
+                )
+            if database.execute(
+                "SELECT 1 FROM users WHERE email = ?", (email,)
+            ).fetchone():
+                database.rollback()
+                record_auth_event("register", email, False)
+                return api_error(
+                    "该邮箱无法注册，请直接登录或更换邮箱。",
+                    409,
+                    "email_unavailable",
+                )
+            cursor = database.execute(
+                "INSERT INTO users("
+                "email, password_hash, role, display_name, must_change_password, created_at"
+                ") VALUES (?, ?, 'viewer', ?, 0, ?)",
+                (email, password_digest, display_name, current),
+            )
+            database.execute(
+                "INSERT INTO viewer_connections("
+                "user_id, space_id, code_version, connected_at, last_ip, last_seen_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    cursor.lastrowid,
+                    space["id"],
+                    space["viewer_code_version"],
+                    current,
+                    client_ip(),
+                    current,
+                ),
+            )
+            database.commit()
+        except sqlite3.IntegrityError:
+            database.rollback()
+            record_auth_event("register", email, False)
+            return api_error(
+                "该邮箱无法注册，请直接登录或更换邮箱。",
+                409,
+                "email_unavailable",
+            )
+        role = "viewer"
+    else:
+        invite_digest = code_hash(payload.get("managerInviteCode"))
+        space_name = normalize_space_name(payload.get("spaceName"))
+        invite = (
+            database.execute(
+                "SELECT id FROM manager_invites WHERE code_hash = ? "
+                "AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?",
+                (invite_digest, current),
+            ).fetchone()
+            if invite_digest
+            else None
+        )
+        if not space_name:
+            record_auth_event("register", email, False)
+            return api_error(
+                "管理端名称需为 1–60 个字符，且不能使用 Blue 品牌名。",
+                400,
+                "invalid_space_name",
+            )
+        if not invite:
+            record_auth_event("register", email, False)
+            return api_error(
+                "管理邀请码无效或已失效，请向 Blue 获取新的邀请码。",
+                403,
+                "invalid_manager_invite",
+            )
+        storage_key = secrets.token_hex(16)
+        public_id = secrets.token_urlsafe(12)
+        viewer_secret = new_viewer_secret()
+        initial_viewer_code = viewer_code_for(viewer_secret, 1)
+        storage_stub = {"is_blue_space": 0, "storage_key": storage_key}
+        try:
+            initialize_space_storage(storage_stub)
+        except Exception:
+            remove_empty_space_storage(storage_key)
+            return api_error(
+                "暂时无法创建管理端，请稍后重试。",
+                503,
+                "space_provisioning_failed",
+            )
+        try:
+            database.execute("BEGIN IMMEDIATE")
+            invite = database.execute(
+                "SELECT id FROM manager_invites WHERE code_hash = ? "
+                "AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?",
+                (invite_digest, now_ts()),
+            ).fetchone()
+            if not invite:
+                database.rollback()
+                remove_empty_space_storage(storage_key)
+                record_auth_event("register", email, False)
+                return api_error(
+                    "管理邀请码无效或已失效，请向 Blue 获取新的邀请码。",
+                    403,
+                    "invalid_manager_invite",
+                )
+            if database.execute(
+                "SELECT 1 FROM users WHERE email = ?", (email,)
+            ).fetchone():
+                database.rollback()
+                remove_empty_space_storage(storage_key)
+                record_auth_event("register", email, False)
+                return api_error(
+                    "该邮箱无法注册，请直接登录或更换邮箱。",
+                    409,
+                    "email_unavailable",
+                )
+            cursor = database.execute(
+                "INSERT INTO users("
+                "email, password_hash, role, display_name, must_change_password, created_at"
+                ") VALUES (?, ?, 'owner', ?, 0, ?)",
+                (email, password_digest, display_name, current),
+            )
+            database.execute(
+                "INSERT INTO spaces("
+                "public_id, owner_user_id, name, storage_key, viewer_secret, "
+                "viewer_code_version, viewer_code_hash, mascot_enabled, "
+                "is_blue_space, status, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, 1, ?, 1, 0, 'ready', ?, ?)",
+                (
+                    public_id,
+                    cursor.lastrowid,
+                    space_name,
+                    storage_key,
+                    viewer_secret,
+                    code_hash(initial_viewer_code),
+                    current,
+                    current,
+                ),
+            )
+            consumed = database.execute(
+                "UPDATE manager_invites SET used_at = ?, used_by_user_id = ? "
+                "WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL "
+                "AND expires_at > ?",
+                (current, cursor.lastrowid, invite["id"], current),
+            )
+            if consumed.rowcount != 1:
+                raise sqlite3.IntegrityError("manager invite already consumed")
+            database.commit()
+        except sqlite3.IntegrityError:
+            database.rollback()
+            remove_empty_space_storage(storage_key)
+            record_auth_event("register", email, False)
+            return api_error(
+                "该邮箱或管理邀请码已无法使用，请刷新后重试。",
+                409,
+                "registration_conflict",
+            )
+        role = "owner"
+
     record_auth_event("register", email, True)
     raw_token, csrf_token = create_session(cursor.lastrowid)
-    response = jsonify({"ok": True, "user": {"email": email, "role": "viewer", "mustChangePassword": False}})
+    response = jsonify({
+        "ok": True,
+        "user": {
+            "email": email,
+            "displayName": display_name,
+            "role": role,
+            "isPlatformAdmin": False,
+            "mustChangePassword": False,
+        },
+    })
     return set_auth_cookies(response, raw_token, csrf_token)
 
 
@@ -1062,7 +2660,9 @@ def login():
         return api_error("登录尝试过多，请 15 分钟后再试。", 429, "rate_limited")
     database = get_db()
     user = database.execute(
-        "SELECT id, email, password_hash, role, must_change_password FROM users WHERE email = ?", (email,)
+        "SELECT id, email, display_name, password_hash, role, is_platform_admin, "
+        "must_change_password FROM users WHERE email = ?",
+        (email,),
     ).fetchone()
     valid = verify_password(password[:128], user["password_hash"] if user else DUMMY_PASSWORD_HASH)
     if not user or not valid:
@@ -1081,7 +2681,9 @@ def login():
         "ok": True,
         "user": {
             "email": user["email"],
+            "displayName": user["display_name"] or default_display_name(user["email"]),
             "role": user["role"],
+            "isPlatformAdmin": bool(user["is_platform_admin"]),
             "mustChangePassword": bool(user["must_change_password"]),
         }
     })
@@ -1124,15 +2726,940 @@ def change_password():
     return set_auth_cookies(response, raw_token, csrf_token)
 
 
-@app.get("/api/data")
+@app.get("/api/spaces")
 @require_auth
-def get_data():
+def list_spaces():
+    spaces = user_spaces()
+    return jsonify({
+        "ok": True,
+        "spaces": spaces,
+        "defaultSpaceId": next(
+            (
+                item["publicId"]
+                for item in spaces
+                if item["connectionStatus"] == "active"
+            ),
+            spaces[0]["publicId"] if spaces else None,
+        ),
+    })
+
+
+@app.post("/api/spaces/connect")
+@require_auth
+@require_csrf
+def connect_space():
+    payload = parse_json()
+    digest = code_hash(payload.get("viewerCode") if payload else None)
+    email = g.current_user["email"]
+    if (
+        auth_limited("viewer_connect", email, 15 * 60, 10)
+        or auth_ip_limited("viewer_connect", 15 * 60, 30, True)
+    ):
+        return api_error(
+            "识别码尝试过多，请稍后再试。",
+            429,
+            "rate_limited",
+        )
     database = get_db()
-    if g.current_user["role"] == "owner":
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        if visitor_ip_blocked(database):
+            database.rollback()
+            record_auth_event("viewer_connect", email, False)
+            return api_error(
+                VISITOR_IP_BLOCKED_REASON,
+                403,
+                "visitor_ip_blocked",
+            )
+        space = (
+            database.execute(
+                "SELECT * FROM spaces WHERE viewer_code_hash = ? AND status = 'ready'",
+                (digest,),
+            ).fetchone()
+            if digest
+            else None
+        )
+        if not space:
+            database.rollback()
+            record_auth_event("viewer_connect", email, False)
+            return api_error(
+                "预览识别码无效或已更新，请向管理者确认后重试。",
+                403,
+                "invalid_viewer_code",
+            )
+        if space["owner_user_id"] == g.current_user["id"]:
+            database.rollback()
+            return jsonify({
+                "ok": True,
+                "space": serialize_space(space, "owner"),
+                "alreadyConnected": True,
+            })
+        database.execute(
+            "INSERT INTO viewer_connections("
+            "user_id, space_id, code_version, connected_at, last_ip, last_seen_at, "
+            "revoked_at, revoked_reason"
+            ") VALUES (?, ?, ?, ?, ?, ?, NULL, NULL) "
+            "ON CONFLICT(user_id, space_id) DO UPDATE SET "
+            "code_version = excluded.code_version, "
+            "connected_at = excluded.connected_at, "
+            "last_ip = excluded.last_ip, last_seen_at = excluded.last_seen_at, "
+            "revoked_at = NULL, revoked_reason = NULL",
+            (
+                g.current_user["id"],
+                space["id"],
+                space["viewer_code_version"],
+                now_ts(),
+                client_ip(),
+                now_ts(),
+            ),
+        )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error(
+            "暂时无法连接该空间，请稍后重试。",
+            409,
+            "connection_conflict",
+        )
+    record_auth_event("viewer_connect", email, True)
+    return jsonify({
+        "ok": True,
+        "space": serialize_space(space, "viewer", can_disconnect=True),
+        "alreadyConnected": False,
+    })
+
+
+@app.delete("/api/spaces/connections/<public_id>")
+@require_auth
+@require_csrf
+def disconnect_space(public_id):
+    database = get_db()
+    disconnected = False
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        connection = database.execute(
+            "SELECT viewer_connections.id FROM viewer_connections "
+            "JOIN spaces ON spaces.id = viewer_connections.space_id "
+            "WHERE viewer_connections.user_id = ? AND spaces.public_id = ? "
+            "AND spaces.status = 'ready'",
+            (g.current_user["id"], public_id),
+        ).fetchone()
+        if connection:
+            database.execute(
+                "DELETE FROM viewer_connections WHERE id = ? AND user_id = ?",
+                (connection["id"], g.current_user["id"]),
+            )
+            disconnected = True
+        else:
+            own_space = database.execute(
+                "SELECT 1 FROM spaces WHERE public_id = ? AND owner_user_id = ? "
+                "AND status = 'ready'",
+                (public_id, g.current_user["id"]),
+            ).fetchone()
+            if own_space:
+                database.rollback()
+                return api_error(
+                    "自己的管理端不能断开。",
+                    403,
+                    "owned_space_not_disconnectable",
+                )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error(
+            "暂时无法断开这个预览端，请稍后重试。",
+            409,
+            "disconnect_conflict",
+        )
+    spaces = user_spaces()
+    return jsonify({
+        "ok": True,
+        "disconnected": disconnected,
+        "disconnectedSpaceId": public_id,
+        "spaces": spaces,
+        "defaultSpaceId": next(
+            (
+                item["publicId"]
+                for item in spaces
+                if item["connectionStatus"] == "active"
+            ),
+            spaces[0]["publicId"] if spaces else None,
+        ),
+    })
+
+
+@app.get("/api/spaces/current/viewer-code")
+@require_owner
+def current_viewer_code():
+    database = get_db()
+    space = database.execute(
+        "SELECT * FROM spaces WHERE id = ? AND owner_user_id = ? AND status = 'ready'",
+        (g.current_space["id"], g.current_user["id"]),
+    ).fetchone()
+    if not space:
+        return api_error("未找到请求的内容。", 404, "not_found")
+    active_connections = database.execute(
+        "SELECT COUNT(*) AS count FROM viewer_connections "
+        "WHERE space_id = ? AND revoked_at IS NULL AND code_version = ?",
+        (space["id"], space["viewer_code_version"]),
+    ).fetchone()["count"]
+    return jsonify({
+        "ok": True,
+        "viewerCode": viewer_code_for(
+            space["viewer_secret"], space["viewer_code_version"]
+        ),
+        "activeConnections": active_connections,
+    })
+
+
+VIEWER_CODE_REFRESH_CONFIRMATION = "我确认刷新并知道会断开所有访客端连接"
+
+
+@app.post("/api/spaces/current/viewer-code/refresh")
+@require_owner
+@require_csrf
+def refresh_viewer_code():
+    payload = parse_json()
+    if not payload or payload.get("confirmation") != VIEWER_CODE_REFRESH_CONFIRMATION:
+        return api_error(
+            f"请输入完整确认语句：{VIEWER_CODE_REFRESH_CONFIRMATION}",
+            400,
+            "confirmation_required",
+        )
+    database = get_db()
+    current = now_ts()
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        space = database.execute(
+            "SELECT * FROM spaces WHERE id = ? AND owner_user_id = ? AND status = 'ready'",
+            (g.current_space["id"], g.current_user["id"]),
+        ).fetchone()
+        if not space:
+            database.rollback()
+            return api_error("未找到请求的内容。", 404, "not_found")
+        affected = database.execute(
+            "SELECT COUNT(*) AS count FROM viewer_connections "
+            "WHERE space_id = ? AND revoked_at IS NULL "
+            "AND code_version = ?",
+            (space["id"], space["viewer_code_version"]),
+        ).fetchone()["count"]
+        secret = new_viewer_secret()
+        version = space["viewer_code_version"] + 1
+        viewer_code = viewer_code_for(secret, version)
+        database.execute(
+            "UPDATE spaces SET viewer_secret = ?, viewer_code_version = ?, "
+            "viewer_code_hash = ?, updated_at = ? "
+            "WHERE id = ? AND owner_user_id = ?",
+            (
+                secret,
+                version,
+                code_hash(viewer_code),
+                current,
+                space["id"],
+                g.current_user["id"],
+            ),
+        )
+        database.execute(
+            "UPDATE viewer_connections SET revoked_at = ?, "
+            "revoked_reason = ? WHERE space_id = ? AND revoked_at IS NULL",
+            (
+                current,
+                "管理者已经刷新识别码。请向管理者获取新的识别码后重新连接。",
+                space["id"],
+            ),
+        )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error(
+            "刷新未完成，原识别码仍然有效，请重试。",
+            409,
+            "refresh_conflict",
+        )
+    return jsonify({
+        "ok": True,
+        "viewerCode": viewer_code,
+        "activeConnections": 0,
+        "disconnectedConnections": affected,
+    })
+
+
+@app.delete("/api/spaces/current")
+@require_owner
+@require_csrf
+def delete_current_space():
+    if bool(g.current_space["is_blue_space"]) or g.current_user["is_platform_admin"]:
+        return api_error(
+            "Blue 主端不能在网站中删除。",
+            403,
+            "blue_space_protected",
+        )
+    payload = parse_json()
+    expected = space_delete_confirmation(g.current_space["name"])
+    if not payload or payload.get("confirmation") != expected:
+        return api_error(
+            f"请输入完整确认语句：{expected}",
+            400,
+            "confirmation_required",
+        )
+    try:
+        deleted = delete_non_blue_space(g.current_space["public_id"])
+    except LookupError:
+        return api_error(
+            "这个管理端已经被删除。",
+            410,
+            "space_deleted",
+        )
+    except PermissionError:
+        return api_error(
+            "Blue 主端不能在网站中删除。",
+            403,
+            "blue_space_protected",
+        )
+    except (OSError, RuntimeError, sqlite3.Error):
+        return api_error(
+            "删除没有完成，原管理端仍保持可用，请稍后重试。",
+            503,
+            "space_delete_failed",
+        )
+    response = jsonify({"ok": True, "deletedSpace": deleted})
+    return clear_auth_cookies(response)
+
+
+def manager_invite_code():
+    body = base64.b32encode(secrets.token_bytes(13)).decode("ascii").rstrip("=")[:20]
+    return "MGR-" + "-".join(body[index:index + 4] for index in range(0, 20, 4))
+
+
+def serialize_manager_invite(row):
+    current = now_ts()
+    if row["revoked_at"] is not None:
+        status = "revoked"
+    elif row["used_at"] is not None:
+        status = "used"
+    elif row["expires_at"] <= current:
+        status = "expired"
+    else:
+        status = "active"
+    return {
+        "id": row["id"],
+        "hint": row["code_hint"],
+        "status": status,
+        "createdAt": utc_iso(row["created_at"]),
+        "expiresAt": utc_iso(row["expires_at"]),
+        "usedAt": utc_iso(row["used_at"]),
+    }
+
+
+@app.post("/api/platform/manager-invites")
+@require_platform_admin
+@require_csrf
+def create_manager_invite():
+    payload = parse_json() or {}
+    expires_days = payload.get("expiresDays", 7)
+    if (
+        not isinstance(expires_days, int)
+        or isinstance(expires_days, bool)
+        or not 1 <= expires_days <= 30
+    ):
+        return api_error("邀请码有效期必须是 1–30 天。")
+    code = manager_invite_code()
+    current = now_ts()
+    database = get_db()
+    cursor = database.execute(
+        "INSERT INTO manager_invites("
+        "code_hash, code_hint, created_by_user_id, created_at, expires_at"
+        ") VALUES (?, ?, ?, ?, ?)",
+        (
+            code_hash(code),
+            f"末四位 {code[-4:]}",
+            g.current_user["id"],
+            current,
+            current + expires_days * 24 * 60 * 60,
+        ),
+    )
+    database.commit()
+    row = database.execute(
+        "SELECT * FROM manager_invites WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return jsonify({
+        "ok": True,
+        "invite": serialize_manager_invite(row),
+        "code": code,
+        "shownOnce": True,
+    }), 201
+
+
+@app.delete("/api/platform/manager-invites/<int:invite_id>")
+@require_platform_admin
+@require_csrf
+def revoke_manager_invite(invite_id):
+    database = get_db()
+    cursor = database.execute(
+        "UPDATE manager_invites SET revoked_at = ? "
+        "WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL",
+        (now_ts(), invite_id),
+    )
+    database.commit()
+    if cursor.rowcount != 1:
+        return api_error("该邀请码已无法撤销。", 409, "invite_not_active")
+    row = database.execute(
+        "SELECT * FROM manager_invites WHERE id = ?", (invite_id,)
+    ).fetchone()
+    return jsonify({"ok": True, "invite": serialize_manager_invite(row)})
+
+
+@app.get("/api/platform/overview")
+@require_platform_admin
+def platform_overview():
+    database = get_db()
+    current = now_ts()
+    space_rows = database.execute(
+        "SELECT spaces.*, users.email AS owner_email, "
+        "users.display_name AS owner_display_name, users.last_login_at, "
+        "(SELECT COUNT(*) FROM viewer_connections vc "
+        " WHERE vc.space_id = spaces.id AND vc.revoked_at IS NULL "
+        " AND vc.code_version = spaces.viewer_code_version) AS visitor_count "
+        "FROM spaces JOIN users ON users.id = spaces.owner_user_id "
+        "WHERE spaces.status = 'ready' ORDER BY spaces.is_blue_space DESC, spaces.id"
+    ).fetchall()
+    spaces = [
+        {
+            "publicId": row["public_id"],
+            "name": row["name"],
+            "owner": {
+                "displayName": row["owner_display_name"],
+                "email": row["owner_email"],
+            },
+            "visitorCount": row["visitor_count"],
+            "lastLoginAt": utc_iso(row["last_login_at"]),
+            "createdAt": utc_iso(row["created_at"]),
+            "previewPermission": "read_only",
+            "appearance": {"mascotEnabled": True},
+            "isBlueSpace": bool(row["is_blue_space"]),
+        }
+        for row in space_rows
+    ]
+    user_rows = database.execute(
+        "SELECT users.id, users.email, users.display_name, users.role, "
+        "users.is_platform_admin, users.created_at, users.last_login_at, "
+        "(SELECT COUNT(*) FROM sessions WHERE sessions.user_id = users.id "
+        " AND sessions.expires_at > ?) AS active_sessions, "
+        "(SELECT name FROM spaces WHERE owner_user_id = users.id "
+        " AND status = 'ready' LIMIT 1) AS owned_space "
+        "FROM users ORDER BY users.created_at, users.id",
+        (current,),
+    ).fetchall()
+    preview_rows = database.execute(
+        "SELECT viewer_connections.user_id, spaces.public_id, spaces.name, "
+        "viewer_connections.revoked_at, viewer_connections.code_version, "
+        "spaces.viewer_code_version "
+        "FROM viewer_connections JOIN spaces "
+        "ON spaces.id = viewer_connections.space_id "
+        "WHERE spaces.status = 'ready' ORDER BY spaces.id"
+    ).fetchall()
+    preview_access_by_user = {}
+    for row in preview_rows:
+        active = (
+            row["revoked_at"] is None
+            and row["code_version"] == row["viewer_code_version"]
+        )
+        preview_access_by_user.setdefault(row["user_id"], []).append({
+            "publicId": row["public_id"],
+            "name": row["name"],
+            "status": "active" if active else "revoked",
+            "permission": "read_only",
+        })
+    users = [
+        {
+            "id": row["id"],
+            "displayName": row["display_name"],
+            "email": row["email"],
+            "role": row["role"],
+            "isPlatformAdmin": bool(row["is_platform_admin"]),
+            "ownedSpace": row["owned_space"],
+            "previewSpaces": preview_access_by_user.get(row["id"], []),
+            "activeSessions": row["active_sessions"],
+            "createdAt": utc_iso(row["created_at"]),
+            "lastLoginAt": utc_iso(row["last_login_at"]),
+        }
+        for row in user_rows
+    ]
+    invite_rows = database.execute(
+        "SELECT * FROM manager_invites ORDER BY created_at DESC, id DESC LIMIT 30"
+    ).fetchall()
+    active_session_count = database.execute(
+        "SELECT COUNT(*) AS count FROM sessions WHERE expires_at > ?", (current,)
+    ).fetchone()["count"]
+    signed_in_user_count = database.execute(
+        "SELECT COUNT(DISTINCT user_id) AS count FROM sessions WHERE expires_at > ?",
+        (current,),
+    ).fetchone()["count"]
+    connected_viewer_count = database.execute(
+        "SELECT COUNT(*) AS count FROM viewer_connections "
+        "JOIN spaces ON spaces.id = viewer_connections.space_id "
+        "WHERE viewer_connections.revoked_at IS NULL "
+        "AND viewer_connections.code_version = spaces.viewer_code_version"
+    ).fetchone()["count"]
+    return jsonify({
+        "ok": True,
+        "counts": {
+            "managerCount": len(spaces),
+            "activeSessionCount": active_session_count,
+            "signedInUserCount": signed_in_user_count,
+            "connectedViewerCount": connected_viewer_count,
+        },
+        "spaces": spaces,
+        "users": users,
+        "managerInvites": [
+            serialize_manager_invite(row) for row in invite_rows
+        ],
+    })
+
+
+@app.delete("/api/platform/spaces/<public_id>")
+@require_platform_admin
+@require_csrf
+def platform_delete_space(public_id):
+    database = get_db()
+    space = database.execute(
+        "SELECT * FROM spaces WHERE public_id = ? AND status = 'ready'",
+        (public_id,),
+    ).fetchone()
+    if not space:
+        return api_error("未找到请求的内容。", 404, "not_found")
+    if bool(space["is_blue_space"]):
+        return api_error(
+            "Blue 主端不能在网站中删除。",
+            403,
+            "blue_space_protected",
+        )
+    payload = parse_json()
+    expected = space_delete_confirmation(space["name"])
+    if not payload or payload.get("confirmation") != expected:
+        return api_error(
+            f"请输入完整确认语句：{expected}",
+            400,
+            "confirmation_required",
+        )
+    try:
+        deleted = delete_non_blue_space(public_id)
+    except LookupError:
+        return api_error(
+            "这个管理端已经被删除。",
+            410,
+            "space_deleted",
+        )
+    except PermissionError:
+        return api_error(
+            "Blue 主端不能在网站中删除。",
+            403,
+            "blue_space_protected",
+        )
+    except (OSError, RuntimeError, sqlite3.Error):
+        return api_error(
+            "删除没有完成，系统已保留恢复信息，请稍后重试。",
+            503,
+            "space_delete_failed",
+        )
+    return jsonify({"ok": True, "deletedSpace": deleted})
+
+
+def serialize_ip_block(row, affected_connections=0):
+    return {
+        "id": row["id"],
+        "ip": row["ip"],
+        "note": row["note"],
+        "createdAt": utc_iso(row["created_at"]),
+        "affectedConnections": int(affected_connections),
+    }
+
+
+@app.get("/api/platform/ip-access")
+@require_platform_admin
+def platform_ip_access():
+    database = get_db()
+    block_rows = database.execute(
+        "SELECT * FROM ip_blocks ORDER BY created_at DESC, id DESC"
+    ).fetchall()
+    block_by_ip = {row["ip"]: row for row in block_rows}
+    connection_rows = database.execute(
+        "SELECT viewer_connections.id, viewer_connections.last_ip, "
+        "viewer_connections.last_seen_at, viewer_connections.revoked_at, "
+        "viewer_connections.code_version, spaces.viewer_code_version, "
+        "spaces.public_id, spaces.name AS space_name, "
+        "users.id AS user_id, users.display_name, users.email, users.role "
+        "FROM viewer_connections "
+        "JOIN spaces ON spaces.id = viewer_connections.space_id "
+        "JOIN users ON users.id = viewer_connections.user_id "
+        "WHERE spaces.status = 'ready' "
+        "AND viewer_connections.last_ip NOT IN ('', 'unknown') "
+        "ORDER BY viewer_connections.last_seen_at DESC, viewer_connections.id DESC "
+        "LIMIT 100"
+    ).fetchall()
+    visitors = []
+    for row in connection_rows:
+        connection_active = (
+            row["revoked_at"] is None
+            and row["code_version"] == row["viewer_code_version"]
+        )
+        blocked = row["last_ip"] in block_by_ip
+        visitors.append({
+            "connectionId": row["id"],
+            "visitor": {
+                "id": row["user_id"],
+                "displayName": row["display_name"],
+                "email": row["email"],
+                "role": row["role"],
+            },
+            "space": {
+                "publicId": row["public_id"],
+                "name": row["space_name"],
+            },
+            "ip": row["last_ip"],
+            "lastSeenAt": utc_iso(row["last_seen_at"]),
+            "status": (
+                "blocked"
+                if blocked
+                else ("active" if connection_active else "revoked")
+            ),
+        })
+    active_counts = {
+        row["last_ip"]: row["count"]
+        for row in database.execute(
+            "SELECT viewer_connections.last_ip, COUNT(*) AS count "
+            "FROM viewer_connections JOIN spaces "
+            "ON spaces.id = viewer_connections.space_id "
+            "WHERE spaces.status = 'ready' "
+            "AND viewer_connections.last_ip NOT IN ('', 'unknown') "
+            "AND viewer_connections.revoked_at IS NULL "
+            "AND viewer_connections.code_version = spaces.viewer_code_version "
+            "GROUP BY viewer_connections.last_ip"
+        ).fetchall()
+    }
+    return jsonify({
+        "ok": True,
+        "visitors": visitors,
+        "blocks": [
+            serialize_ip_block(row, active_counts.get(row["ip"], 0))
+            for row in block_rows
+        ],
+    })
+
+
+@app.post("/api/platform/ip-blocks")
+@require_platform_admin
+@require_csrf
+def create_ip_block():
+    payload = parse_json()
+    canonical = normalize_ip(payload.get("ip") if payload else None)
+    note = normalize_ip_block_note(payload.get("note") if payload else None)
+    if not canonical:
+        return api_error(
+            "请输入有效的 IPv4 或 IPv6 地址。",
+            400,
+            "invalid_ip",
+        )
+    if note is None:
+        return api_error(
+            f"备注不能超过 {MAX_IP_BLOCK_NOTE_LENGTH} 个字符。",
+            400,
+            "invalid_note",
+        )
+    database = get_db()
+    try:
+        cursor = database.execute(
+            "INSERT INTO ip_blocks(ip, note, created_by_user_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (canonical, note, g.current_user["id"], now_ts()),
+        )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error(
+            "这个 IP 已经在黑名单中。",
+            409,
+            "ip_already_blocked",
+        )
+    row = database.execute(
+        "SELECT * FROM ip_blocks WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    affected = database.execute(
+        "SELECT COUNT(*) AS count FROM viewer_connections JOIN spaces "
+        "ON spaces.id = viewer_connections.space_id "
+        "WHERE viewer_connections.last_ip = ? "
+        "AND viewer_connections.revoked_at IS NULL "
+        "AND viewer_connections.code_version = spaces.viewer_code_version",
+        (canonical,),
+    ).fetchone()["count"]
+    return jsonify({
+        "ok": True,
+        "block": serialize_ip_block(row, affected),
+    }), 201
+
+
+@app.delete("/api/platform/ip-blocks/<int:block_id>")
+@require_platform_admin
+@require_csrf
+def delete_ip_block(block_id):
+    database = get_db()
+    row = database.execute(
+        "SELECT * FROM ip_blocks WHERE id = ?", (block_id,)
+    ).fetchone()
+    if not row:
+        return api_error("该黑名单记录已经不存在。", 404, "not_found")
+    database.execute("DELETE FROM ip_blocks WHERE id = ?", (block_id,))
+    database.commit()
+    return jsonify({
+        "ok": True,
+        "unblockedIp": row["ip"],
+    })
+
+
+SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def business_now():
+    return datetime.fromtimestamp(now_ts(), SHANGHAI_TIMEZONE)
+
+
+def message_window():
+    current = business_now()
+    opens = current.replace(hour=20, minute=0, second=0, microsecond=0)
+    closes = current.replace(hour=21, minute=0, second=0, microsecond=0)
+    is_open = opens <= current < closes
+    if current < opens:
+        next_opens = opens
+    else:
+        next_opens = opens + timedelta(days=1)
+    return {
+        "isOpen": is_open,
+        "serverNow": current.isoformat(timespec="seconds"),
+        "closesAt": closes.isoformat(timespec="seconds"),
+        "nextOpensAt": next_opens.isoformat(timespec="seconds"),
+        "label": "回复时段 · 20:00–21:00" if is_open else "每天 20:00–21:00 开放查看与回复",
+    }
+
+
+def normalize_message_body(value):
+    if not isinstance(value, str):
+        return None
+    body = value.strip()
+    if not body or len(body) > MAX_MESSAGE_LENGTH:
+        return None
+    if any(
+        unicodedata.category(character).startswith("C")
+        and character not in {"\n", "\r", "\t"}
+        for character in body
+    ):
+        return None
+    return body
+
+
+def serialize_message(row):
+    return {
+        "id": row["id"],
+        "senderKind": row["sender_kind"],
+        "body": row["body"],
+        "createdAt": utc_iso(row["created_at"]),
+    }
+
+
+@app.get("/api/messages")
+@require_space
+def list_messages():
+    window = message_window()
+    database = get_db()
+    if g.space_access == "owner":
+        if not window["isOpen"]:
+            return jsonify({
+                "ok": True,
+                "mode": "owner",
+                "window": window,
+                "contentAvailable": False,
+                "conversations": [],
+            })
+        rows = database.execute(
+            "SELECT messages.*, users.display_name AS visitor_name "
+            "FROM messages JOIN users ON users.id = messages.visitor_user_id "
+            "WHERE messages.space_id = ? "
+            "ORDER BY messages.created_at, messages.id",
+            (g.current_space["id"],),
+        ).fetchall()
+        conversations = []
+        by_visitor = {}
+        for row in rows:
+            conversation = by_visitor.get(row["visitor_user_id"])
+            if conversation is None:
+                conversation = {
+                    "visitorUserId": row["visitor_user_id"],
+                    "visitorDisplayName": row["visitor_name"],
+                    "messages": [],
+                }
+                by_visitor[row["visitor_user_id"]] = conversation
+                conversations.append(conversation)
+            conversation["messages"].append(serialize_message(row))
+        return jsonify({
+            "ok": True,
+            "mode": "owner",
+            "window": window,
+            "contentAvailable": True,
+            "conversations": conversations,
+        })
+    rows = database.execute(
+        "SELECT * FROM messages WHERE space_id = ? AND visitor_user_id = ? "
+        "ORDER BY created_at, id",
+        (g.current_space["id"], g.current_user["id"]),
+    ).fetchall()
+    return jsonify({
+        "ok": True,
+        "mode": "viewer",
+        "window": window,
+        "messages": [serialize_message(row) for row in rows],
+    })
+
+
+@app.post("/api/messages")
+@require_space
+@require_csrf
+def leave_message():
+    if g.space_access not in {"viewer", "platform_preview"}:
+        return api_error("当前页面不能发送留言。", 403, "viewer_required")
+    payload = parse_json()
+    body = normalize_message_body(payload.get("body") if payload else None)
+    if not body:
+        return api_error("留言不能为空，且不能超过 1000 字。")
+    database = get_db()
+    current = now_ts()
+    recent = database.execute(
+        "SELECT COUNT(*) AS count FROM messages WHERE space_id = ? "
+        "AND visitor_user_id = ? AND sender_kind = 'visitor' AND created_at >= ?",
+        (g.current_space["id"], g.current_user["id"], current - 60),
+    ).fetchone()["count"]
+    if recent >= 5:
+        return api_error("留言发送较快，请稍后再试。", 429, "rate_limited")
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        if g.space_access == "viewer":
+            connection = database.execute(
+                "SELECT viewer_connections.* FROM viewer_connections "
+                "JOIN spaces ON spaces.id = viewer_connections.space_id "
+                "WHERE viewer_connections.user_id = ? AND viewer_connections.space_id = ? "
+                "AND viewer_connections.revoked_at IS NULL "
+                "AND viewer_connections.code_version = spaces.viewer_code_version",
+                (g.current_user["id"], g.current_space["id"]),
+            ).fetchone()
+            if not connection:
+                database.rollback()
+                return api_error(
+                    "管理者已经刷新识别码，请重新连接后再留言。",
+                    410,
+                    "preview_access_revoked",
+                )
+        cursor = database.execute(
+            "INSERT INTO messages("
+            "space_id, visitor_user_id, sender_user_id, sender_kind, body, created_at"
+            ") VALUES (?, ?, ?, 'visitor', ?, ?)",
+            (
+                g.current_space["id"],
+                g.current_user["id"],
+                g.current_user["id"],
+                body,
+                current,
+            ),
+        )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error("留言未保存，请重试。", 409, "message_conflict")
+    row = database.execute(
+        "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return jsonify({
+        "ok": True,
+        "message": serialize_message(row),
+        "window": message_window(),
+    }), 201
+
+
+@app.post("/api/messages/<int:visitor_user_id>/reply")
+@require_owner
+@require_csrf
+def reply_message(visitor_user_id):
+    window = message_window()
+    if not window["isOpen"]:
+        return api_error(
+            "管理端仅在每天 20:00–21:00 开放查看与回复。",
+            403,
+            "message_window_closed",
+        )
+    payload = parse_json()
+    body = normalize_message_body(payload.get("body") if payload else None)
+    if not body:
+        return api_error("回复不能为空，且不能超过 1000 字。")
+    database = get_db()
+    current = now_ts()
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        owner = database.execute(
+            "SELECT 1 FROM spaces WHERE id = ? AND owner_user_id = ? "
+            "AND status = 'ready'",
+            (g.current_space["id"], g.current_user["id"]),
+        ).fetchone()
+        conversation = database.execute(
+            "SELECT 1 FROM messages WHERE space_id = ? AND visitor_user_id = ? "
+            "LIMIT 1",
+            (g.current_space["id"], visitor_user_id),
+        ).fetchone()
+        if not owner or not conversation:
+            database.rollback()
+            return api_error("未找到该留言。", 404, "not_found")
+        # Re-check the server-side time after taking the write lock.
+        if not message_window()["isOpen"]:
+            database.rollback()
+            return api_error(
+                "回复时段已经结束，请在明晚 20:00 再继续。",
+                403,
+                "message_window_closed",
+            )
+        cursor = database.execute(
+            "INSERT INTO messages("
+            "space_id, visitor_user_id, sender_user_id, sender_kind, body, created_at"
+            ") VALUES (?, ?, ?, 'manager', ?, ?)",
+            (
+                g.current_space["id"],
+                visitor_user_id,
+                g.current_user["id"],
+                body,
+                current,
+            ),
+        )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error("回复未保存，请重试。", 409, "message_conflict")
+    row = database.execute(
+        "SELECT * FROM messages WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return jsonify({
+        "ok": True,
+        "message": serialize_message(row),
+        "window": message_window(),
+    }), 201
+
+
+@app.get("/api/data")
+@require_space
+def get_data():
+    database = get_content_db()
+    current_date = business_today_key()
+    if finalize_expired_tasks(database, current_date):
+        database.commit()
+    if g.space_access == "owner":
         task_rows = database.execute("SELECT * FROM tasks ORDER BY task_date").fetchall()
         progress_by_date = task_progress_map(database)
     else:
-        public_cutoff = business_today_key()
+        public_cutoff = current_date
         task_rows = database.execute(
             "SELECT * FROM tasks WHERE task_date <= ? ORDER BY task_date",
             (public_cutoff,),
@@ -1144,15 +3671,23 @@ def get_data():
     ]
     payload = {
         "ok": True,
+        "businessDate": current_date,
         "tasks": tasks,
         "user": {
             "email": g.current_user["email"],
+            "displayName": g.current_user["display_name"],
             "role": g.current_user["role"],
+            "isPlatformAdmin": g.current_user["is_platform_admin"],
             "mustChangePassword": g.current_user["must_change_password"],
         },
+        "access": g.space_access,
+        "workspace": serialize_space(
+            g.current_space,
+            g.space_access,
+        ),
     }
-    public_cutoff = business_today_key()
-    if g.current_user["role"] == "owner":
+    public_cutoff = current_date
+    if g.space_access == "owner":
         stat_rows = database.execute(
             "SELECT * FROM daily_stats ORDER BY stat_date"
         ).fetchall()
@@ -1191,14 +3726,160 @@ def parse_stage_year(value):
     return year if 2020 <= year <= 2100 else False
 
 
+@app.get("/api/goals")
+@require_space
+def list_goals():
+    database = get_content_db()
+    active_row = database.execute(
+        "SELECT * FROM long_term_goals WHERE status = 'active' LIMIT 1"
+    ).fetchone()
+    completed_rows = database.execute(
+        "SELECT * FROM long_term_goals WHERE status = 'completed' "
+        "ORDER BY completed_date DESC, id DESC"
+    ).fetchall()
+    return jsonify({
+        "ok": True,
+        "activeGoal": serialize_goal(active_row, database) if active_row else None,
+        "completedGoals": [serialize_goal(row, database) for row in completed_rows],
+    })
+
+
+@app.post("/api/goals")
+@require_owner
+@require_csrf
+def create_goal():
+    payload = parse_json()
+    fields = validate_goal_fields(payload)
+    if not fields:
+        return api_error("长期目标名称不能超过 30 字，描述不能超过 120 字。")
+    title, description, color_key = fields
+    database = get_content_db()
+    if database.execute(
+        "SELECT 1 FROM long_term_goals WHERE status = 'active'"
+    ).fetchone():
+        return api_error("请先完成当前长期目标。", 409, "active_goal_exists")
+    active_stage = database.execute(
+        "SELECT * FROM stages WHERE status = 'active' LIMIT 1"
+    ).fetchone()
+    active_stage_weight = None
+    if active_stage:
+        if active_stage["goal_id"] is not None:
+            return api_error("当前阶段已经属于另一个长期目标。", 409, "stage_goal_conflict")
+        active_stage_weight = validate_weight_percent(
+            payload.get("activeStageWeight") if payload else None
+        )
+        if active_stage_weight is None:
+            return api_error("请设置当前阶段在长期目标中所占的百分比。")
+    current = now_ts()
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        cursor = database.execute(
+            "INSERT INTO long_term_goals("
+            "title, description, color_key, status, started_at, started_date, updated_at"
+            ") VALUES (?, ?, ?, 'active', ?, ?, ?)",
+            (title, description, color_key, current, business_today_key(), current),
+        )
+        if active_stage:
+            database.execute(
+                "UPDATE stages SET goal_id = ?, weight_percent = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'active' AND goal_id IS NULL",
+                (cursor.lastrowid, active_stage_weight, current, active_stage["id"]),
+            )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error("请先完成当前长期目标。", 409, "active_goal_exists")
+    row = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return jsonify({"ok": True, "goal": serialize_goal(row, database)}), 201
+
+
+@app.put("/api/goals/<int:goal_id>")
+@require_owner
+@require_csrf
+def update_goal(goal_id):
+    database = get_content_db()
+    row = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (goal_id,)
+    ).fetchone()
+    if not row:
+        return api_error("未找到该长期目标。", 404, "not_found")
+    if row["status"] != "active":
+        return api_error("已完成的长期目标不能修改。", 409, "goal_completed")
+    fields = validate_goal_fields(parse_json(), row)
+    if not fields:
+        return api_error("长期目标名称不能超过 30 字，描述不能超过 120 字。")
+    title, description, color_key = fields
+    database.execute(
+        "UPDATE long_term_goals SET title = ?, description = ?, color_key = ?, "
+        "updated_at = ? WHERE id = ? AND status = 'active'",
+        (title, description, color_key, now_ts(), goal_id),
+    )
+    database.commit()
+    updated = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (goal_id,)
+    ).fetchone()
+    return jsonify({"ok": True, "goal": serialize_goal(updated, database)})
+
+
+@app.post("/api/goals/<int:goal_id>/complete")
+@require_owner
+@require_csrf
+def complete_goal(goal_id):
+    database = get_content_db()
+    row = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (goal_id,)
+    ).fetchone()
+    if not row:
+        return api_error("未找到该长期目标。", 404, "not_found")
+    if row["status"] == "completed":
+        return jsonify({
+            "ok": True,
+            "idempotent": True,
+            "goal": serialize_goal(row, database),
+        })
+    goal = serialize_goal(row, database)
+    if goal["currentStageId"] is not None:
+        return api_error("请先完成当前阶段。", 409, "active_stage_exists")
+    if goal["allocatedPercent"] != 100 or goal["progressPercent"] != 100:
+        return api_error(
+            "长期目标需要规划满 100%，并完成全部阶段后才能归档。",
+            409,
+            "goal_incomplete",
+        )
+    completed_at = now_ts()
+    cursor = database.execute(
+        "UPDATE long_term_goals SET status = 'completed', updated_at = ?, "
+        "completed_at = ?, completed_date = ? "
+        "WHERE id = ? AND status = 'active'",
+        (completed_at, completed_at, business_today_key(), goal_id),
+    )
+    if cursor.rowcount != 1:
+        database.rollback()
+        return api_error("该长期目标已经完成。", 409, "goal_completed")
+    database.commit()
+    updated = database.execute(
+        "SELECT * FROM long_term_goals WHERE id = ?", (goal_id,)
+    ).fetchone()
+    return jsonify({
+        "ok": True,
+        "idempotent": False,
+        "goal": serialize_goal(updated, database),
+    })
+
+
 @app.get("/api/stages")
 @app.get("/api/stages/year/<int:path_year>")
-@require_auth
+@require_space
 def list_stages(path_year=None):
     year = parse_stage_year(path_year if path_year is not None else request.args.get("year"))
     if year is False:
         return api_error("年份无效。")
-    database = get_db()
+    database = get_content_db()
+    active_goal_row = database.execute(
+        "SELECT * FROM long_term_goals WHERE status = 'active' LIMIT 1"
+    ).fetchone()
     active_row = database.execute(
         "SELECT * FROM stages WHERE status = 'active' LIMIT 1"
     ).fetchone()
@@ -1216,8 +3897,11 @@ def list_stages(path_year=None):
         ).fetchall()
     return jsonify({
         "ok": True,
-        "activeStage": serialize_stage(active_row) if active_row else None,
-        "completedStages": [serialize_stage(row) for row in completed_rows],
+        "activeGoal": (
+            serialize_goal(active_goal_row, database) if active_goal_row else None
+        ),
+        "activeStage": serialize_stage(active_row, database) if active_row else None,
+        "completedStages": [serialize_stage(row, database) for row in completed_rows],
         "completionDates": [
             {"date": row["completed_date"], "stageId": row["id"]}
             for row in completed_rows
@@ -1226,65 +3910,273 @@ def list_stages(path_year=None):
 
 
 @app.get("/api/stages/<int:stage_id>")
-@require_auth
+@require_space
 def get_stage(stage_id):
-    row = get_db().execute("SELECT * FROM stages WHERE id = ?", (stage_id,)).fetchone()
+    database = get_content_db()
+    row = database.execute(
+        "SELECT * FROM stages WHERE id = ?", (stage_id,)
+    ).fetchone()
     if not row:
         return api_error("未找到该阶段。", 404, "not_found")
-    return jsonify({"ok": True, "stage": serialize_stage(row)})
+    return jsonify({"ok": True, "stage": serialize_stage(row, database)})
 
 
 @app.post("/api/stages")
 @require_owner
 @require_csrf
 def create_stage():
-    fields = validate_stage_fields(parse_json())
+    payload = parse_json()
+    fields = validate_stage_fields(payload)
     if not fields:
         return api_error("阶段标题或说明无效，标题不能超过 200 字，说明不能超过 5000 字。")
     title, description = fields
-    database = get_db()
+    database = get_content_db()
     if database.execute("SELECT 1 FROM stages WHERE status = 'active'").fetchone():
         return api_error("请先完成当前阶段，再新建下一阶段。", 409, "active_stage_exists")
+    active_goal = database.execute(
+        "SELECT * FROM long_term_goals WHERE status = 'active' LIMIT 1"
+    ).fetchone()
+    goal_id = active_goal["id"] if active_goal else None
+    weight_percent = None
+    if active_goal:
+        weight_percent = validate_weight_percent(
+            payload.get("weightPercent") if payload else None
+        )
+        if weight_percent is None:
+            return api_error("请设置这个阶段在长期目标中所占的百分比。")
+        remaining = 100 - goal_allocated_percent(database, goal_id)
+        if weight_percent > remaining:
+            return api_error(
+                f"这个阶段最多可以占长期目标的 {remaining}%。",
+                409,
+                "goal_weight_exceeded",
+            )
     current = now_ts()
     try:
         cursor = database.execute(
-            "INSERT INTO stages(title, description, status, started_at, started_date, updated_at) "
-            "VALUES (?, ?, 'active', ?, ?, ?)",
-            (title, description, current, business_today_key(), current),
+            "INSERT INTO stages("
+            "goal_id, weight_percent, title, description, status, "
+            "started_at, started_date, updated_at"
+            ") VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+            (
+                goal_id,
+                weight_percent,
+                title,
+                description,
+                current,
+                business_today_key(),
+                current,
+            ),
         )
         database.commit()
     except sqlite3.IntegrityError:
         database.rollback()
         return api_error("请先完成当前阶段，再新建下一阶段。", 409, "active_stage_exists")
     row = database.execute("SELECT * FROM stages WHERE id = ?", (cursor.lastrowid,)).fetchone()
-    return jsonify({"ok": True, "stage": serialize_stage(row)}), 201
+    return jsonify({"ok": True, "stage": serialize_stage(row, database)}), 201
 
 
 @app.put("/api/stages/<int:stage_id>")
 @require_owner
 @require_csrf
 def update_stage(stage_id):
-    database = get_db()
+    database = get_content_db()
     row = database.execute("SELECT * FROM stages WHERE id = ?", (stage_id,)).fetchone()
     if not row:
         return api_error("未找到该阶段。", 404, "not_found")
     if row["status"] != "active":
         return api_error("已完成的阶段不能修改。", 409, "stage_completed")
-    fields = validate_stage_fields(parse_json(), row)
+    payload = parse_json()
+    fields = validate_stage_fields(payload, row)
     if not fields:
         return api_error("阶段标题或说明无效，标题不能超过 200 字，说明不能超过 5000 字。")
     title, description = fields
+    weight_percent = row["weight_percent"]
+    if payload and "weightPercent" in payload:
+        if row["goal_id"] is None:
+            return api_error("这个阶段还没有关联长期目标。", 409, "stage_without_goal")
+        weight_percent = validate_weight_percent(payload.get("weightPercent"))
+        if weight_percent is None:
+            return api_error("阶段占比必须是 1 到 100 的整数。")
+        allocated_without_stage = goal_allocated_percent(
+            database, row["goal_id"], stage_id
+        )
+        remaining = 100 - allocated_without_stage
+        if weight_percent > remaining:
+            return api_error(
+                f"这个阶段最多可以占长期目标的 {remaining}%。",
+                409,
+                "goal_weight_exceeded",
+            )
     cursor = database.execute(
-        "UPDATE stages SET title = ?, description = ?, updated_at = ? "
+        "UPDATE stages SET title = ?, description = ?, weight_percent = ?, updated_at = ? "
         "WHERE id = ? AND status = 'active'",
-        (title, description, now_ts(), stage_id),
+        (title, description, weight_percent, now_ts(), stage_id),
     )
     if cursor.rowcount != 1:
         database.rollback()
         return api_error("已完成的阶段不能修改。", 409, "stage_completed")
     database.commit()
     updated = database.execute("SELECT * FROM stages WHERE id = ?", (stage_id,)).fetchone()
-    return jsonify({"ok": True, "stage": serialize_stage(updated)})
+    return jsonify({"ok": True, "stage": serialize_stage(updated, database)})
+
+
+@app.post("/api/stages/<int:stage_id>/subgoals")
+@require_owner
+@require_csrf
+def create_stage_subgoal(stage_id):
+    payload = parse_json()
+    title = validate_subgoal_title(payload.get("title") if payload else None)
+    if title is None:
+        return api_error("子目标不能为空，且不能超过 60 字。")
+    database = get_content_db()
+    stage = database.execute(
+        "SELECT * FROM stages WHERE id = ?", (stage_id,)
+    ).fetchone()
+    if not stage:
+        return api_error("未找到该阶段。", 404, "not_found")
+    if stage["status"] != "active":
+        return api_error("已完成的阶段不能修改子目标。", 409, "stage_completed")
+    position_row = database.execute(
+        "SELECT COALESCE(MAX(position), -1) + 1 AS next_position "
+        "FROM stage_subgoals WHERE stage_id = ?",
+        (stage_id,),
+    ).fetchone()
+    current = now_ts()
+    cursor = database.execute(
+        "INSERT INTO stage_subgoals("
+        "stage_id, title, position, status, created_at, updated_at"
+        ") VALUES (?, ?, ?, 'pending', ?, ?)",
+        (stage_id, title, position_row["next_position"], current, current),
+    )
+    database.commit()
+    row = database.execute(
+        "SELECT * FROM stage_subgoals WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return jsonify({"ok": True, "subgoal": serialize_subgoal(row)}), 201
+
+
+@app.put("/api/subgoals/<int:subgoal_id>")
+@require_owner
+@require_csrf
+def update_stage_subgoal(subgoal_id):
+    payload = parse_json()
+    if not isinstance(payload, dict):
+        return api_error("子目标内容无效。")
+    database = get_content_db()
+    row = database.execute(
+        "SELECT stage_subgoals.*, stages.status AS stage_status "
+        "FROM stage_subgoals JOIN stages ON stages.id = stage_subgoals.stage_id "
+        "WHERE stage_subgoals.id = ?",
+        (subgoal_id,),
+    ).fetchone()
+    if not row:
+        return api_error("未找到该子目标。", 404, "not_found")
+    if row["stage_status"] != "active":
+        return api_error("已完成的阶段不能修改子目标。", 409, "stage_completed")
+    title = row["title"]
+    if "title" in payload:
+        title = validate_subgoal_title(payload.get("title"))
+        if title is None:
+            return api_error("子目标不能为空，且不能超过 60 字。")
+    status = row["status"]
+    completed_at = row["completed_at"]
+    if "completed" in payload:
+        if not isinstance(payload.get("completed"), bool):
+            return api_error("子目标完成状态无效。")
+        status = "completed" if payload["completed"] else "pending"
+        completed_at = now_ts() if payload["completed"] else None
+    if "title" not in payload and "completed" not in payload:
+        return api_error("没有可更新的子目标内容。")
+    database.execute(
+        "UPDATE stage_subgoals SET title = ?, status = ?, completed_at = ?, "
+        "updated_at = ? WHERE id = ?",
+        (title, status, completed_at, now_ts(), subgoal_id),
+    )
+    database.commit()
+    updated = database.execute(
+        "SELECT * FROM stage_subgoals WHERE id = ?", (subgoal_id,)
+    ).fetchone()
+    return jsonify({"ok": True, "subgoal": serialize_subgoal(updated)})
+
+
+@app.delete("/api/subgoals/<int:subgoal_id>")
+@require_owner
+@require_csrf
+def delete_stage_subgoal(subgoal_id):
+    database = get_content_db()
+    row = database.execute(
+        "SELECT stage_subgoals.*, stages.status AS stage_status "
+        "FROM stage_subgoals JOIN stages ON stages.id = stage_subgoals.stage_id "
+        "WHERE stage_subgoals.id = ?",
+        (subgoal_id,),
+    ).fetchone()
+    if not row:
+        return api_error("未找到该子目标。", 404, "not_found")
+    if row["stage_status"] != "active":
+        return api_error("已完成的阶段不能删除子目标。", 409, "stage_completed")
+    database.execute("DELETE FROM stage_subgoals WHERE id = ?", (subgoal_id,))
+    remaining = database.execute(
+        "SELECT id FROM stage_subgoals WHERE stage_id = ? ORDER BY position, id",
+        (row["stage_id"],),
+    ).fetchall()
+    for position, item in enumerate(remaining):
+        database.execute(
+            "UPDATE stage_subgoals SET position = ?, updated_at = ? WHERE id = ?",
+            (position, now_ts(), item["id"]),
+        )
+    database.commit()
+    return jsonify({"ok": True, "deleted": True})
+
+
+@app.post("/api/stages/<int:stage_id>/subgoals/reorder")
+@require_owner
+@require_csrf
+def reorder_stage_subgoals(stage_id):
+    payload = parse_json()
+    ordered_ids = payload.get("ids") if isinstance(payload, dict) else None
+    if (
+        not isinstance(ordered_ids, list)
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in ordered_ids)
+        or len(set(ordered_ids)) != len(ordered_ids)
+    ):
+        return api_error("子目标顺序无效。")
+    database = get_content_db()
+    stage = database.execute(
+        "SELECT * FROM stages WHERE id = ?", (stage_id,)
+    ).fetchone()
+    if not stage:
+        return api_error("未找到该阶段。", 404, "not_found")
+    if stage["status"] != "active":
+        return api_error("已完成的阶段不能调整子目标。", 409, "stage_completed")
+    existing = database.execute(
+        "SELECT id FROM stage_subgoals WHERE stage_id = ? ORDER BY position, id",
+        (stage_id,),
+    ).fetchall()
+    if set(ordered_ids) != {item["id"] for item in existing}:
+        return api_error("必须提交当前阶段的全部子目标。", 409, "subgoal_set_changed")
+    current = now_ts()
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        database.execute(
+            "UPDATE stage_subgoals SET position = position + 100000, updated_at = ? "
+            "WHERE stage_id = ?",
+            (current, stage_id),
+        )
+        for position, item_id in enumerate(ordered_ids):
+            database.execute(
+                "UPDATE stage_subgoals SET position = ?, updated_at = ? "
+                "WHERE id = ? AND stage_id = ?",
+                (position, current, item_id, stage_id),
+            )
+        database.commit()
+    except sqlite3.IntegrityError:
+        database.rollback()
+        return api_error("子目标顺序刚刚发生变化，请刷新后重试。", 409, "subgoal_set_changed")
+    return jsonify({
+        "ok": True,
+        "subgoals": [serialize_subgoal(item) for item in stage_subgoal_rows(database, stage_id)],
+    })
 
 
 @app.post("/api/stages/<int:stage_id>/complete")
@@ -1313,7 +4205,7 @@ def complete_stage(stage_id):
         return api_error("证据链接必须是有效的 http 或 https 地址。")
     has_upload = bool(upload and upload.filename)
 
-    database = get_db()
+    database = get_content_db()
     row = database.execute("SELECT * FROM stages WHERE id = ?", (stage_id,)).fetchone()
     if not row:
         return api_error("未找到该阶段。", 404, "not_found")
@@ -1323,8 +4215,26 @@ def complete_stage(stage_id):
             and proof_text == (row["proof_text"] or "")
             and proof_url == (row["proof_url"] or "")
         ):
-            return jsonify({"ok": True, "idempotent": True, "stage": serialize_stage(row)})
+            return jsonify({
+                "ok": True,
+                "idempotent": True,
+                "stage": serialize_stage(row, database),
+            })
         return api_error("该阶段已经完成，不能重复修改完成证明。", 409, "stage_completed")
+    if row["goal_id"] is not None:
+        subgoals = stage_subgoal_rows(database, stage_id)
+        if not subgoals:
+            return api_error(
+                "请先为当前阶段添加至少一个子目标。",
+                409,
+                "stage_subgoals_required",
+            )
+        if any(item["status"] != "completed" for item in subgoals):
+            return api_error(
+                "请先完成当前阶段的全部子目标。",
+                409,
+                "stage_subgoals_incomplete",
+            )
     if not proof_text and not proof_url and not has_upload:
         return api_error("请填写完成说明、证据链接或上传一个证明附件。")
 
@@ -1367,7 +4277,11 @@ def complete_stage(stage_id):
         delete_stored_proof(new_file)
         raise
     updated = database.execute("SELECT * FROM stages WHERE id = ?", (stage_id,)).fetchone()
-    return jsonify({"ok": True, "idempotent": False, "stage": serialize_stage(updated)})
+    return jsonify({
+        "ok": True,
+        "idempotent": False,
+        "stage": serialize_stage(updated, database),
+    })
 
 
 @app.put("/api/tasks/<task_date>")
@@ -1379,7 +4293,16 @@ def set_task(task_date):
     text = payload.get("text", "").strip() if payload and isinstance(payload.get("text"), str) else ""
     if not task_date or not text or len(text) > 1000:
         return api_error("任务日期或内容无效，内容不能超过 1000 字。")
-    database = get_db()
+    current_date = business_today_key(task_date)
+    if task_date < current_date:
+        return api_error(
+            "过去日期已经冻结，不能再新建或修改任务。",
+            409,
+            "task_window_closed",
+        )
+    database = get_content_db()
+    database.execute("BEGIN IMMEDIATE")
+    finalize_expired_tasks(database, current_date)
     cursor = database.execute(
         "INSERT INTO tasks(task_date, text, done, created_at) VALUES (?, ?, 0, ?) "
         "ON CONFLICT(task_date) DO UPDATE SET text = excluded.text "
@@ -1403,10 +4326,12 @@ def delete_task(task_date):
     task_date = validate_date_key(task_date)
     if not task_date:
         return api_error("任务日期无效。")
-    database = get_db()
+    current_date = business_today_key(task_date)
+    database = get_content_db()
     # Keep attachment discovery and the cascading task delete in the same
     # write-locked transaction as concurrent progress-file inserts.
     database.execute("BEGIN IMMEDIATE")
+    finalize_expired_tasks(database, current_date)
     row = database.execute(
         "SELECT done, result_status, proof_file FROM tasks WHERE task_date = ?", (task_date,)
     ).fetchone()
@@ -1591,10 +4516,11 @@ def transcode_proof_image(raw, extension):
 
 
 def store_proof_bytes(raw, extension):
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    upload_dir = current_upload_dir()
+    upload_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{uuid.uuid4().hex}{extension}"
-    target = UPLOAD_DIR / filename
-    temporary = UPLOAD_DIR / f".{filename}.tmp"
+    target = upload_dir / filename
+    temporary = upload_dir / f".{filename}.tmp"
     try:
         with open(temporary, "xb") as handle:
             handle.write(raw)
@@ -1615,7 +4541,7 @@ def delete_stored_proof(filename):
     if not isinstance(filename, str) or not PROOF_FILE_RE.fullmatch(filename):
         return
     try:
-        (UPLOAD_DIR / filename).unlink(missing_ok=True)
+        (current_upload_dir() / filename).unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -1640,9 +4566,10 @@ def delete_stored_proof_if_unreferenced(database, filename):
         delete_stored_proof(filename)
 
 
-def cleanup_orphaned_uploads(database):
+def cleanup_orphaned_uploads(database, upload_dir=None):
     """Remove interrupted temporary files and attachment files with no DB row."""
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    upload_dir = upload_dir or UPLOAD_DIR
+    upload_dir.mkdir(parents=True, exist_ok=True)
     referenced = {
         row[0]
         for table in ("tasks", "stages", "task_progress_assets")
@@ -1650,7 +4577,7 @@ def cleanup_orphaned_uploads(database):
             f"SELECT proof_file FROM {table} WHERE proof_file IS NOT NULL"
         ).fetchall()
     }
-    for path in UPLOAD_DIR.iterdir():
+    for path in upload_dir.iterdir():
         if not path.is_file():
             continue
         is_interrupted_temporary = path.name.startswith(".") and path.name.endswith(".tmp")
@@ -1752,6 +4679,18 @@ def create_task_progress(task_date):
     payload = parse_json()
     if not task_date or not isinstance(payload, dict):
         return api_error("进度记录无效。")
+    current_date = business_today_key(task_date)
+    progress_mode = task_progress_mode(task_date, current_date)
+    if progress_mode is None:
+        if task_date < current_date:
+            return api_error(
+                "只能补充昨天的记录，更早日期已经关闭。",
+                409,
+                "supplement_window_closed",
+            )
+        return api_error(
+            "任务当天开始后才能记录进度。", 409, "progress_window_not_open"
+        )
 
     note_value = payload.get("note", "")
     progress_percent = payload.get("progressPercent")
@@ -1792,19 +4731,41 @@ def create_task_progress(task_date):
             seen_links.add(normalized)
             links.append(normalized)
 
-    database = get_db()
+    database = get_content_db()
     created_at = now_ts()
     try:
         # Serialize the idempotency recheck and insert. Without this write
         # lock, two workers can both miss the token and one would surface a
         # UNIQUE violation instead of returning the already-created record.
         database.execute("BEGIN IMMEDIATE")
+        current_date = business_today_key(task_date)
+        progress_mode = task_progress_mode(task_date, current_date)
+        if progress_mode is None:
+            database.rollback()
+            if task_date < current_date:
+                return api_error(
+                    "只能补充昨天的记录，更早日期已经关闭。",
+                    409,
+                    "supplement_window_closed",
+                )
+            return api_error(
+                "任务当天开始后才能记录进度。",
+                409,
+                "progress_window_not_open",
+            )
+        finalize_expired_tasks(database, current_date)
+        created_at = now_ts()
         task_row = database.execute(
             "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
         ).fetchone()
         if not task_row:
             database.rollback()
             return api_error("未找到该任务。", 404, "not_found")
+        if progress_mode == "day" and task_row["result_locked_at"] is not None:
+            database.rollback()
+            return api_error(
+                "当日结果已经锁定，不能再修改。", 409, "result_locked"
+            )
         if client_key:
             existing_progress = database.execute(
                 "SELECT id FROM task_progress WHERE task_date = ? AND client_key = ?",
@@ -1850,9 +4811,16 @@ def create_task_progress(task_date):
             )
         cursor = database.execute(
             "INSERT INTO task_progress("
-            "task_date, client_key, note, progress_percent, created_at"
-            ") VALUES (?, ?, ?, ?, ?)",
-            (task_date, client_key, note, progress_percent, created_at),
+            "task_date, client_key, note, progress_percent, record_date, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                task_date,
+                client_key,
+                note,
+                progress_percent,
+                current_date,
+                created_at,
+            ),
         )
         progress_id = cursor.lastrowid
         for position, proof_url in enumerate(links):
@@ -1913,6 +4881,14 @@ def add_task_progress_file(task_date, progress_id):
     task_date = validate_date_key(task_date)
     if not task_date:
         return api_error("任务日期无效。")
+    current_date = business_today_key(task_date)
+    progress_mode = task_progress_mode(task_date, current_date)
+    if progress_mode is None:
+        return api_error(
+            "只能为今天或昨天刚补充的进度添加附件。",
+            409,
+            "progress_file_window_closed",
+        )
     try:
         upload = get_proof_upload()
     except ValueError as error:
@@ -1923,7 +4899,7 @@ def add_task_progress_file(task_date, progress_id):
     if client_key is False:
         return api_error("附件请求标识无效。", 400, "invalid_client_upload_id")
 
-    database = get_db()
+    database = get_content_db()
     progress_row = database.execute(
         "SELECT progress.* FROM task_progress AS progress "
         "JOIN tasks ON tasks.task_date = progress.task_date "
@@ -1932,6 +4908,12 @@ def add_task_progress_file(task_date, progress_id):
     ).fetchone()
     if not progress_row:
         return api_error("未找到该进度记录。", 404, "not_found")
+    if progress_row["record_date"] != current_date:
+        return api_error(
+            "只能为今天新建的进度添加附件。",
+            409,
+            "progress_file_window_closed",
+        )
     if client_key:
         existing_asset = database.execute(
             "SELECT * FROM task_progress_assets "
@@ -1962,6 +4944,17 @@ def add_task_progress_file(task_date, progress_id):
         # allocation, and insert so concurrent workers cannot create duplicate
         # rows or collide on MAX(position) + 1.
         database.execute("BEGIN IMMEDIATE")
+        current_date = business_today_key(task_date)
+        progress_mode = task_progress_mode(task_date, current_date)
+        if progress_mode is None:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error(
+                "只能为今天或昨天刚补充的进度添加附件。",
+                409,
+                "progress_file_window_closed",
+            )
+        finalize_expired_tasks(database, current_date)
         progress_row = database.execute(
             "SELECT progress.* FROM task_progress AS progress "
             "JOIN tasks ON tasks.task_date = progress.task_date "
@@ -1972,6 +4965,14 @@ def add_task_progress_file(task_date, progress_id):
             database.rollback()
             delete_stored_proof_if_unreferenced(database, new_file)
             return api_error("未找到该进度记录。", 404, "not_found")
+        if progress_row["record_date"] != current_date:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error(
+                "只能为今天新建的进度添加附件。",
+                409,
+                "progress_file_window_closed",
+            )
         if client_key:
             existing_asset = database.execute(
                 "SELECT * FROM task_progress_assets "
@@ -2014,7 +5015,7 @@ def add_task_progress_file(task_date, progress_id):
                 or canonical_mime_for_internal_file(filename) != attachment["mime"]
             ):
                 continue
-            target = UPLOAD_DIR / filename
+            target = current_upload_dir() / filename
             try:
                 valid_stored_size = (
                     isinstance(candidate["proof_size"], int)
@@ -2116,15 +5117,33 @@ def delete_task_progress_asset(task_date, progress_id, asset_id):
     task_date = validate_date_key(task_date)
     if not task_date:
         return api_error("任务日期无效。")
-    database = get_db()
+    current_date = business_today_key(task_date)
+    if task_progress_mode(task_date, current_date) is None:
+        return api_error(
+            "只能调整今天新建的进度附件。",
+            409,
+            "progress_asset_window_closed",
+        )
+    database = get_content_db()
+    database.execute("BEGIN IMMEDIATE")
+    finalize_expired_tasks(database, current_date)
     asset_row = database.execute(
-        "SELECT assets.* FROM task_progress_assets AS assets "
+        "SELECT assets.*, progress.record_date AS progress_record_date "
+        "FROM task_progress_assets AS assets "
         "JOIN task_progress AS progress ON progress.id = assets.progress_id "
         "WHERE assets.id = ? AND progress.id = ? AND progress.task_date = ?",
         (asset_id, progress_id, task_date),
     ).fetchone()
     if not asset_row:
+        database.rollback()
         return api_error("未找到该附件或链接。", 404, "not_found")
+    if asset_row["progress_record_date"] != current_date:
+        database.rollback()
+        return api_error(
+            "只能调整今天新建的进度附件。",
+            409,
+            "progress_asset_window_closed",
+        )
     stored_file = asset_row["proof_file"]
     database.execute("DELETE FROM task_progress_assets WHERE id = ?", (asset_id,))
     database.commit()
@@ -2149,6 +5168,13 @@ def record_task_result(task_date):
     task_date = validate_date_key(task_date)
     if not task_date:
         return api_error("任务日期无效。")
+    current_date = business_today_key(task_date)
+    if task_date != current_date:
+        return api_error(
+            "最终结果只能在任务当天记录；24:00 后结果已经冻结。",
+            409,
+            "result_window_closed",
+        )
     legacy_completion = request.path.endswith("/complete")
     result_status = request.form.get("resultStatus")
     if legacy_completion and not result_status:
@@ -2187,7 +5213,7 @@ def record_task_result(task_date):
         upload = get_proof_upload()
     except ValueError as error:
         return attachment_api_error(error)
-    database = get_db()
+    database = get_content_db()
     row = database.execute("SELECT * FROM tasks WHERE task_date = ?", (task_date,)).fetchone()
     if not row:
         return api_error("未找到该任务。", 404, "not_found")
@@ -2212,6 +5238,16 @@ def record_task_result(task_date):
         # monotonic result version for true compare-and-swap semantics even
         # when two writes arrive within the same second.
         database.execute("BEGIN IMMEDIATE")
+        current_date = business_today_key(task_date)
+        if task_date != current_date:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error(
+                "最终结果只能在任务当天记录；24:00 后结果已经冻结。",
+                409,
+                "result_window_closed",
+            )
+        finalize_expired_tasks(database, current_date)
         current_row = database.execute(
             "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
         ).fetchone()
@@ -2219,6 +5255,12 @@ def record_task_result(task_date):
             database.rollback()
             delete_stored_proof_if_unreferenced(database, new_file)
             return api_error("未找到该任务。", 404, "not_found")
+        if current_row["result_locked_at"] is not None:
+            database.rollback()
+            delete_stored_proof_if_unreferenced(database, new_file)
+            return api_error(
+                "当日结果已经锁定，不能再修改。", 409, "result_locked"
+            )
         if current_row["result_version"] != initial_result_version:
             database.rollback()
             delete_stored_proof_if_unreferenced(database, new_file)
@@ -2310,7 +5352,7 @@ def set_stats(stat_date):
         return api_error("番茄钟数量无效。")
     if not isinstance(note, str) or len(note) > 10000:
         return api_error("便签内容不能超过 10000 字。")
-    database = get_db()
+    database = get_content_db()
     current = database.execute(
         "SELECT distractions FROM daily_stats WHERE stat_date = ?", (stat_date,)
     ).fetchone()
@@ -2473,6 +5515,22 @@ def validate_legacy_import(value):
             created_at, created_iso = parse_import_progress_timestamp(
                 entry.get("createdAt")
             )
+            record_date_value = entry.get("recordDate")
+            if record_date_value is None:
+                record_date = business_date_for_timestamp(created_at)
+            else:
+                record_date = validate_date_key(record_date_value)
+                if not record_date:
+                    raise ValueError("invalid")
+            supplemental_value = entry.get("supplemental")
+            if (
+                supplemental_value is not None
+                and (
+                    not isinstance(supplemental_value, bool)
+                    or supplemental_value != (record_date > key)
+                )
+            ):
+                raise ValueError("invalid")
             client_key = imported_progress_client_key(
                 key,
                 nonlegacy_progress_index,
@@ -2482,7 +5540,15 @@ def validate_legacy_import(value):
                 links,
             )
             progress_entries.append(
-                (key, client_key, note, progress_percent, created_at, links)
+                (
+                    key,
+                    client_key,
+                    note,
+                    progress_percent,
+                    record_date,
+                    created_at,
+                    links,
+                )
             )
             nonlegacy_progress_index += 1
         result_recorded_value = item.get("resultRecordedAt")
@@ -2523,6 +5589,29 @@ def validate_legacy_import(value):
                 != (confirmed_progress_count < nonlegacy_progress_index)
             ):
                 raise ValueError("invalid")
+        result_locked_value = item.get("resultLocked", False)
+        if not isinstance(result_locked_value, bool):
+            raise ValueError("invalid")
+        result_locked_at_value = item.get("resultLockedAt")
+        result_lock_source = item.get("resultLockSource")
+        if result_locked_value:
+            if result_status == "pending" or result_lock_source not in {
+                "recorded",
+                "automatic",
+            }:
+                raise ValueError("invalid")
+            result_locked_at = (
+                parse_import_progress_timestamp(result_locked_at_value)[0]
+                if result_locked_at_value is not None
+                else task_deadline_timestamp(key)
+            )
+            if result_locked_at != task_deadline_timestamp(key):
+                raise ValueError("invalid")
+        else:
+            if result_locked_at_value is not None or result_lock_source is not None:
+                raise ValueError("invalid")
+            result_locked_at = None
+            result_lock_source = None
         tasks.append(
             (
                 key,
@@ -2532,6 +5621,8 @@ def validate_legacy_import(value):
                 result_note.strip(),
                 result_recorded_at,
                 confirmed_progress_count,
+                result_locked_at,
+                result_lock_source,
             )
         )
     clean_poms = {}
@@ -2582,7 +5673,7 @@ def import_data():
         ) = validate_legacy_import(payload.get("data") if payload else None)
     except ValueError:
         return api_error("导入数据格式不正确。")
-    database = get_db()
+    database = get_content_db()
     imported_tasks = 0
     imported_progress_entries = 0
     imported_links = 0
@@ -2603,14 +5694,17 @@ def import_data():
             result_note,
             result_recorded_at,
             _confirmed_progress_count,
+            result_locked_at,
+            result_lock_source,
         ) in tasks:
             recorded = result_status != "pending"
             imported_at = now_ts()
             cursor = database.execute(
                 "INSERT OR IGNORE INTO tasks("
                 "task_date, text, done, result_status, completion_percent, result_note, "
-                "result_recorded_at, result_version, created_at, completed_at, proof_text"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "result_recorded_at, result_version, result_locked_at, result_lock_source, "
+                "created_at, completed_at, proof_text"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     key,
                     text,
@@ -2620,6 +5714,8 @@ def import_data():
                     result_note,
                     (result_recorded_at or imported_at) if recorded else None,
                     1 if recorded else 0,
+                    result_locked_at,
+                    result_lock_source,
                     imported_at,
                     (result_recorded_at or imported_at)
                     if result_status == "completed"
@@ -2642,6 +5738,7 @@ def import_data():
             client_key,
             note,
             progress_percent,
+            record_date,
             created_at,
             links,
         ) in progress_entries:
@@ -2650,9 +5747,16 @@ def import_data():
                 continue
             cursor = database.execute(
                 "INSERT OR IGNORE INTO task_progress("
-                "task_date, client_key, note, progress_percent, created_at"
-                ") VALUES (?, ?, ?, ?, ?)",
-                (task_date, client_key, note, progress_percent, created_at),
+                "task_date, client_key, note, progress_percent, record_date, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    task_date,
+                    client_key,
+                    note,
+                    progress_percent,
+                    record_date,
+                    created_at,
+                ),
             )
             if cursor.rowcount == 0:
                 continue
@@ -2681,6 +5785,7 @@ def import_data():
                 "WHERE task_date = ?",
                 (confirmed_progress_id, task_date),
             )
+        finalize_expired_tasks(database)
         for key in set(poms) | set(notes) | set(distractions):
             database.execute(
                 "INSERT INTO daily_stats(stat_date, poms, note, distractions, updated_at) "
@@ -2712,7 +5817,7 @@ def import_data():
 @app.get("/api/export")
 @require_owner
 def export_data():
-    database = get_db()
+    database = get_content_db()
     tasks = {}
     progress_by_date = task_progress_map(database)
     for row in database.execute("SELECT * FROM tasks ORDER BY task_date").fetchall():
@@ -2729,6 +5834,9 @@ def export_data():
             "resultConfirmedProgressCount": serialized[
                 "resultConfirmedProgressCount"
             ],
+            "resultLocked": serialized["resultLocked"],
+            "resultLockedAt": serialized["resultLockedAt"],
+            "resultLockSource": serialized["resultLockSource"],
             "createdAt": utc_iso(row["created_at"]),
             "doneAt": utc_iso(row["completed_at"]),
             "proofText": row["proof_text"] or "",
@@ -2738,8 +5846,14 @@ def export_data():
         }
     stats = database.execute("SELECT * FROM daily_stats ORDER BY stat_date").fetchall()
     stages = [
-        serialize_stage(row)
+        serialize_stage(row, database)
         for row in database.execute("SELECT * FROM stages ORDER BY started_at, id").fetchall()
+    ]
+    goals = [
+        serialize_goal(row, database)
+        for row in database.execute(
+            "SELECT * FROM long_term_goals ORDER BY started_at, id"
+        ).fetchall()
     ]
     body = json.dumps({
         "formatVersion": 2,
@@ -2748,6 +5862,7 @@ def export_data():
         "poms": {row["stat_date"]: row["poms"] for row in stats},
         "notes": {row["stat_date"]: row["note"] for row in stats},
         "distractions": {row["stat_date"]: row["distractions"] for row in stats},
+        "goals": goals,
         "stages": stages,
     }, ensure_ascii=False, indent=2)
     filename = f"blue-{business_today_key()}.json"
@@ -2758,12 +5873,10 @@ def export_data():
     )
 
 
-@app.get("/api/proofs/<filename>")
-@require_auth
-def proof_image(filename):
+def serve_proof(filename):
     if not PROOF_FILE_RE.fullmatch(filename):
         return api_error("未找到证明附件。", 404, "not_found")
-    database = get_db()
+    database = get_content_db()
     task_rows = database.execute(
         "SELECT task_date, proof_file, proof_mime, proof_original_name, proof_size "
         "FROM tasks WHERE proof_file = ? ORDER BY task_date",
@@ -2789,11 +5902,11 @@ def proof_image(filename):
         if task_rows
         else (progress_asset_rows[0] if progress_asset_rows else stage_row)
     )
-    target = UPLOAD_DIR / filename
+    target = current_upload_dir() / filename
     if not metadata_row or not target.is_file():
         return api_error("未找到证明附件。", 404, "not_found")
     if (
-        g.current_user["role"] != "owner"
+        g.space_access != "owner"
         and not stage_row
         and not any(
             dated_row["task_date"] <= business_today_key()
@@ -2807,7 +5920,7 @@ def proof_image(filename):
     is_image = mime == "image/jpeg"
     if is_image and Path(download_name).suffix.lower() not in {".jpg", ".jpeg"}:
         download_name = f"{Path(download_name).stem or '证明图片'}.jpg"
-    return send_file(
+    response = send_file(
         target,
         mimetype=mime,
         as_attachment=not is_image,
@@ -2815,6 +5928,24 @@ def proof_image(filename):
         conditional=True,
         max_age=3600,
     )
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@app.get("/api/spaces/<public_id>/proofs/<filename>")
+@require_auth
+def space_proof(public_id, filename):
+    error = establish_space_context(public_id)
+    if error:
+        return error
+    return serve_proof(filename)
+
+
+@app.get("/api/proofs/<filename>")
+@require_space
+def legacy_proof(filename):
+    """Compatibility alias for proof links created before workspace support."""
+    return serve_proof(filename)
 
 
 def seed_from_file(path):
@@ -2825,14 +5956,29 @@ def seed_from_file(path):
     if not email or not isinstance(password_hash, str) or not password_hash.startswith("scrypt$"):
         raise SystemExit("Invalid seed config")
     init_db()
-    connection = sqlite3.connect(str(DB_PATH), timeout=15)
+    connection = connect_sqlite(DB_PATH)
     try:
-        existing = connection.execute("SELECT id FROM users WHERE role = 'owner'").fetchone()
-        if not existing:
+        blue = connection.execute(
+            "SELECT id FROM spaces WHERE is_blue_space = 1"
+        ).fetchone()
+        existing = connection.execute(
+            "SELECT id FROM users WHERE email = ?", (email,)
+        ).fetchone()
+        if not blue and not existing:
             connection.execute(
-                "INSERT INTO users(email, password_hash, role, must_change_password, created_at) VALUES (?, ?, 'owner', 1, ?)",
+                "INSERT INTO users("
+                "email, password_hash, role, display_name, must_change_password, created_at"
+                ") VALUES (?, ?, 'owner', 'Blue', 1, ?)",
                 (email, password_hash, now_ts())
             )
+        elif not blue and existing:
+            connection.execute(
+                "UPDATE users SET role = 'owner', is_platform_admin = 1 "
+                "WHERE id = ?",
+                (existing["id"],),
+            )
+        connection.commit()
+        ensure_platform_state(connection)
         task = config.get("task")
         if isinstance(task, dict):
             task_date = validate_date_key(task.get("date"))
