@@ -111,6 +111,14 @@ VISITOR_IP_BLOCKED_REASON = (
     "当前网络地址已被 Blue 平台加入访客黑名单，暂时无法访问预览端。"
     "这不会影响管理端登录；如有疑问请联系 Blue。"
 )
+DEFAULT_MASCOT_KEY = "blue"
+MASCOT_CATALOG = (
+    {"key": "blue", "label": "Blue 原版", "assetUrl": "/static/mascots/blue.png"},
+    {"key": "azure", "label": "蓝角小精灵", "assetUrl": "/static/mascots/azure.png"},
+    {"key": "ribbon", "label": "红绫小精灵", "assetUrl": "/static/mascots/ribbon.png"},
+    {"key": "pink", "label": "粉团小精灵", "assetUrl": "/static/mascots/pink.png"},
+)
+MASCOT_BY_KEY = {item["key"]: item for item in MASCOT_CATALOG}
 Image.MAX_IMAGE_PIXELS = MAX_PROOF_IMAGE_PIXELS
 RESAMPLE_LANCZOS = getattr(Image, "Resampling", Image).LANCZOS
 IMAGE_PROCESS_LOCK = threading.Lock()
@@ -250,6 +258,7 @@ CREATE TABLE IF NOT EXISTS spaces (
     viewer_code_hash TEXT NOT NULL UNIQUE,
     mascot_enabled INTEGER NOT NULL DEFAULT 1
         CHECK (mascot_enabled IN (0, 1)),
+    mascot_key TEXT NOT NULL DEFAULT 'blue',
     is_blue_space INTEGER NOT NULL DEFAULT 0
         CHECK (is_blue_space IN (0, 1)),
     status TEXT NOT NULL DEFAULT 'ready'
@@ -1020,6 +1029,12 @@ def init_db():
             "last_seen_at",
             "INTEGER",
         )
+        ensure_column(
+            connection,
+            "spaces",
+            "mascot_key",
+            "TEXT NOT NULL DEFAULT 'blue'",
+        )
         connection.execute(
             "UPDATE viewer_connections SET last_seen_at = connected_at "
             "WHERE last_seen_at IS NULL"
@@ -1035,6 +1050,12 @@ def init_db():
         # existing spaces that were created before the shared appearance.
         connection.execute(
             "UPDATE spaces SET mascot_enabled = 1 WHERE mascot_enabled != 1"
+        )
+        placeholders = ", ".join("?" for _item in MASCOT_CATALOG)
+        connection.execute(
+            f"UPDATE spaces SET mascot_key = ? "
+            f"WHERE mascot_key IS NULL OR mascot_key NOT IN ({placeholders})",
+            (DEFAULT_MASCOT_KEY, *MASCOT_BY_KEY),
         )
         reconcile_space_deletion_storage(connection)
         spaces = connection.execute(
@@ -1520,6 +1541,23 @@ def api_error(message, status=400, code="bad_request"):
     return jsonify({"ok": False, "error": message, "code": code}), status
 
 
+def normalize_mascot_key(value):
+    return value if isinstance(value, str) and value in MASCOT_BY_KEY else DEFAULT_MASCOT_KEY
+
+
+def serialize_mascot_appearance(space):
+    try:
+        value = space["mascot_key"]
+    except (IndexError, KeyError, TypeError):
+        value = DEFAULT_MASCOT_KEY
+    key = normalize_mascot_key(value)
+    return {
+        "mascotEnabled": True,
+        "mascotKey": key,
+        "assetUrl": MASCOT_BY_KEY[key]["assetUrl"],
+    }
+
+
 def serialize_space(
     space,
     access,
@@ -1536,7 +1574,7 @@ def serialize_space(
         "connectionStatus": connection_status,
         "revokedReason": revoked_reason,
         "canDisconnect": bool(can_disconnect),
-        "appearance": {"mascotEnabled": True},
+        "appearance": serialize_mascot_appearance(space),
     }
 
 
@@ -3135,7 +3173,7 @@ def platform_overview():
             "lastLoginAt": utc_iso(row["last_login_at"]),
             "createdAt": utc_iso(row["created_at"]),
             "previewPermission": "read_only",
-            "appearance": {"mascotEnabled": True},
+            "appearance": serialize_mascot_appearance(row),
             "isBlueSpace": bool(row["is_blue_space"]),
         }
         for row in space_rows
@@ -3210,10 +3248,59 @@ def platform_overview():
             "connectedViewerCount": connected_viewer_count,
         },
         "spaces": spaces,
+        "mascotOptions": [dict(item) for item in MASCOT_CATALOG],
         "users": users,
         "managerInvites": [
             serialize_manager_invite(row) for row in invite_rows
         ],
+    })
+
+
+@app.put("/api/platform/spaces/<public_id>/appearance")
+@require_platform_admin
+@require_csrf
+def platform_update_space_appearance(public_id):
+    payload = parse_json()
+    mascot_key = payload.get("mascotKey") if payload else None
+    if not isinstance(mascot_key, str) or mascot_key not in MASCOT_BY_KEY:
+        return api_error(
+            "请选择可用的小精灵。",
+            400,
+            "invalid_mascot",
+        )
+
+    database = get_db()
+    space = database.execute(
+        "SELECT * FROM spaces WHERE public_id = ? AND status = 'ready'",
+        (public_id,),
+    ).fetchone()
+    if not space:
+        return api_error("未找到请求的内容。", 404, "not_found")
+    if bool(space["is_blue_space"]):
+        return api_error(
+            "Blue 主端固定使用原版小精灵。",
+            403,
+            "blue_space_protected",
+        )
+
+    if space["mascot_key"] != mascot_key:
+        database.execute(
+            "UPDATE spaces SET mascot_key = ?, updated_at = ? WHERE id = ?",
+            (mascot_key, now_ts(), space["id"]),
+        )
+        database.commit()
+        space = database.execute(
+            "SELECT * FROM spaces WHERE id = ?",
+            (space["id"],),
+        ).fetchone()
+
+    return jsonify({
+        "ok": True,
+        "space": {
+            "publicId": space["public_id"],
+            "name": space["name"],
+            "appearance": serialize_mascot_appearance(space),
+        },
     })
 
 
