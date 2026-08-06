@@ -7,6 +7,13 @@
   const SHANGHAI_TZ = "Asia/Shanghai";
   const VIEWER_CODE_REFRESH_CONFIRMATION = "我确认刷新并知道会断开所有访客端连接";
   const MAX_PROOF_FILE_BYTES = 10 * 1024 * 1024;
+  const MASCOT_OPTIONS = Object.freeze([
+    Object.freeze({ key: "blue", label: "Blue 原版", assetUrl: "/static/mascots/blue.png" }),
+    Object.freeze({ key: "azure", label: "蓝角小精灵", assetUrl: "/static/mascots/azure.png" }),
+    Object.freeze({ key: "ribbon", label: "红绫小精灵", assetUrl: "/static/mascots/ribbon.png" }),
+    Object.freeze({ key: "pink", label: "粉团小精灵", assetUrl: "/static/mascots/pink.png" }),
+  ]);
+  const MASCOT_BY_KEY = Object.freeze(Object.fromEntries(MASCOT_OPTIONS.map((option) => [option.key, option])));
   const PROOF_FILE_RULES = Object.freeze({
     jpg: { label: "JPG", image: true },
     jpeg: { label: "JPG", image: true },
@@ -59,6 +66,7 @@
     platformIpAccess: null,
     platformTab: "spaces",
     deleteSpaceTarget: null,
+    mascotSpaceTarget: null,
     messagesPayload: null,
     selectedConversationId: "",
     messageRefreshTimer: null,
@@ -93,6 +101,21 @@
     return typeof value === "string" && value.trim() ? value.trim() : (fallback || "");
   }
 
+  function normalizeMascotKey(value) {
+    return typeof value === "string" && Object.prototype.hasOwnProperty.call(MASCOT_BY_KEY, value)
+      ? value
+      : "blue";
+  }
+
+  function normalizeMascotAppearance(appearance) {
+    const mascotKey = normalizeMascotKey(appearance && appearance.mascotKey);
+    return {
+      mascotEnabled: true,
+      mascotKey,
+      assetUrl: MASCOT_BY_KEY[mascotKey].assetUrl,
+    };
+  }
+
   function normalizeSpace(space) {
     if (!space || typeof space !== "object") return null;
     const publicId = textValue(space.publicId || space.id);
@@ -105,9 +128,7 @@
       revokedReason: textValue(space.revokedReason),
       canDisconnect: Boolean(space.canDisconnect),
       platformPreview: Boolean(space.platformPreview || space.access === "platform_preview"),
-      appearance: {
-        mascotEnabled: true,
-      },
+      appearance: normalizeMascotAppearance(space.appearance),
       ownerEmail: textValue(space.ownerEmail),
       ownerDisplayName: textValue(space.ownerDisplayName || space.ownerName),
       activeConnections: Number.isFinite(Number(space.activeConnections)) ? Number(space.activeConnections) : 0,
@@ -923,6 +944,7 @@
     state.platformOverview = null;
     state.platformIpAccess = null;
     state.deleteSpaceTarget = null;
+    state.mascotSpaceTarget = null;
     state.connectionLostKind = "";
     state.connectionLostReason = "";
     state.messagesPayload = null;
@@ -1007,6 +1029,7 @@
     state.platformOverview = null;
     state.platformIpAccess = null;
     state.deleteSpaceTarget = null;
+    state.mascotSpaceTarget = null;
     $("#platform-space-count").textContent = "—";
     $("#platform-user-count").textContent = "—";
     $("#platform-connection-count").textContent = "—";
@@ -1016,6 +1039,8 @@
     $("#platform-ip-block-list").replaceChildren();
     $("#platform-blacklist-count").textContent = "0 条";
     setMessage($("#platform-message"), "");
+    clearMascotOptions();
+    setMessage($("#mascot-dialog-message"), "");
     $("#manager-invite-code").textContent = "—";
     $("#manager-invite-result").hidden = true;
     $("#manager-invite-empty").hidden = false;
@@ -1033,6 +1058,8 @@
       const dialog = $(selector);
       if (dialog.open) closeDialog(dialog);
     });
+    const mascotDialog = $("#mascot-dialog");
+    if (mascotDialog.open) closeDialog(mascotDialog);
   }
 
   function clearWorkspaceState() {
@@ -1044,6 +1071,7 @@
     state.stageYears = {};
     state.workspace = null;
     state.access = "";
+    applyMascotAppearance(null);
     clearPrivateClientState();
     accountDetails();
   }
@@ -1214,9 +1242,25 @@
     }
   }
 
+  function applyMascotAppearance(space) {
+    const hasSpace = Boolean(space && space.publicId);
+    const appearance = normalizeMascotAppearance(space && space.appearance);
+    [
+      [$("#owner-goal-mascot"), $("#owner-goal-mascot-image")],
+      [$("#visitor-mascot"), $("#visitor-mascot-image")],
+    ].forEach(([figure, image]) => {
+      figure.hidden = !hasSpace;
+      figure.dataset.mascotKey = appearance.mascotKey;
+      if (image.getAttribute("src") !== appearance.assetUrl) {
+        image.setAttribute("src", appearance.assetUrl);
+      }
+    });
+  }
+
   function renderWorkspaceChrome() {
     const space = activeSpace();
     const name = space ? space.name : "未连接端";
+    applyMascotAppearance(space);
     $("#active-workspace-name").textContent = state.mode === "platform" ? "平台概览" : name;
     $("#active-workspace-access").textContent = state.mode === "platform"
       ? "Blue 平台"
@@ -3603,6 +3647,28 @@
     return Array.isArray(values) ? values : [];
   }
 
+  function platformMascotOptions() {
+    const provided = state.platformOverview && Array.isArray(state.platformOverview.mascotOptions)
+      ? state.platformOverview.mascotOptions
+      : [];
+    const labels = new Map();
+    provided.forEach((option) => {
+      const key = option && option.key;
+      if (typeof key === "string" && Object.prototype.hasOwnProperty.call(MASCOT_BY_KEY, key)) {
+        labels.set(key, textValue(option.label, MASCOT_BY_KEY[key].label));
+      }
+    });
+    return MASCOT_OPTIONS.map((option) => Object.assign({}, option, {
+      label: labels.get(option.key) || option.label,
+    }));
+  }
+
+  function mascotLabel(value) {
+    const key = normalizeMascotKey(value);
+    const option = platformMascotOptions().find((item) => item.key === key);
+    return option ? option.label : MASCOT_BY_KEY.blue.label;
+  }
+
   function platformUsers(payload) {
     const values = payload && (payload.users || payload.sessions || payload.loggedInUsers);
     return Array.isArray(values) ? values : [];
@@ -3656,7 +3722,7 @@
     const connectionLabel = document.createElement("span");
     connectionLabel.textContent = `${Number.isFinite(connections) ? connections : 0} 个访客连接`;
     const userLabel = document.createElement("span");
-    userLabel.textContent = Number.isFinite(users) ? `${users} 个登录用户` : "只读预览权限";
+    userLabel.textContent = Number.isFinite(users) ? `${users} 个登录用户` : `只读预览 · ${mascotLabel(space.appearance.mascotKey)}`;
     meta.append(connectionLabel, userLabel);
 
     const actions = document.createElement("div");
@@ -3678,6 +3744,18 @@
       moreTrigger.setAttribute("aria-label", `${space.name} 的更多操作`);
       const morePanel = document.createElement("div");
       morePanel.className = "platform-more-panel";
+      const customize = document.createElement("button");
+      customize.className = "menu-button";
+      customize.type = "button";
+      customize.textContent = "更换小精灵…";
+      customize.addEventListener("click", () => {
+        more.open = false;
+        openMascotDialog({
+          publicId: space.publicId,
+          name: space.name,
+          mascotKey: space.appearance.mascotKey,
+        });
+      });
       const remove = document.createElement("button");
       remove.className = "menu-button menu-button-danger";
       remove.type = "button";
@@ -3690,7 +3768,7 @@
           source: "platform",
         });
       });
-      morePanel.appendChild(remove);
+      morePanel.append(customize, remove);
       more.append(moreTrigger, morePanel);
       actions.append(preview, more);
     } else {
@@ -3740,6 +3818,116 @@
     meta.append(role, current);
     row.append(identity, meta);
     return row;
+  }
+
+  function clearMascotOptions() {
+    const container = $("#mascot-options");
+    Array.from(container.querySelectorAll(".mascot-option")).forEach((option) => option.remove());
+  }
+
+  function renderMascotOptions(selectedKey) {
+    const container = $("#mascot-options");
+    clearMascotOptions();
+    if (!container.querySelector("legend")) {
+      const legend = document.createElement("legend");
+      legend.className = "visually-hidden";
+      legend.textContent = "选择小精灵";
+      container.appendChild(legend);
+    }
+    const normalizedSelectedKey = normalizeMascotKey(selectedKey);
+    platformMascotOptions().forEach((option) => {
+      const label = document.createElement("label");
+      label.className = "mascot-option";
+
+      const input = document.createElement("input");
+      input.className = "mascot-option-input";
+      input.type = "radio";
+      input.name = "mascotKey";
+      input.value = option.key;
+      input.checked = option.key === normalizedSelectedKey;
+
+      const card = document.createElement("span");
+      card.className = "mascot-option-card";
+      const preview = document.createElement("span");
+      preview.className = "mascot-option-preview";
+      preview.dataset.mascotKey = option.key;
+      preview.setAttribute("aria-hidden", "true");
+      const image = document.createElement("img");
+      image.src = option.assetUrl;
+      image.alt = "";
+      image.loading = "lazy";
+      image.decoding = "async";
+      preview.appendChild(image);
+
+      const copy = document.createElement("span");
+      copy.className = "mascot-option-copy";
+      const title = document.createElement("strong");
+      title.textContent = option.label;
+      const detail = document.createElement("small");
+      detail.textContent = option.key === "blue" ? "默认 · Blue 同款" : "仅替换当前端外观";
+      copy.append(title, detail);
+      card.append(preview, copy);
+      label.append(input, card);
+      container.appendChild(label);
+    });
+  }
+
+  function openMascotDialog(target) {
+    if (!isPlatformAdmin() || !target || !target.publicId || !target.name) return;
+    state.mascotSpaceTarget = {
+      publicId: target.publicId,
+      name: target.name,
+    };
+    $("#mascot-space-name").textContent = target.name;
+    renderMascotOptions(target.mascotKey);
+    setMessage($("#mascot-dialog-message"), "");
+    showDialog($("#mascot-dialog"));
+    window.setTimeout(() => {
+      const selected = $('#mascot-options input[name="mascotKey"]:checked');
+      if (selected) selected.focus();
+    }, 0);
+  }
+
+  async function saveMascotAppearance(event) {
+    event.preventDefault();
+    const target = state.mascotSpaceTarget;
+    const selected = $('#mascot-options input[name="mascotKey"]:checked');
+    if (!target || !selected || !Object.prototype.hasOwnProperty.call(MASCOT_BY_KEY, selected.value)) {
+      setMessage($("#mascot-dialog-message"), "请选择一个小精灵。");
+      return;
+    }
+
+    const mascotKey = selected.value;
+    const button = $("#save-mascot-button");
+    setLoading(button, true);
+    setMessage($("#mascot-dialog-message"), "");
+    try {
+      const payload = await api(`/api/platform/spaces/${encodeURIComponent(target.publicId)}/appearance`, {
+        method: "PUT",
+        body: { mascotKey },
+      });
+      const appearance = normalizeMascotAppearance(
+        payload && payload.space && payload.space.appearance
+          ? payload.space.appearance
+          : { mascotKey },
+      );
+      const overviewSpace = platformSpaces(state.platformOverview).find((space) => space.publicId === target.publicId);
+      if (overviewSpace) overviewSpace.appearance = appearance;
+      const connectedSpace = spaceById(target.publicId);
+      if (connectedSpace) connectedSpace.appearance = appearance;
+      if (state.workspace && state.workspace.publicId === target.publicId) {
+        state.workspace.appearance = appearance;
+      }
+      const targetName = target.name;
+      closeDialog($("#mascot-dialog"));
+      renderPlatformOverview();
+      applyMascotAppearance(activeSpace());
+      toast(`${targetName} 已使用${mascotLabel(appearance.mascotKey)}。`, "success");
+    } catch (error) {
+      setMessage($("#mascot-dialog-message"), error.message);
+    } finally {
+      setLoading(button, false);
+    }
   }
 
   function spaceDeleteConfirmation(spaceName) {
@@ -4721,7 +4909,11 @@
     });
     $$('[data-switch-view]').forEach((button) => button.addEventListener("click", () => {
       $("#workspace-menu").open = false;
-      setMode(button.dataset.switchView);
+      const nextMode = button.dataset.switchView;
+      setMode(nextMode);
+      if (nextMode === "platform") {
+        void loadPlatformOverview();
+      }
     }));
     $("#workspace-menu").addEventListener("toggle", () => {
       if ($("#workspace-menu").open) {
@@ -4811,6 +5003,7 @@
     $("#account-platform-overview").addEventListener("click", openPlatformOverview);
     $("#create-manager-invite").addEventListener("click", openManagerInviteDialog);
     $("#manager-invite-form").addEventListener("submit", generateManagerInvite);
+    $("#mascot-form").addEventListener("submit", saveMascotAppearance);
     $("#copy-manager-invite").addEventListener("click", () => copyText($("#manager-invite-code").textContent, "管理邀请码已复制。"));
     $("#open-manual-ip-block").addEventListener("click", () => openIpBlockDialog(""));
     $("#ip-block-form").addEventListener("submit", createIpBlock);
@@ -4875,6 +5068,11 @@
       if (dialog === $("#progress-dialog")) clearProgressFiles();
       if (dialog === $("#stage-complete-dialog")) clearStageImagePreview();
     }));
+    $("#mascot-dialog").addEventListener("close", () => {
+      state.mascotSpaceTarget = null;
+      clearMascotOptions();
+      setMessage($("#mascot-dialog-message"), "");
+    });
     $("#delete-space-dialog").addEventListener("close", () => {
       state.deleteSpaceTarget = null;
       $("#delete-space-form").reset();

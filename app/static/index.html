@@ -238,7 +238,7 @@
               <div id="owner-goal-progressbar" class="goal-progress-track" role="progressbar" aria-label="长期目标进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
               <p id="owner-goal-stage">完成阶段后，进度会累加到这里。</p>
             </div>
-            <figure class="goal-banner-mascot" aria-hidden="true"><img src="/static/blue-mascot.png" alt=""></figure>
+            <figure id="owner-goal-mascot" class="goal-banner-mascot" data-mascot-key="blue" aria-hidden="true"><img id="owner-goal-mascot-image" src="/static/mascots/blue.png" alt=""></figure>
           </section>
 
           <div class="owner-layout">
@@ -358,7 +358,7 @@
                   <strong id="owner-last-stage-title">—</strong>
                   <small id="owner-last-stage-meta">—</small>
                 </button>
-                <p class="stage-destination-note">完成后会保存在阶段记录，并在年度记录中标为金色。</p>
+                <p class="stage-destination-note">完成后会保存在阶段记录；年度记录用金色角标表示阶段，完成结果仍按绿色显示。</p>
               </section>
 
               <section id="focus-card" class="card focus-card" aria-labelledby="focus-title">
@@ -480,8 +480,8 @@
               <h1 id="visitor-page-title">Blue 的每日记录</h1>
               <p id="visitor-context-line">沿着今天留下的轨迹，看看事情正走到哪里。</p>
             </div>
-            <figure id="visitor-mascot" class="visitor-mascot" aria-hidden="true">
-              <img src="/static/blue-mascot.png" alt="">
+            <figure id="visitor-mascot" class="visitor-mascot" data-mascot-key="blue" aria-hidden="true">
+              <img id="visitor-mascot-image" src="/static/mascots/blue.png" alt="">
             </figure>
           </div>
 
@@ -593,9 +593,9 @@
         <section id="platform-view" class="dashboard-view platform-view" data-view="platform" aria-labelledby="platform-page-title" hidden>
           <div class="page-heading platform-heading">
             <div>
-              <p class="eyebrow">BLUE · 平台只读治理</p>
+              <p class="eyebrow">BLUE · 内容只读 · 外观可管理</p>
               <h1 id="platform-page-title">平台概览</h1>
-              <p class="page-heading-copy">查看管理端与登录用户；他人的记录只能以访客视角预览。</p>
+              <p class="page-heading-copy">查看管理端与登录用户；他人的记录仍只能只读预览，外观可由 Blue 统一调整。</p>
             </div>
             <button id="create-manager-invite" class="button button-primary" type="button">生成管理邀请码</button>
           </div>
@@ -983,7 +983,7 @@
           <button id="remove-stage-image" class="attachment-remove" type="button" aria-label="移除所选附件">移除</button>
         </div>
       </div>
-      <p class="record-destination-note is-stage">完成后会归档到阶段记录，并在年度记录中把当天标为金色；阶段与证明将不能再修改。</p>
+      <p class="record-destination-note is-stage">完成后会归档到阶段记录；年度记录用金色角标表示阶段，完成结果仍按绿色显示。阶段与证明将不能再修改。</p>
       <div id="stage-complete-message" class="form-message" role="status" aria-live="polite" hidden></div>
       <footer class="dialog-actions">
         <button class="button button-quiet" type="button" data-close-dialog="stage-complete-dialog">取消</button>
@@ -1185,6 +1185,28 @@
       <footer class="dialog-actions">
         <button class="button button-quiet" type="button" data-close-dialog="refresh-viewer-code-dialog">取消</button>
         <button id="refresh-viewer-code-submit" class="button button-danger" type="submit" data-loading-label="正在刷新…" disabled>刷新并断开连接</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="mascot-dialog" class="dialog dialog-compact" aria-labelledby="mascot-dialog-title">
+    <form id="mascot-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">外观管理</p>
+          <h2 id="mascot-dialog-title">更换小精灵</h2>
+          <p class="dialog-description">正在调整：<strong id="mascot-space-name">—</strong></p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="mascot-dialog">×</button>
+      </header>
+      <p class="mascot-dialog-note">只改变这个管理端的小精灵，不改变任务、权限或记录；随时可以恢复 Blue 原版。</p>
+      <fieldset id="mascot-options" class="mascot-options">
+        <legend class="visually-hidden">选择小精灵</legend>
+      </fieldset>
+      <div id="mascot-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="mascot-dialog">取消</button>
+        <button id="save-mascot-button" class="button button-primary" type="submit" data-loading-label="正在保存…">应用小精灵</button>
       </footer>
     </form>
   </dialog>

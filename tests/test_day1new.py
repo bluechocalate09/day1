@@ -801,7 +801,7 @@ class Day1NewApiTests(unittest.TestCase):
         payload = overview.get_json()
         self.assertEqual(
             set(payload),
-            {"ok", "counts", "spaces", "users", "managerInvites"},
+            {"ok", "counts", "spaces", "users", "managerInvites", "mascotOptions"},
         )
         self.assertEqual(
             set(payload["counts"]),
@@ -815,6 +815,19 @@ class Day1NewApiTests(unittest.TestCase):
         self.assertEqual(payload["counts"]["managerCount"], 2)
         self.assertGreaterEqual(payload["counts"]["signedInUserCount"], 3)
         self.assertEqual(payload["counts"]["connectedViewerCount"], 1)
+        self.assertEqual(
+            [option["key"] for option in payload["mascotOptions"]],
+            ["blue", "azure", "ribbon", "pink"],
+        )
+        self.assertTrue(
+            all(
+                set(option) == {"key", "label", "assetUrl"}
+                for option in payload["mascotOptions"]
+            )
+        )
+        self.assertTrue(
+            all(option["assetUrl"].startswith("/static/mascots/") for option in payload["mascotOptions"])
+        )
 
         expected_space_fields = {
             "publicId",
@@ -892,6 +905,11 @@ class Day1NewApiTests(unittest.TestCase):
             if item["publicId"] == manager["space"]["publicId"]
         )
         self.assertTrue(manager_space["appearance"]["mascotEnabled"])
+        self.assertEqual(
+            set(manager_space["appearance"]),
+            {"mascotEnabled", "mascotKey", "assetUrl"},
+        )
+        self.assertEqual(manager_space["appearance"]["mascotKey"], "blue")
 
         for client in (manager["client"], visitor["client"], self.blue):
             unavailable = client.post(
@@ -903,22 +921,154 @@ class Day1NewApiTests(unittest.TestCase):
 
         with self.platform_db() as connection:
             connection.execute(
-                "UPDATE spaces SET mascot_enabled = 0 WHERE public_id = ?",
+                "UPDATE spaces SET mascot_enabled = 0, mascot_key = 'unknown' "
+                "WHERE public_id = ?",
                 (manager["space"]["publicId"],),
             )
             connection.commit()
+        fallback_spaces = manager["client"].get("/api/spaces").get_json()["spaces"]
+        self.assertEqual(fallback_spaces[0]["appearance"]["mascotKey"], "blue")
+        self.assertEqual(
+            fallback_spaces[0]["appearance"]["assetUrl"],
+            "/static/mascots/blue.png",
+        )
         server.init_db()
         with self.platform_db() as connection:
             upgraded = connection.execute(
-                "SELECT mascot_enabled FROM spaces WHERE public_id = ?",
+                "SELECT mascot_enabled, mascot_key FROM spaces WHERE public_id = ?",
                 (manager["space"]["publicId"],),
-            ).fetchone()["mascot_enabled"]
-        self.assertEqual(upgraded, 1)
+            ).fetchone()
+        self.assertEqual(upgraded["mascot_enabled"], 1)
+        self.assertEqual(upgraded["mascot_key"], "blue")
 
         manager_spaces = manager["client"].get("/api/spaces").get_json()["spaces"]
         self.assertTrue(manager_spaces[0]["appearance"]["mascotEnabled"])
+        self.assertEqual(manager_spaces[0]["appearance"]["mascotKey"], "blue")
+        visitor_spaces = visitor["client"].get("/api/spaces").get_json()["spaces"]
+        self.assertEqual(visitor_spaces[0]["appearance"]["mascotKey"], "blue")
         blue_spaces = self.blue.get("/api/spaces").get_json()["spaces"]
         self.assertTrue(blue_spaces[0]["appearance"]["mascotEnabled"])
+        self.assertEqual(blue_spaces[0]["appearance"]["mascotKey"], "blue")
+
+    def test_platform_admin_can_change_and_restore_mascot_without_cross_space_leakage(self):
+        manager_a = self.register_manager("mascot-a")
+        manager_b = self.register_manager("mascot-b")
+        public_a = manager_a["space"]["publicId"]
+        public_b = manager_b["space"]["publicId"]
+        visitor = self.register_viewer(self.viewer_code(manager_a), "mascotviewer")
+        path = f"/api/platform/spaces/{public_a}/appearance"
+
+        with self.platform_db() as connection:
+            defaults = {
+                row["public_id"]: row["mascot_key"]
+                for row in connection.execute(
+                    "SELECT public_id, mascot_key FROM spaces WHERE public_id IN (?, ?)",
+                    (public_a, public_b),
+                ).fetchall()
+            }
+        self.assertEqual(defaults, {public_a: "blue", public_b: "blue"})
+
+        anonymous = server.app.test_client()
+        self.assertEqual(
+            anonymous.put(path, json={"mascotKey": "azure"}).status_code,
+            401,
+        )
+        for client in (manager_a["client"], visitor["client"]):
+            denied = client.put(
+                path,
+                json={"mascotKey": "azure"},
+                headers=self.headers(client, csrf=True),
+            )
+            self.assertEqual(denied.status_code, 404)
+
+        missing_csrf = self.blue.put(path, json={"mascotKey": "azure"})
+        self.assertEqual(missing_csrf.status_code, 403)
+        self.assertEqual(missing_csrf.get_json()["code"], "csrf_failed")
+
+        invalid = self.blue.put(
+            path,
+            json={"mascotKey": "https://example.test/not-allowed.png"},
+            headers=self.headers(self.blue, csrf=True),
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(invalid.get_json()["code"], "invalid_mascot")
+
+        missing = self.blue.put(
+            "/api/platform/spaces/missing-space/appearance",
+            json={"mascotKey": "azure"},
+            headers=self.headers(self.blue, csrf=True),
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.get_json()["code"], "not_found")
+
+        protected = self.blue.put(
+            f"/api/platform/spaces/{self.blue_space['publicId']}/appearance",
+            json={"mascotKey": "pink"},
+            headers=self.headers(self.blue, csrf=True),
+        )
+        self.assertEqual(protected.status_code, 403)
+        self.assertEqual(protected.get_json()["code"], "blue_space_protected")
+
+        assigned = self.blue.put(
+            path,
+            json={"mascotKey": "azure"},
+            headers=self.headers(self.blue, csrf=True),
+        )
+        self.assertEqual(assigned.status_code, 200, assigned.get_data(as_text=True))
+        assigned_payload = assigned.get_json()
+        self.assertEqual(set(assigned_payload), {"ok", "space"})
+        self.assertEqual(
+            assigned_payload["space"]["appearance"],
+            {
+                "mascotEnabled": True,
+                "mascotKey": "azure",
+                "assetUrl": "/static/mascots/azure.png",
+            },
+        )
+
+        with self.platform_db() as connection:
+            assigned_keys = {
+                row["public_id"]: row["mascot_key"]
+                for row in connection.execute(
+                    "SELECT public_id, mascot_key FROM spaces WHERE public_id IN (?, ?)",
+                    (public_a, public_b),
+                ).fetchall()
+            }
+        self.assertEqual(assigned_keys, {public_a: "azure", public_b: "blue"})
+
+        for client, expected_access in (
+            (manager_a["client"], "owner"),
+            (visitor["client"], "viewer"),
+            (self.blue, "platform_preview"),
+        ):
+            response = client.get(
+                "/api/data",
+                headers=self.headers(client, public_a),
+            )
+            self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+            payload = response.get_json()
+            self.assertEqual(payload["access"], expected_access)
+            self.assertEqual(payload["workspace"]["appearance"]["mascotKey"], "azure")
+            self.assertNotIn("viewer_secret", response.get_data(as_text=True))
+
+        manager_b_data = manager_b["client"].get(
+            "/api/data",
+            headers=self.headers(manager_b["client"], public_b),
+        )
+        self.assertEqual(manager_b_data.get_json()["workspace"]["appearance"]["mascotKey"], "blue")
+
+        restored = self.blue.put(
+            path,
+            json={"mascotKey": "blue"},
+            headers=self.headers(self.blue, csrf=True),
+        )
+        self.assertEqual(restored.status_code, 200, restored.get_data(as_text=True))
+        self.assertEqual(restored.get_json()["space"]["appearance"]["mascotKey"], "blue")
+        restored_owner = manager_a["client"].get(
+            "/api/data",
+            headers=self.headers(manager_a["client"], public_a),
+        )
+        self.assertEqual(restored_owner.get_json()["workspace"]["appearance"]["mascotKey"], "blue")
 
     def test_space_deletion_permissions_confirmation_protection_and_target_binding(self):
         manager_a = self.register_manager("delete-a")
@@ -1524,6 +1674,14 @@ class Day1NewApiTests(unittest.TestCase):
             "platform-blacklist-count",
             "platform-ip-block-list",
             "open-manual-ip-block",
+            "owner-goal-mascot",
+            "owner-goal-mascot-image",
+            "visitor-mascot-image",
+            "mascot-dialog",
+            "mascot-form",
+            "mascot-space-name",
+            "mascot-options",
+            "save-mascot-button",
             "delete-space-dialog",
             "delete-space-form",
             "delete-space-name",
@@ -1558,7 +1716,7 @@ class Day1NewApiTests(unittest.TestCase):
         self.assertNotIn(" open", html[danger_start:danger_tag_end])
         self.assertLess(html.index('id="data-tools"'), danger_start)
         self.assertIn('id="visitor-heading" class="visitor-heading visitor-heading-with-mascot"', html)
-        self.assertIn('id="visitor-mascot" class="visitor-mascot" aria-hidden="true">', html)
+        self.assertIn('id="visitor-mascot" class="visitor-mascot" data-mascot-key="blue" aria-hidden="true">', html)
         self.assertNotIn("visitor-day1-seal", html)
 
         for visible_copy in (
@@ -1576,6 +1734,9 @@ class Day1NewApiTests(unittest.TestCase):
             "安排到今天",
             "占长期目标的比例",
             "添加一个明确的小目标",
+            "内容只读 · 外观可管理",
+            "更换小精灵",
+            "随时可以恢复 Blue 原版",
         ):
             self.assertIn(visible_copy, html)
 
@@ -1599,13 +1760,17 @@ class Day1NewApiTests(unittest.TestCase):
             "activeGoal",
             "weightPercent",
             "progressPercent",
+            "MASCOT_OPTIONS",
+            "openMascotDialog",
+            "clearMascotOptions",
+            "/appearance",
+            'image.loading = "lazy"',
         ):
             self.assertIn(script_contract, script)
         self.assertNotIn("blockedPlatformPreview", script)
 
         self.assertNotIn("添加小精灵", script)
         self.assertNotIn("移除小精灵", script)
-        self.assertNotIn("/mascot", script)
         self.assertNotIn("visitor-heading-with-seal", script + styles)
         self.assertNotIn("visitor-day1-seal", html + script + styles)
 
@@ -1643,8 +1808,28 @@ class Day1NewApiTests(unittest.TestCase):
             ".goal-route-subgoal",
             ".goal-color-options",
             '[data-goal-color="sage"]',
+            ".mascot-options",
+            ".mascot-option-card",
+            '.visitor-mascot[data-mascot-key="blue"] img',
+            '.mascot-option-preview[data-mascot-key="blue"] img',
+            ".history-item-status.is-combined::before",
+            ".history-item-status.is-combined",
+            ".record-result-status.is-completed",
+            ".heatmap-cell.is-stage-complete.has-daily-result::after",
         ):
             self.assertIn(selector, styles)
+
+        mascot_dir = static_dir / "mascots"
+        for filename in ("blue.png", "azure.png", "ribbon.png", "pink.png"):
+            path = mascot_dir / filename
+            self.assertTrue(path.is_file(), filename)
+            self.assertLess(path.stat().st_size, 175_000, filename)
+            with server.Image.open(path) as image:
+                image.load()
+                self.assertEqual(image.format, "PNG", filename)
+                self.assertEqual(image.size, (510, 340), filename)
+                self.assertEqual(image.mode, "RGBA", filename)
+                self.assertEqual(image.getchannel("A").getextrema(), (0, 255), filename)
 
     def test_message_window_boundaries_and_conversations_are_isolated(self):
         manager = self.register_manager("留言空间")
