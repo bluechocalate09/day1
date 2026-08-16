@@ -2475,6 +2475,80 @@ class DailySealApiTests(unittest.TestCase):
         self.assertIn("每行粘贴一个", index_html)
         self.assertIn("每个文件最大 10 MB", index_html)
 
+    def test_history_marks_zero_percent_incomplete_and_keeps_long_records_collapsible(self):
+        static_dir = WORK_DIR / "app" / "static"
+        index_html = (static_dir / "index.html").read_text(encoding="utf-8")
+        app_script = (static_dir / "app.js").read_text(encoding="utf-8")
+        styles = (static_dir / "app.css").read_text(encoding="utf-8")
+
+        self.assertEqual(index_html.count("0% 未完成"), 2)
+        self.assertIn('id="history-list-controls"', index_html)
+        self.assertIn('id="visitor-history-list-controls"', index_html)
+        self.assertIn('id="collapse-history"', index_html)
+        self.assertIn('id="visitor-collapse-history"', index_html)
+        self.assertGreaterEqual(index_html.count("再看 5 条"), 2)
+        progress_start = index_html.index('<details id="record-progress-section"')
+        progress_tag_end = index_html.index(">", progress_start)
+        self.assertNotIn(" open", index_html[progress_start:progress_tag_end])
+        self.assertIn('class="record-progress-toggle"', index_html)
+        summary_start = index_html.index('<summary class="record-progress-heading">')
+        summary_end = index_html.index("</summary>", summary_start)
+        summary_markup = index_html[summary_start:summary_end]
+        self.assertNotIn("<div", summary_markup)
+        self.assertIn('class="record-progress-title" role="heading"', summary_markup)
+
+        for script_contract in (
+            "const HISTORY_PAGE_SIZE = 5;",
+            "taskIsZeroIncomplete(task)",
+            "task.resultLocked === true",
+            'cell.classList.add("is-zero-incomplete")',
+            'section.classList.add("is-zero-incomplete")',
+            'state.ownerHistoryLimit += HISTORY_PAGE_SIZE',
+            'state.ownerHistoryLimit = HISTORY_PAGE_SIZE',
+            "阶段 · 0% 未完成",
+            "0% 未完成警示",
+            'if ($("#show-all-history").hidden) $("#collapse-history").focus()',
+            'if (!$("#show-all-history").hidden) $("#show-all-history").focus()',
+            'if ($("#visitor-load-more").hidden) $("#visitor-collapse-history").focus()',
+            'if (!$("#visitor-load-more").hidden) $("#visitor-load-more").focus()',
+        ):
+            self.assertIn(script_contract, app_script)
+
+        self.assertGreaterEqual(
+            app_script.count("state.ownerHistoryLimit = HISTORY_PAGE_SIZE;"), 4
+        )
+        self.assertGreaterEqual(
+            app_script.count("state.visitorHistoryLimit = HISTORY_PAGE_SIZE;"), 4
+        )
+
+        zero_warning_start = app_script.index("function taskIsZeroIncomplete(task)")
+        zero_warning_end = app_script.index("\n  }", zero_warning_start)
+        zero_warning_contract = app_script[zero_warning_start:zero_warning_end]
+        for required_boundary in (
+            "task.resultLocked === true",
+            'taskResultStatus(task) === "incomplete"',
+            "taskCompletionPercent(task) === 0",
+        ):
+            self.assertIn(required_boundary, zero_warning_contract)
+
+        for style_contract in (
+            ".heatmap-cell.is-zero-incomplete",
+            ".history-item.is-zero-incomplete",
+            ".history-item-status.is-combined.is-incomplete",
+            ".record-daily-section.is-zero-incomplete",
+            ".record-progress-section[open] .record-progress-toggle::after",
+            "#proof-view-dialog .dialog-actions",
+        ):
+            self.assertIn(style_contract, styles)
+
+        combined_color = styles.index(".history-item-status.is-combined {")
+        incomplete_color = styles.index(
+            ".history-item-status.is-combined.is-incomplete {"
+        )
+        zero_color = styles.index(".history-item-status.is-zero-incomplete,")
+        self.assertLess(combined_color, incomplete_color)
+        self.assertLess(incomplete_color, zero_color)
+
     def test_completion_rejects_missing_invalid_unsupported_and_oversize_proof(self):
         self.login_unlocked_owner()
         self.assertEqual(self.put_task(self.client).status_code, 200)

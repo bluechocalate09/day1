@@ -7,6 +7,7 @@
   const SHANGHAI_TZ = "Asia/Shanghai";
   const VIEWER_CODE_REFRESH_CONFIRMATION = "我确认刷新并知道会断开所有访客端连接";
   const MAX_PROOF_FILE_BYTES = 10 * 1024 * 1024;
+  const HISTORY_PAGE_SIZE = 5;
   const MASCOT_OPTIONS = Object.freeze([
     Object.freeze({ key: "blue", label: "Blue 原版", assetUrl: "/static/mascots/blue.png" }),
     Object.freeze({ key: "azure", label: "蓝角小精灵", assetUrl: "/static/mascots/azure.png" }),
@@ -75,8 +76,8 @@
     lastAccessCheckAt: 0,
     historyYear: Number(dateKeyInShanghai().slice(0, 4)),
     visitorHistoryYear: Number(dateKeyInShanghai().slice(0, 4)),
-    ownerHistoryExpanded: false,
-    visitorHistoryLimit: 8,
+    ownerHistoryLimit: HISTORY_PAGE_SIZE,
+    visitorHistoryLimit: HISTORY_PAGE_SIZE,
     selectedOwnerDate: "",
     selectedVisitorDate: "",
     progressFiles: [],
@@ -359,6 +360,15 @@
 
   function taskHasResult(task) {
     return taskResultStatus(task) !== "pending";
+  }
+
+  function taskIsZeroIncomplete(task) {
+    return Boolean(
+      task
+      && task.resultLocked === true
+      && taskResultStatus(task) === "incomplete"
+      && taskCompletionPercent(task) === 0
+    );
   }
 
   function taskResultIsStale(task) {
@@ -951,6 +961,8 @@
     state.lastAccessCheckAt = 0;
     state.selectedOwnerDate = "";
     state.selectedVisitorDate = "";
+    state.ownerHistoryLimit = HISTORY_PAGE_SIZE;
+    state.visitorHistoryLimit = HISTORY_PAGE_SIZE;
     state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
@@ -973,6 +985,8 @@
     state.publicPoms = {};
     state.selectedOwnerDate = "";
     state.selectedVisitorDate = "";
+    state.ownerHistoryLimit = HISTORY_PAGE_SIZE;
+    state.visitorHistoryLimit = HISTORY_PAGE_SIZE;
     state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
@@ -998,6 +1012,7 @@
     $("#record-stage-section").hidden = true;
     $("#record-daily-section").hidden = true;
     $("#record-progress-section").hidden = true;
+    $("#record-progress-section").open = false;
     $("#record-progress-list").replaceChildren();
     $("#record-focus-section").hidden = true;
     $("#record-private-section").hidden = true;
@@ -1990,10 +2005,14 @@
       if (task) cell.classList.add("is-task");
       if (task && taskHasPublicRecord(task)) {
         cell.classList.add("is-recorded", `progress-${taskProgressLevel(task)}`);
-        cell.style.setProperty("--daily-result-color", `var(--progress-${taskProgressLevel(task)})`);
+        cell.style.setProperty(
+          "--daily-result-color",
+          taskIsZeroIncomplete(task) ? "var(--danger)" : `var(--progress-${taskProgressLevel(task)})`,
+        );
       }
       if (task && taskResultStatus(task) === "completed") cell.classList.add("is-done");
       if (task && taskResultStatus(task) === "incomplete") cell.classList.add("is-incomplete");
+      if (task && taskIsZeroIncomplete(task)) cell.classList.add("is-zero-incomplete");
       if (task && taskHasSupplement(task)) cell.classList.add("is-supplemented");
       if (poms > 0) cell.classList.add("is-focus-record");
       if (hasPrivate) cell.classList.add("has-private-record");
@@ -2111,7 +2130,7 @@
       });
     }
     const ordered = Array.from(entries.values()).sort((a, b) => b.date.localeCompare(a.date));
-    const limit = visitor ? state.visitorHistoryLimit : (state.ownerHistoryExpanded ? ordered.length : 8);
+    const limit = visitor ? state.visitorHistoryLimit : state.ownerHistoryLimit;
     list.replaceChildren();
     if (!ordered.length) {
       const empty = document.createElement("li");
@@ -2121,10 +2140,12 @@
     } else {
       ordered.slice(0, limit).forEach((entry) => {
         const item = document.createElement("li");
+        const zeroIncomplete = Boolean(entry.task && taskIsZeroIncomplete(entry.task));
         item.className = "history-item";
         if (entry.stageId !== null) item.classList.add("has-stage");
         if (entry.poms > 0) item.classList.add("has-focus");
         if (entry.task && taskHasSupplement(entry.task)) item.classList.add("is-supplemented");
+        if (zeroIncomplete) item.classList.add("is-zero-incomplete");
         if (entry.hasPrivate) item.classList.add("has-private-record");
         const time = document.createElement("time");
         time.className = "history-item-date";
@@ -2153,8 +2174,9 @@
         const action = document.createElement("button");
         action.type = "button";
         if (entry.stageId !== null && entry.task && taskHasPublicRecord(entry.task)) {
-          action.className = "history-item-status is-combined";
-          action.textContent = `阶段 · ${taskResultLabel(entry.task, false)}`;
+          const resultStatus = taskResultStatus(entry.task);
+          action.className = `history-item-status is-combined${resultStatus === "incomplete" ? " is-incomplete" : ""}${zeroIncomplete ? " is-zero-incomplete" : ""}`;
+          action.textContent = zeroIncomplete ? "阶段 · 0% 未完成" : `阶段 · ${taskResultLabel(entry.task, false)}`;
         } else if (entry.stageId !== null) {
           action.className = "history-item-status is-stage";
           action.textContent = "阶段完成";
@@ -2166,7 +2188,7 @@
           action.textContent = "查看";
         } else {
           const status = taskResultStatus(entry.task);
-          action.className = `history-item-status${status === "completed" ? " is-done" : (status === "incomplete" ? " is-incomplete" : " is-pending")}`;
+          action.className = `history-item-status${status === "completed" ? " is-done" : (status === "incomplete" ? " is-incomplete" : " is-pending")}${zeroIncomplete ? " is-zero-incomplete" : ""}`;
           action.textContent = taskResultLabel(entry.task, status === "incomplete" || taskHasProgress(entry.task));
         }
         const recordKinds = [];
@@ -2174,21 +2196,22 @@
         if (entry.task) recordKinds.push("每日记录");
         if (entry.poms > 0) recordKinds.push("专注记录");
         if (entry.hasPrivate) recordKinds.push("私人记录");
-        action.setAttribute("aria-label", `查看 ${entry.date} 的${recordKinds.join("和")}`);
+        action.setAttribute("aria-label", `查看 ${entry.date} 的${recordKinds.join("和")}${zeroIncomplete ? "；0% 未完成警示" : ""}`);
         action.addEventListener("click", () => openDateRecord(entry.date, entry.task, entry.stageId, scope));
         item.append(time, text, action);
         list.appendChild(item);
       });
     }
 
-    if (visitor) {
-      const more = $("#visitor-load-more");
-      more.hidden = ordered.length <= state.visitorHistoryLimit;
-    } else {
-      const all = $("#show-all-history");
-      all.hidden = ordered.length <= 8;
-      all.textContent = state.ownerHistoryExpanded ? "收起" : "查看全部";
-    }
+    const currentLimit = visitor ? state.visitorHistoryLimit : state.ownerHistoryLimit;
+    const more = visitor ? $("#visitor-load-more") : $("#show-all-history");
+    const collapse = visitor ? $("#visitor-collapse-history") : $("#collapse-history");
+    const remaining = Math.max(0, ordered.length - currentLimit);
+    const visibleCount = Math.min(ordered.length, currentLimit);
+    more.hidden = remaining === 0;
+    more.textContent = `再看 ${Math.min(HISTORY_PAGE_SIZE, remaining)} 条`;
+    collapse.hidden = visibleCount <= HISTORY_PAGE_SIZE;
+    more.parentElement.hidden = remaining === 0 && visibleCount <= HISTORY_PAGE_SIZE;
   }
 
   function renderAll() {
@@ -2964,6 +2987,7 @@
     $("#record-focus-section").hidden = true;
     $("#record-private-section").hidden = true;
     $("#record-progress-section").hidden = true;
+    $("#record-progress-section").open = false;
     $("#record-progress-list").replaceChildren();
     $("#record-distractions-block").hidden = true;
     $("#record-note-block").hidden = true;
@@ -2998,6 +3022,9 @@
     section.hidden = false;
     const status = taskResultStatus(task);
     const hasResult = taskHasResult(task);
+    section.classList.remove("is-completed", "is-incomplete", "is-zero-incomplete", "is-pending");
+    section.classList.add(status === "completed" ? "is-completed" : (status === "incomplete" ? "is-incomplete" : "is-pending"));
+    if (taskIsZeroIncomplete(task)) section.classList.add("is-zero-incomplete");
     const statusElement = $("#record-daily-status");
     statusElement.classList.remove("is-completed", "is-incomplete", "is-pending");
     statusElement.classList.add(status === "completed" ? "is-completed" : (status === "incomplete" ? "is-incomplete" : "is-pending"));
@@ -3389,6 +3416,8 @@
     const currentYear = Number(dateKeyInShanghai().slice(0, 4));
     const previous = state[key];
     state[key] = Math.min(currentYear, Math.max(2020, previous + amount));
+    if (visitor) state.visitorHistoryLimit = HISTORY_PAGE_SIZE;
+    else state.ownerHistoryLimit = HISTORY_PAGE_SIZE;
     try {
       await loadStageYear(state[key]);
       renderStageCards();
@@ -5020,12 +5049,24 @@
     $("#close-message-panel").addEventListener("click", () => toggleMessagePanel(false));
     $("#message-form").addEventListener("submit", submitMessage);
     $("#show-all-history").addEventListener("click", () => {
-      state.ownerHistoryExpanded = !state.ownerHistoryExpanded;
+      state.ownerHistoryLimit += HISTORY_PAGE_SIZE;
       renderHistory("owner");
+      if ($("#show-all-history").hidden) $("#collapse-history").focus();
+    });
+    $("#collapse-history").addEventListener("click", () => {
+      state.ownerHistoryLimit = HISTORY_PAGE_SIZE;
+      renderHistory("owner");
+      if (!$("#show-all-history").hidden) $("#show-all-history").focus();
     });
     $("#visitor-load-more").addEventListener("click", () => {
-      state.visitorHistoryLimit += 8;
+      state.visitorHistoryLimit += HISTORY_PAGE_SIZE;
       renderHistory("visitor");
+      if ($("#visitor-load-more").hidden) $("#visitor-collapse-history").focus();
+    });
+    $("#visitor-collapse-history").addEventListener("click", () => {
+      state.visitorHistoryLimit = HISTORY_PAGE_SIZE;
+      renderHistory("visitor");
+      if (!$("#visitor-load-more").hidden) $("#visitor-load-more").focus();
     });
     $("#previous-year").addEventListener("click", () => moveHistoryYear("owner", -1));
     $("#next-year").addEventListener("click", () => moveHistoryYear("owner", 1));

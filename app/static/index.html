@@ -304,6 +304,7 @@
                   <div id="history-grid" class="heatmap-grid" role="grid" aria-label="每日完成记录" data-history-grid="owner"></div>
                 </div>
                 <div class="heatmap-legend" aria-label="年度记录图例">
+                  <span><i class="is-zero-incomplete" aria-hidden="true"></i>0% 未完成</span>
                   <span class="heatmap-scale"><span class="heatmap-scale-swatches" aria-hidden="true"><i class="progress-0"></i><i class="progress-1"></i><i class="progress-2"></i><i class="progress-3"></i><i class="progress-4"></i><i class="progress-5"></i></span>完成程度</span>
                   <span><i class="is-stage-complete" aria-hidden="true"></i>阶段完成</span>
                   <span><i class="is-focus-record" aria-hidden="true"></i>专注记录</span>
@@ -313,11 +314,14 @@
                 <div class="history-list-section">
                   <div class="history-list-heading">
                     <h3>最近记录</h3>
-                    <button id="show-all-history" class="text-button" type="button" data-action="show-all-history">查看全部</button>
                   </div>
                   <ol id="history-list" class="history-list" data-history-list="owner">
                     <li class="history-empty">完成后，记录会安静地留在这里。</li>
                   </ol>
+                  <div id="history-list-controls" class="history-list-controls" hidden>
+                    <button id="collapse-history" class="button button-quiet button-small" type="button" aria-controls="history-list" hidden>收起记录</button>
+                    <button id="show-all-history" class="button button-quiet button-small" type="button" aria-controls="history-list" data-action="show-all-history" hidden>再看 5 条</button>
+                  </div>
                 </div>
               </section>
             </div>
@@ -576,6 +580,7 @@
                 <div id="visitor-history-grid" class="heatmap-grid" role="grid" aria-label="每日完成记录" data-history-grid="visitor"></div>
               </div>
               <div class="heatmap-legend" aria-label="年度记录图例">
+                <span><i class="is-zero-incomplete" aria-hidden="true"></i>0% 未完成</span>
                 <span class="heatmap-scale"><span class="heatmap-scale-swatches" aria-hidden="true"><i class="progress-0"></i><i class="progress-1"></i><i class="progress-2"></i><i class="progress-3"></i><i class="progress-4"></i><i class="progress-5"></i></span>完成程度</span>
                 <span><i class="is-stage-complete" aria-hidden="true"></i>阶段完成</span>
                 <span><i class="is-focus-record" aria-hidden="true"></i>专注记录</span>
@@ -585,7 +590,10 @@
               <ol id="visitor-history-list" class="history-list visitor-history-list" data-history-list="visitor">
                 <li class="history-empty">暂时还没有完成记录。</li>
               </ol>
-              <button id="visitor-load-more" class="button button-quiet button-block" type="button" data-action="load-more-history" hidden>查看更多记录</button>
+              <div id="visitor-history-list-controls" class="history-list-controls" hidden>
+                <button id="visitor-collapse-history" class="button button-quiet button-small" type="button" aria-controls="visitor-history-list" hidden>收起记录</button>
+                <button id="visitor-load-more" class="button button-quiet button-small" type="button" aria-controls="visitor-history-list" data-action="load-more-history" hidden>再看 5 条</button>
+              </div>
             </section>
           </div>
         </section>
@@ -1037,16 +1045,16 @@
             <span id="record-daily-feedback-label">备注</span>
             <p id="proof-view-text" class="proof-view-text">—</p>
           </div>
-          <section id="record-progress-section" class="record-progress-section" aria-labelledby="record-progress-title" hidden>
-            <header class="record-progress-heading">
-              <div>
-                <p class="card-kicker">进度轨迹</p>
-                <h4 id="record-progress-title">进度记录</h4>
-              </div>
-              <span id="record-progress-count" class="record-duration">0 次更新</span>
-            </header>
+          <details id="record-progress-section" class="record-progress-section" hidden>
+            <summary class="record-progress-heading">
+              <span class="record-progress-heading-copy">
+                <span class="card-kicker">进度轨迹</span>
+                <span id="record-progress-title" class="record-progress-title" role="heading" aria-level="4">进度记录</span>
+              </span>
+              <span class="record-progress-summary-action"><span id="record-progress-count" class="record-duration">0 次更新</span><span class="record-progress-toggle" aria-hidden="true"></span></span>
+            </summary>
             <div id="record-progress-list" class="record-progress-list"></div>
-          </section>
+          </details>
           <a id="record-daily-proof-url" class="record-proof-link" href="#" target="_blank" rel="noopener noreferrer nofollow" hidden>打开证据链接<span aria-hidden="true"> ↗</span></a>
           <img id="proof-view-image" class="proof-view-image" alt="每日完成证明图片" hidden>
           <a id="record-daily-file" class="record-file-card" href="#" download hidden>
