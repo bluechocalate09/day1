@@ -412,6 +412,8 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     poms INTEGER NOT NULL DEFAULT 0 CHECK (poms >= 0),
     note TEXT NOT NULL DEFAULT '',
     distractions TEXT NOT NULL DEFAULT '',
+    poms_recorded_at INTEGER CHECK (poms_recorded_at IS NULL OR poms_recorded_at >= 0),
+    poms_record_date TEXT,
     updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS long_term_goals (
@@ -523,6 +525,19 @@ def business_date_for_timestamp(timestamp):
     return datetime.fromtimestamp(timestamp, CHINA_STANDARD_TIME).date().isoformat()
 
 
+def business_clock_snapshot(task_date_hint=None):
+    """Return one timestamp and its matching Beijing business date.
+
+    The injected date provider is reserved for deterministic tests and
+    maintenance. Production derives both values from the same clock sample so
+    a write cannot straddle midnight with contradictory pomodoro metadata.
+    """
+    timestamp = now_ts()
+    if callable(app.config.get("BUSINESS_DATE_PROVIDER")):
+        return timestamp, business_today_key(task_date_hint)
+    return timestamp, business_date_for_timestamp(timestamp)
+
+
 def task_deadline_timestamp(task_date):
     next_date = date.fromisoformat(task_date) + timedelta(days=1)
     return int(
@@ -544,6 +559,19 @@ def task_progress_mode(task_date, current_date=None):
         return "day"
     if parsed_task_date == parsed_current_date - timedelta(days=1):
         return "supplement"
+    return None
+
+
+def pom_recording_mode(stat_date, current_date=None):
+    """Return ``day``, ``backfill`` or ``None`` for a pomodoro write."""
+    current_date = current_date or business_today_key()
+    parsed_stat_date = date.fromisoformat(stat_date)
+    parsed_current_date = date.fromisoformat(current_date)
+    day_distance = (parsed_current_date - parsed_stat_date).days
+    if day_distance == 0:
+        return "day"
+    if 1 <= day_distance <= 3:
+        return "backfill"
     return None
 
 
@@ -722,6 +750,8 @@ def migrate_content_schema(connection, upload_dir):
     """Apply additive content migrations to one isolated Day1 workspace."""
     upload_dir.mkdir(parents=True, exist_ok=True)
     connection.executescript(CONTENT_SCHEMA)
+    ensure_column(connection, "tasks", "checklist", "TEXT NOT NULL DEFAULT '[]'")
+    ensure_column(connection, "task_progress", "checked_items", "TEXT")
     ensure_column(connection, "tasks", "proof_url", "TEXT")
     ensure_column(
         connection,
@@ -796,6 +826,13 @@ def migrate_content_schema(connection, upload_dir):
         "distractions",
         "TEXT NOT NULL DEFAULT ''",
     )
+    ensure_column(
+        connection,
+        "daily_stats",
+        "poms_recorded_at",
+        "INTEGER CHECK (poms_recorded_at IS NULL OR poms_recorded_at >= 0)",
+    )
+    ensure_column(connection, "daily_stats", "poms_record_date", "TEXT")
     ensure_column(connection, "task_progress", "client_key", "TEXT")
     ensure_column(connection, "task_progress", "record_date", "TEXT")
     connection.execute(
@@ -1936,6 +1973,7 @@ def serialize_progress_entry(row, assets):
         "id": row["id"],
         "note": row["note"] or "",
         "progressPercent": row["progress_percent"],
+        "checkedItems": json.loads(row["checked_items"]) if row["checked_items"] else None,
         "createdAt": utc_iso(row["created_at"]),
         "recordDate": record_date,
         "supplemental": record_date > row["task_date"],
@@ -2077,6 +2115,9 @@ def serialize_task(row, progress_entries=None):
     progress_mode = task_progress_mode(row["task_date"], current_date)
     latest_supplement = supplement_entries[-1] if supplement_entries else None
     payload = {
+        "checklist": json.loads(row["checklist"]),
+        "checkedItems": (actual_entries[-1].get("checkedItems") or []) if actual_entries else [],
+        "checklistRevision": actual_entries[-1]["id"] if actual_entries else 0,
         "date": row["task_date"],
         "text": row["text"],
         "done": bool(row["done"]),
@@ -2119,6 +2160,34 @@ def serialize_task(row, progress_entries=None):
     ))
     payload["progressEntries"] = entries
     return payload
+
+
+def serialize_pom_record(row):
+    """Serialize public pomodoro timing without exposing private daily text."""
+    recorded_at = row["poms_recorded_at"]
+    record_date = row["poms_record_date"]
+    if recorded_at is None or not validate_date_key(record_date):
+        return {
+            "poms": row["poms"],
+            "pomsRecordedAt": None,
+            "pomsRecordDate": None,
+            "pomsBackfilled": False,
+        }
+    return {
+        "poms": row["poms"],
+        "pomsRecordedAt": utc_iso(recorded_at),
+        "pomsRecordDate": record_date,
+        "pomsBackfilled": record_date > row["stat_date"],
+    }
+
+
+def public_pom_meta(row):
+    record = serialize_pom_record(row)
+    return {
+        "recordedAt": record["pomsRecordedAt"],
+        "recordDate": record["pomsRecordDate"],
+        "backfilled": record["pomsBackfilled"],
+    }
 
 
 def validate_goal_fields(payload, existing=None):
@@ -3791,7 +3860,8 @@ def get_data():
         # Select only explicitly public columns for viewers so private text can
         # never enter their response object, even accidentally.
         public_pom_rows = database.execute(
-            "SELECT stat_date, poms FROM daily_stats "
+            "SELECT stat_date, poms, poms_recorded_at, poms_record_date "
+            "FROM daily_stats "
             "WHERE stat_date <= ? AND poms > 0 ORDER BY stat_date",
             (public_cutoff,),
         ).fetchall()
@@ -3800,6 +3870,14 @@ def get_data():
         for row in public_pom_rows
         if row["poms"] > 0 and row["stat_date"] <= public_cutoff
     }
+    pom_meta = {}
+    for row in public_pom_rows:
+        if row["poms"] <= 0 or row["stat_date"] > public_cutoff:
+            continue
+        serialized_meta = public_pom_meta(row)
+        if serialized_meta["recordedAt"] and serialized_meta["backfilled"]:
+            pom_meta[row["stat_date"]] = serialized_meta
+    payload["publicPomMeta"] = pom_meta
     return jsonify(payload)
 
 
@@ -4371,13 +4449,52 @@ def complete_stage(stage_id):
     })
 
 
+def validate_checklist(value):
+    """Keep the daily denominator explicit and stable once recording starts."""
+    if not isinstance(value, list) or len(value) > 20:
+        raise ValueError("清单最多可安排 20 项任务。")
+    result = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("清单项目无效。")
+        title, weight = item.get("text"), item.get("weight")
+        if not isinstance(title, str) or not title.strip() or len(title.strip()) > 200:
+            raise ValueError("每项请填写 1 到 200 字的任务内容。")
+        if type(weight) is not int or not 1 <= weight <= 100:
+            raise ValueError("每项占比应为 1 到 100 的整数。")
+        result.append({"text": title.strip(), "weight": weight})
+    if result and sum(item["weight"] for item in result) != 100:
+        raise ValueError("请将所有任务的占比合计为 100%。")
+    if len(checklist_text(result)) > 1000:
+        raise ValueError("每日清单总内容不能超过 1000 字。")
+    return result
+
+
+def checklist_text(items):
+    return "\n".join(f'{index + 1}. {item["text"]} · {item["weight"]}%' for index, item in enumerate(items))
+
+
+def validate_checked_items(value, checklist):
+    if (not isinstance(value, list) or any(type(index) is not int for index in value)
+            or len(set(value)) != len(value)
+            or any(index < 0 or index >= len(checklist) for index in value)):
+        raise ValueError("勾选项目无效，请重新打开进度清单。")
+    return sorted(value)
+
+
 @app.put("/api/tasks/<task_date>")
 @require_owner
 @require_csrf
 def set_task(task_date):
     task_date = validate_date_key(task_date)
     payload = parse_json()
+    try:
+        checklist = validate_checklist(payload.get("checklist", [])) if payload else []
+    except ValueError as error:
+        return api_error(str(error))
     text = payload.get("text", "").strip() if payload and isinstance(payload.get("text"), str) else ""
+    if checklist:
+        text = checklist_text(checklist)
     if not task_date or not text or len(text) > 1000:
         return api_error("任务日期或内容无效，内容不能超过 1000 字。")
     current_date = business_today_key(task_date)
@@ -4389,6 +4506,24 @@ def set_task(task_date):
         )
     database = get_content_db()
     database.execute("BEGIN IMMEDIATE")
+    current_date = business_today_key(task_date)
+    if task_date < current_date:
+        database.rollback()
+        return api_error("日期已经变化，请刷新后再设置任务。", 409, "task_window_closed")
+    existing = database.execute("SELECT * FROM tasks WHERE task_date = ?", (task_date,)).fetchone()
+    if existing:
+        old_checklist = json.loads(existing["checklist"])
+        # Old clients cannot silently erase a checklist; historical percentages
+        # cannot acquire a new denominator after progress has been recorded.
+        if "checklist" not in payload:
+            checklist = old_checklist
+            if checklist:
+                text = checklist_text(checklist)
+        if checklist != old_checklist and database.execute(
+            "SELECT 1 FROM task_progress WHERE task_date = ? LIMIT 1", (task_date,)
+        ).fetchone():
+            database.rollback()
+            return api_error("已有进度后，任务项目和占比保持固定；可继续勾选或补充说明。", 409, "checklist_locked")
     finalize_expired_tasks(database, current_date)
     cursor = database.execute(
         "INSERT INTO tasks(task_date, text, done, created_at) VALUES (?, ?, 0, ?) "
@@ -4401,6 +4536,8 @@ def set_task(task_date):
         return api_error(
             "已记录最终结果的任务不能直接修改。", 409, "task_recorded"
         )
+    database.execute("UPDATE tasks SET checklist = ? WHERE task_date = ?",
+                     (json.dumps(checklist, ensure_ascii=False), task_date))
     database.commit()
     row = database.execute("SELECT * FROM tasks WHERE task_date = ?", (task_date,)).fetchone()
     return jsonify({"ok": True, "task": serialize_task_with_progress(database, row)})
@@ -4825,7 +4962,7 @@ def create_task_progress(task_date):
         # lock, two workers can both miss the token and one would surface a
         # UNIQUE violation instead of returning the already-created record.
         database.execute("BEGIN IMMEDIATE")
-        current_date = business_today_key(task_date)
+        created_at, current_date = business_clock_snapshot(task_date)
         progress_mode = task_progress_mode(task_date, current_date)
         if progress_mode is None:
             database.rollback()
@@ -4841,7 +4978,6 @@ def create_task_progress(task_date):
                 "progress_window_not_open",
             )
         finalize_expired_tasks(database, current_date)
-        created_at = now_ts()
         task_row = database.execute(
             "SELECT * FROM tasks WHERE task_date = ?", (task_date,)
         ).fetchone()
@@ -4871,10 +5007,28 @@ def create_task_progress(task_date):
                 database.rollback()
                 return jsonify(response_payload)
         latest_progress = database.execute(
-            "SELECT progress_percent FROM task_progress WHERE task_date = ? "
+            "SELECT id, progress_percent, checked_items FROM task_progress WHERE task_date = ? "
             "ORDER BY created_at DESC, id DESC LIMIT 1",
             (task_date,),
         ).fetchone()
+        checklist = json.loads(task_row["checklist"])
+        checked_items = None
+        checked_changed = False
+        if checklist:
+            try:
+                checked_items = validate_checked_items(payload.get("checkedItems"), checklist)
+            except ValueError as error:
+                database.rollback()
+                return api_error(str(error), 400, "invalid_checked_items")
+            revision = latest_progress["id"] if latest_progress else 0
+            if (type(payload.get("checklistRevision")) is not int
+                    or payload["checklistRevision"] != revision
+                    or payload.get("checklist") != checklist):
+                database.rollback()
+                return api_error("清单已有新进度，请关闭后刷新，再重新勾选。", 409, "checklist_conflict")
+            previous_checked = json.loads(latest_progress["checked_items"] or "[]") if latest_progress else []
+            checked_changed = checked_items != previous_checked
+            progress_percent = sum(checklist[index]["weight"] for index in checked_items)
         baseline_percent = (
             latest_progress["progress_percent"]
             if latest_progress
@@ -4888,6 +5042,7 @@ def create_task_progress(task_date):
             not note
             and not links
             and not has_pending_files
+            and not checked_changed
             and progress_percent == baseline_percent
         ):
             database.rollback()
@@ -4910,6 +5065,9 @@ def create_task_progress(task_date):
             ),
         )
         progress_id = cursor.lastrowid
+        if checked_items is not None:
+            database.execute("UPDATE task_progress SET checked_items = ? WHERE id = ?",
+                             (json.dumps(checked_items), progress_id))
         for position, proof_url in enumerate(links):
             database.execute(
                 "INSERT INTO task_progress_assets("
@@ -5289,8 +5447,6 @@ def record_task_result(task_date):
     result_note = result_note_value.strip()
     if len(result_note) > MAX_TASK_RESULT_NOTE_LENGTH:
         return api_error("备注不能超过 1000 字。")
-    if not legacy_completion and not result_note:
-        return api_error("请填写备注。", 400, "result_note_required")
 
     proof_url_input = request.form.get("proofUrl")
     proof_url = validate_proof_url(proof_url_input)
@@ -5304,6 +5460,8 @@ def record_task_result(task_date):
     row = database.execute("SELECT * FROM tasks WHERE task_date = ?", (task_date,)).fetchone()
     if not row:
         return api_error("未找到该任务。", 404, "not_found")
+    if not legacy_completion and not result_note and not json.loads(row["checklist"]):
+        return api_error("请填写备注。", 400, "result_note_required")
     effective_proof_url = row["proof_url"] if proof_url_input is None else proof_url
     if (
         legacy_completion
@@ -5357,6 +5515,15 @@ def record_task_result(task_date):
                 "proof_conflict",
             )
         old_file = current_row["proof_file"]
+        checklist = json.loads(current_row["checklist"])
+        if checklist:
+            latest_check = database.execute(
+                "SELECT checked_items FROM task_progress WHERE task_date = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (task_date,),
+            ).fetchone()
+            checked = json.loads(latest_check["checked_items"] or "[]") if latest_check else []
+            completion_percent = sum(checklist[index]["weight"] for index in checked)
+            result_status = "completed" if completion_percent == 100 else "incomplete"
         effective_proof_url = (
             current_row["proof_url"] if proof_url_input is None else proof_url
         )
@@ -5433,6 +5600,17 @@ def set_stats(stat_date):
     payload = parse_json()
     if not stat_date or not payload:
         return api_error("记录日期或内容无效。")
+    current_date = business_today_key(stat_date)
+    if stat_date != current_date:
+        if stat_date < current_date:
+            return api_error(
+                "过去日期只可单独补录番茄，便签与分心记录已经关闭。",
+                409,
+                "focus_window_closed",
+            )
+        return api_error(
+            "日期开始后才能记录今日专注。", 409, "focus_window_not_open"
+        )
     poms = payload.get("poms")
     note = payload.get("note")
     if not isinstance(poms, int) or isinstance(poms, bool) or not 0 <= poms <= 100000:
@@ -5440,26 +5618,154 @@ def set_stats(stat_date):
     if not isinstance(note, str) or len(note) > 10000:
         return api_error("便签内容不能超过 10000 字。")
     database = get_content_db()
+    database.execute("BEGIN IMMEDIATE")
+    updated_at, locked_current_date = business_clock_snapshot(stat_date)
+    if stat_date != locked_current_date:
+        database.rollback()
+        return api_error(
+            "日期已经变化，请刷新后再记录今日专注。",
+            409,
+            "focus_window_changed",
+        )
     current = database.execute(
-        "SELECT distractions FROM daily_stats WHERE stat_date = ?", (stat_date,)
+        "SELECT * FROM daily_stats WHERE stat_date = ?", (stat_date,)
     ).fetchone()
     distractions = payload.get(
         "distractions", current["distractions"] if current else ""
     )
     if not isinstance(distractions, str) or len(distractions) > 10000:
+        database.rollback()
         return api_error("分心记录不能超过 10000 字。")
+    poms_changed = current is None or current["poms"] != poms
+    recorded_at = updated_at if poms_changed else current["poms_recorded_at"]
+    record_date = locked_current_date if poms_changed else current["poms_record_date"]
     database.execute(
-        "INSERT INTO daily_stats(stat_date, poms, note, distractions, updated_at) "
-        "VALUES (?, ?, ?, ?, ?) "
+        "INSERT INTO daily_stats("
+        "stat_date, poms, note, distractions, poms_recorded_at, "
+        "poms_record_date, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(stat_date) DO UPDATE SET "
         "poms = excluded.poms, note = excluded.note, "
-        "distractions = excluded.distractions, updated_at = excluded.updated_at",
-        (stat_date, poms, note, distractions, now_ts())
+        "distractions = excluded.distractions, "
+        "poms_recorded_at = excluded.poms_recorded_at, "
+        "poms_record_date = excluded.poms_record_date, "
+        "updated_at = excluded.updated_at",
+        (
+            stat_date,
+            poms,
+            note,
+            distractions,
+            recorded_at,
+            record_date,
+            updated_at,
+        ),
     )
+    row = database.execute(
+        "SELECT * FROM daily_stats WHERE stat_date = ?", (stat_date,)
+    ).fetchone()
     database.commit()
     return jsonify({
         "ok": True,
         "stats": {"poms": poms, "note": note, "distractions": distractions},
+        "pomRecord": serialize_pom_record(row),
+    })
+
+
+@app.put("/api/stats/<stat_date>/poms")
+@require_owner
+@require_csrf
+def set_poms(stat_date):
+    stat_date = validate_date_key(stat_date)
+    payload = parse_json()
+    if not stat_date or not isinstance(payload, dict):
+        return api_error("番茄补录日期或内容无效。")
+    poms = payload.get("poms")
+    if not isinstance(poms, int) or isinstance(poms, bool) or not 0 <= poms <= 100000:
+        return api_error("番茄数量应在 0 到 100000 之间。")
+
+    current_date = business_today_key(stat_date)
+    mode = pom_recording_mode(stat_date, current_date)
+    if mode is None:
+        if stat_date < current_date:
+            return api_error(
+                "只能补录最近 3 个完整日期的番茄，更早日期已经关闭。",
+                409,
+                "pom_backfill_window_closed",
+            )
+        return api_error(
+            "日期开始后才能记录番茄。", 409, "pom_window_not_open"
+        )
+
+    database = get_content_db()
+    database.execute("BEGIN IMMEDIATE")
+    recorded_at, locked_current_date = business_clock_snapshot(stat_date)
+    locked_mode = pom_recording_mode(stat_date, locked_current_date)
+    if locked_mode is None:
+        database.rollback()
+        if stat_date < locked_current_date:
+            return api_error(
+                "番茄补录窗口刚刚关闭，请刷新后重试。",
+                409,
+                "pom_backfill_window_closed",
+            )
+        return api_error(
+            "日期开始后才能记录番茄。", 409, "pom_window_not_open"
+        )
+
+    current = database.execute(
+        "SELECT * FROM daily_stats WHERE stat_date = ?", (stat_date,)
+    ).fetchone()
+    if current is None and poms == 0:
+        database.commit()
+        return jsonify({
+            "ok": True,
+            "idempotent": True,
+            "mode": locked_mode,
+            "pomRecord": {
+                "poms": 0,
+                "pomsRecordedAt": None,
+                "pomsRecordDate": None,
+                "pomsBackfilled": False,
+            },
+        })
+    if current is not None and current["poms"] == poms:
+        record = serialize_pom_record(current)
+        database.commit()
+        return jsonify({
+            "ok": True,
+            "idempotent": True,
+            "mode": locked_mode,
+            "pomRecord": record,
+        })
+
+    database.execute(
+        "INSERT INTO daily_stats("
+        "stat_date, poms, note, distractions, poms_recorded_at, "
+        "poms_record_date, updated_at"
+        ") VALUES (?, ?, '', '', ?, ?, ?) "
+        "ON CONFLICT(stat_date) DO UPDATE SET "
+        "poms = excluded.poms, "
+        "poms_recorded_at = excluded.poms_recorded_at, "
+        "poms_record_date = excluded.poms_record_date, "
+        "updated_at = excluded.updated_at",
+        (
+            stat_date,
+            poms,
+            recorded_at,
+            locked_current_date,
+            recorded_at,
+        ),
+    )
+    row = database.execute(
+        "SELECT * FROM daily_stats WHERE stat_date = ?", (stat_date,)
+    ).fetchone()
+    record = serialize_pom_record(row)
+    database.commit()
+    return jsonify({
+        "ok": True,
+        "idempotent": False,
+        "mode": locked_mode,
+        "pomRecord": record,
     })
 
 
@@ -5500,6 +5806,7 @@ def validate_legacy_import(value):
     if not isinstance(value, dict) or not isinstance(value.get("tasks"), dict):
         raise ValueError("invalid")
     poms = value.get("poms", {})
+    pom_meta = value.get("pomMeta", {})
     imported_notes = value.get("notes", {})
     if "distractions" in value:
         # Current exports keep private notes and distraction logs separate.
@@ -5512,13 +5819,14 @@ def validate_legacy_import(value):
         distractions = imported_notes
     if (
         not isinstance(poms, dict)
+        or not isinstance(pom_meta, dict)
         or not isinstance(notes, dict)
         or not isinstance(distractions, dict)
     ):
         raise ValueError("invalid")
     if any(
         len(section) > 5000
-        for section in (value["tasks"], poms, notes, distractions)
+        for section in (value["tasks"], poms, pom_meta, notes, distractions)
     ):
         raise ValueError("too_many")
     tasks = []
@@ -5531,6 +5839,7 @@ def validate_legacy_import(value):
         text = item["text"].strip()
         if not text or len(text) > 1000:
             raise ValueError("invalid")
+        checklist = validate_checklist(item.get("checklist", []))
         legacy_done = item.get("done") is True
         result_status = item.get("resultStatus")
         if result_status is None:
@@ -5551,12 +5860,13 @@ def validate_legacy_import(value):
         result_note = item.get("resultNote", item.get("proofText", ""))
         if not isinstance(result_note, str) or len(result_note) > MAX_TASK_RESULT_NOTE_LENGTH:
             raise ValueError("invalid")
-        if result_status == "incomplete" and not result_note.strip():
+        if result_status == "incomplete" and not result_note.strip() and not checklist and not item.get("resultLocked"):
             raise ValueError("invalid")
         raw_progress_entries = item.get("progressEntries", [])
         if not isinstance(raw_progress_entries, list):
             raise ValueError("invalid")
         nonlegacy_progress_index = 0
+        day_progress_count = 0
         for entry in raw_progress_entries:
             if not isinstance(entry, dict):
                 raise ValueError("invalid")
@@ -5599,6 +5909,11 @@ def validate_legacy_import(value):
             ):
                 raise ValueError("invalid")
             note = note_value.strip()
+            checked_items = None
+            if checklist:
+                checked_items = validate_checked_items(entry.get("checkedItems"), checklist)
+                if progress_percent != sum(checklist[index]["weight"] for index in checked_items):
+                    raise ValueError("invalid")
             created_at, created_iso = parse_import_progress_timestamp(
                 entry.get("createdAt")
             )
@@ -5635,9 +5950,12 @@ def validate_legacy_import(value):
                     record_date,
                     created_at,
                     links,
+                    checked_items,
                 )
             )
             nonlegacy_progress_index += 1
+            if record_date <= key:
+                day_progress_count += 1
         result_recorded_value = item.get("resultRecordedAt")
         if result_status == "pending":
             if (
@@ -5660,20 +5978,20 @@ def validate_legacy_import(value):
                 raise ValueError("invalid")
             if confirmed_progress_count is None:
                 confirmed_progress_count = (
-                    max(0, nonlegacy_progress_index - 1)
+                    max(0, day_progress_count - 1)
                     if stale_value is True
-                    else nonlegacy_progress_index
+                    else day_progress_count
                 )
             if (
                 not isinstance(confirmed_progress_count, int)
                 or isinstance(confirmed_progress_count, bool)
-                or not 0 <= confirmed_progress_count <= nonlegacy_progress_index
+                or not 0 <= confirmed_progress_count <= day_progress_count
             ):
                 raise ValueError("invalid")
             if (
                 stale_value is not None
                 and stale_value
-                != (confirmed_progress_count < nonlegacy_progress_index)
+                != (confirmed_progress_count < day_progress_count)
             ):
                 raise ValueError("invalid")
         result_locked_value = item.get("resultLocked", False)
@@ -5710,6 +6028,7 @@ def validate_legacy_import(value):
                 confirmed_progress_count,
                 result_locked_at,
                 result_lock_source,
+                checklist,
             )
         )
     clean_poms = {}
@@ -5718,6 +6037,36 @@ def validate_legacy_import(value):
         if not key or not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 100000:
             raise ValueError("invalid")
         clean_poms[key] = count
+    clean_pom_meta = {}
+    for key, item in pom_meta.items():
+        key = validate_date_key(key)
+        if (
+            not key
+            or key not in clean_poms
+            or clean_poms[key] <= 0
+            or not isinstance(item, dict)
+        ):
+            raise ValueError("invalid")
+        recorded_at, _recorded_iso = parse_import_progress_timestamp(
+            item.get("recordedAt")
+        )
+        record_date = validate_date_key(item.get("recordDate"))
+        if (
+            not record_date
+            or business_date_for_timestamp(recorded_at) != record_date
+            or not 0 <= (date.fromisoformat(record_date) - date.fromisoformat(key)).days <= 3
+        ):
+            raise ValueError("invalid")
+        backfilled = item.get("backfilled")
+        if (
+            backfilled is not None
+            and (
+                not isinstance(backfilled, bool)
+                or backfilled != (record_date > key)
+            )
+        ):
+            raise ValueError("invalid")
+        clean_pom_meta[key] = (recorded_at, record_date)
     clean_notes = {}
     for key, note in notes.items():
         key = validate_date_key(key)
@@ -5733,6 +6082,7 @@ def validate_legacy_import(value):
     return (
         tasks,
         clean_poms,
+        clean_pom_meta,
         clean_notes,
         clean_distractions,
         progress_entries,
@@ -5753,6 +6103,7 @@ def import_data():
         (
             tasks,
             poms,
+            pom_meta,
             notes,
             distractions,
             progress_entries,
@@ -5783,6 +6134,7 @@ def import_data():
             _confirmed_progress_count,
             result_locked_at,
             result_lock_source,
+            checklist,
         ) in tasks:
             recorded = result_status != "pending"
             imported_at = now_ts()
@@ -5812,13 +6164,15 @@ def import_data():
             )
             imported_tasks += cursor.rowcount
             if cursor.rowcount == 1:
+                database.execute("UPDATE tasks SET checklist = ? WHERE task_date = ?",
+                                 (json.dumps(checklist, ensure_ascii=False), key))
                 eligible_progress_dates.add(key)
                 newly_imported_dates.add(key)
             else:
                 existing_task = database.execute(
-                    "SELECT text FROM tasks WHERE task_date = ?", (key,)
+                    "SELECT text, checklist FROM tasks WHERE task_date = ?", (key,)
                 ).fetchone()
-                if existing_task and existing_task["text"] == text:
+                if existing_task and existing_task["text"] == text and json.loads(existing_task["checklist"]) == checklist:
                     eligible_progress_dates.add(key)
         for (
             task_date,
@@ -5828,6 +6182,7 @@ def import_data():
             record_date,
             created_at,
             links,
+            checked_items,
         ) in progress_entries:
             if task_date not in eligible_progress_dates:
                 skipped_mismatched_progress_entries += 1
@@ -5849,7 +6204,11 @@ def import_data():
                 continue
             imported_progress_entries += 1
             progress_id = cursor.lastrowid
-            imported_progress_ids.setdefault(task_date, []).append(progress_id)
+            if checked_items is not None:
+                database.execute("UPDATE task_progress SET checked_items = ? WHERE id = ?",
+                                 (json.dumps(checked_items), progress_id))
+            if record_date <= task_date:
+                imported_progress_ids.setdefault(task_date, []).append(progress_id)
             for position, proof_url in enumerate(links):
                 database.execute(
                     "INSERT INTO task_progress_assets("
@@ -5874,10 +6233,25 @@ def import_data():
             )
         finalize_expired_tasks(database)
         for key in set(poms) | set(notes) | set(distractions):
+            imported_pom_meta = pom_meta.get(key)
+            imported_at = now_ts()
+            # Legacy exports never recorded a pomodoro-specific timestamp.
+            # Preserve that uncertainty instead of inventing metadata that
+            # cannot pass a later export/import round trip.
+            poms_recorded_at = imported_pom_meta[0] if imported_pom_meta else None
+            poms_record_date = imported_pom_meta[1] if imported_pom_meta else None
             database.execute(
-                "INSERT INTO daily_stats(stat_date, poms, note, distractions, updated_at) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO daily_stats("
+                "stat_date, poms, note, distractions, poms_recorded_at, "
+                "poms_record_date, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(stat_date) DO UPDATE SET "
+                "poms_recorded_at = CASE WHEN daily_stats.poms = 0 "
+                "AND excluded.poms > 0 THEN excluded.poms_recorded_at "
+                "ELSE daily_stats.poms_recorded_at END, "
+                "poms_record_date = CASE WHEN daily_stats.poms = 0 "
+                "AND excluded.poms > 0 THEN excluded.poms_record_date "
+                "ELSE daily_stats.poms_record_date END, "
                 "poms = CASE WHEN daily_stats.poms = 0 THEN excluded.poms ELSE daily_stats.poms END, "
                 "note = CASE WHEN daily_stats.note = '' THEN excluded.note ELSE daily_stats.note END, "
                 "distractions = CASE WHEN daily_stats.distractions = '' "
@@ -5888,7 +6262,9 @@ def import_data():
                     poms.get(key, 0),
                     notes.get(key, ""),
                     distractions.get(key, ""),
-                    now_ts(),
+                    poms_recorded_at,
+                    poms_record_date,
+                    imported_at,
                 )
             )
     return jsonify({
@@ -5911,6 +6287,7 @@ def export_data():
         progress_entries = progress_by_date.get(row["task_date"], [])
         serialized = serialize_task(row, progress_entries)
         tasks[row["task_date"]] = {
+            "checklist": serialized["checklist"],
             "text": row["text"],
             "done": bool(row["done"]),
             "resultStatus": serialized["resultStatus"],
@@ -5942,11 +6319,19 @@ def export_data():
             "SELECT * FROM long_term_goals ORDER BY started_at, id"
         ).fetchall()
     ]
+    pom_meta = {}
+    for row in stats:
+        if row["poms"] <= 0:
+            continue
+        serialized_meta = public_pom_meta(row)
+        if serialized_meta["recordedAt"] and serialized_meta["backfilled"]:
+            pom_meta[row["stat_date"]] = serialized_meta
     body = json.dumps({
-        "formatVersion": 2,
+        "formatVersion": 3,
         "attachmentsIncluded": False,
         "tasks": tasks,
         "poms": {row["stat_date"]: row["poms"] for row in stats},
+        "pomMeta": pom_meta,
         "notes": {row["stat_date"]: row["note"] for row in stats},
         "distractions": {row["stat_date"]: row["distractions"] for row in stats},
         "goals": goals,

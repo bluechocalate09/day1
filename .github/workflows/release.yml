@@ -34,6 +34,14 @@ jobs:
         shell: bash
         run: python -m unittest discover -s tests -p "test*.py" -v
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run frontend regression tests
+        run: node --test tests/frontend.test.cjs
+
       - name: Check release notes
         shell: bash
         run: |
