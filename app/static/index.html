@@ -371,6 +371,7 @@
                     <p class="card-kicker">今天的节奏</p>
                     <h2 id="focus-title">今日专注</h2>
                   </div>
+                  <button id="open-pom-backfill" class="button button-quiet button-small pom-backfill-trigger" type="button">补录番茄</button>
                 </header>
                 <form id="focus-form" class="focus-form" novalidate>
                   <section class="focus-section focus-section-public" aria-labelledby="focus-poms-label">
@@ -733,7 +734,14 @@
         <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="task-dialog">×</button>
       </header>
       <input id="task-date-input" name="taskDate" type="hidden">
-      <div class="field">
+      <label class="checklist-mode"><input id="task-checklist-mode" type="checkbox"> 按任务清单规划占比</label>
+      <div id="task-checklist-editor" hidden>
+        <p class="field-help">把今天拆成几个可完成的小步骤，合计 100%。</p>
+        <div id="task-checklist-rows" class="daily-checklist"></div>
+        <div class="checklist-toolbar"><button id="task-checklist-add" class="button button-quiet" type="button">＋ 添加一项</button><output id="task-checklist-total" aria-live="polite">已分配 0% / 100%</output></div>
+        <p id="task-checklist-help" class="field-help">开始记录后，项目与占比保持固定。</p>
+      </div>
+      <div id="task-legacy-field" class="field">
         <label for="task-text-input">任务内容</label>
         <textarea id="task-text-input" name="text" rows="5" maxlength="1000" aria-describedby="task-text-count" placeholder="写下一件明确、可完成的事…" required></textarea>
         <p id="task-text-count" class="field-help field-help-end"><span data-character-count="task-text-input">0</span> / 1000</p>
@@ -759,6 +767,7 @@
       </header>
       <input id="progress-date-input" name="taskDate" type="hidden">
       <div id="progress-controls">
+        <div id="progress-checklist" class="daily-checklist" hidden></div>
         <div class="field result-progress-field">
           <div class="result-progress-heading">
             <label for="progress-percent-input">当前完成程度</label>
@@ -767,6 +776,8 @@
           <input id="progress-percent-input" name="progressPercent" type="range" min="0" max="100" step="5" value="0">
           <div class="result-progress-scale" aria-hidden="true"><span>0%</span><span>选择此刻最接近的进度</span><span>100%</span></div>
         </div>
+        <details id="progress-extra-details" class="progress-extra-details">
+        <summary>补充说明、链接或附件 <span class="label-optional">可选</span></summary>
         <div class="field">
           <label for="progress-note-input">备注 <span class="label-optional">可选</span></label>
           <textarea id="progress-note-input" name="note" rows="4" maxlength="1000" aria-describedby="progress-note-help progress-note-count" placeholder="写下这一步做了什么，或下一步准备做什么…"></textarea>
@@ -780,7 +791,6 @@
           <textarea id="progress-links-input" name="links" rows="3" inputmode="url" aria-describedby="progress-links-help" placeholder="每行粘贴一个 https:// 链接"></textarea>
           <p id="progress-links-help" class="field-help">每行一个 http:// 或 https:// 链接，保存后仍可继续追加。</p>
         </div>
-      </div>
       <p id="progress-existing-assets" class="field-help progress-existing-summary" aria-live="polite" hidden></p>
       <div class="field">
         <label for="progress-file-input">照片或文件 <span class="label-optional">可选，可持续追加</span></label>
@@ -790,6 +800,8 @@
           <span class="upload-copy"><strong>选择这次新增的照片或文件</strong><small>以前上传的附件会原样保留，无需重新选择；不限制累计数量</small><small id="progress-files-help" class="upload-formats">每个文件最大 10 MB；支持 JPG、PNG、WebP、PDF、TXT、CSV、DOCX、XLSX、PPTX；HEIC 请先转成 JPG 或截图</small></span>
         </label>
         <div id="progress-files-preview" class="attachment-queue" role="list" aria-live="polite" hidden></div>
+      </div>
+        </details>
       </div>
       <p class="record-destination-note">保存一次，就增加一个带时间的公开节点；备注、链接和附件会给访客查看。私人便签和分心记录始终不会公开。</p>
       <div id="progress-dialog-message" class="form-message" role="status" aria-live="polite" hidden></div>
@@ -1070,6 +1082,7 @@
             <span class="record-duration">公开</span>
           </header>
           <p class="record-focus-total"><strong id="record-focus-count">0</strong><span>个专注番茄</span></p>
+          <p id="record-focus-backfill" class="record-focus-backfill" hidden>补录于 —</p>
         </section>
 
         <section id="record-private-section" class="record-section record-private-section" aria-labelledby="record-private-title" hidden>
@@ -1090,10 +1103,43 @@
         <p id="record-empty-state" class="history-empty" hidden>这一天没有可查看的完成记录。</p>
       </div>
       <footer class="dialog-actions">
-        <button id="record-add-progress" class="button button-quiet dialog-secondary-action" type="button" hidden>继续补充进度</button>
+        <button id="record-add-progress" class="button button-quiet dialog-secondary-action" type="button" hidden>再添一条进度</button>
         <button class="button button-primary" type="button" data-close-dialog="proof-view-dialog">关闭</button>
       </footer>
     </article>
+  </dialog>
+
+  <dialog id="pom-backfill-dialog" class="dialog dialog-compact" aria-labelledby="pom-backfill-title">
+    <form id="pom-backfill-form" class="dialog-form" method="dialog" novalidate>
+      <header class="dialog-header">
+        <div>
+          <p class="card-kicker">最近三日</p>
+          <h2 id="pom-backfill-title">补录番茄</h2>
+          <p class="dialog-description">可补录前 3 个北京时间自然日；只修正该日番茄总数，不改变任务结果或进度内容。</p>
+        </div>
+        <button class="dialog-close" type="button" aria-label="关闭" data-close-dialog="pom-backfill-dialog">×</button>
+      </header>
+      <div class="field">
+        <label for="pom-backfill-date">补录日期</label>
+        <select id="pom-backfill-date" name="statDate" aria-describedby="pom-backfill-date-help"></select>
+        <p id="pom-backfill-date-help" class="field-help">仅列出仍在补录窗口内的 3 个完整日期。</p>
+      </div>
+      <div class="field">
+        <label id="pom-backfill-count-label" for="pom-backfill-count">该日番茄总数</label>
+        <div class="stepper pom-backfill-stepper">
+          <button id="pom-backfill-decrease" type="button" aria-label="减少一个补录番茄" data-step="-1">−</button>
+          <input id="pom-backfill-count" name="poms" type="number" inputmode="numeric" min="0" max="100000" value="0" aria-labelledby="pom-backfill-count-label" aria-describedby="pom-backfill-count-help pom-backfill-current">
+          <button id="pom-backfill-increase" type="button" aria-label="增加一个补录番茄" data-step="1">+</button>
+        </div>
+        <p id="pom-backfill-count-help" class="field-help">填写当天最终总数；窗口内再次保存会修正总数，相同数值不会重复记录。</p>
+        <p id="pom-backfill-current" class="pom-backfill-current" aria-live="polite">—</p>
+      </div>
+      <div id="pom-backfill-message" class="form-message" role="status" aria-live="polite" hidden></div>
+      <footer class="dialog-actions">
+        <button class="button button-quiet" type="button" data-close-dialog="pom-backfill-dialog">取消</button>
+        <button id="save-pom-backfill" class="button button-primary" type="submit" data-loading-label="正在保存…">保存补录</button>
+      </footer>
+    </form>
   </dialog>
 
   <dialog id="password-dialog" class="dialog" aria-labelledby="password-dialog-title">

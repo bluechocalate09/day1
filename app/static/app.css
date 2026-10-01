@@ -14,11 +14,12 @@
   --green-soft: #e8f0ea;
   --green-pale: #f1f6f2;
   --progress-0: #eee9e2;
-  --progress-1: #e1e8e1;
-  --progress-2: #cad8cc;
-  --progress-3: #a9c0ae;
-  --progress-4: #789b83;
+  --progress-1: #cfe0d2;
+  --progress-2: #b5cdbb;
+  --progress-3: #94b29b;
+  --progress-4: #6c9176;
   --progress-5: #416b55;
+  --completion-track: #e3e7e1;
   --amber: #8b6531;
   --amber-soft: #f6eee0;
   --stage-gold: #b58a3c;
@@ -52,11 +53,12 @@ html[data-theme="dark"] {
   --green-soft: #2e3c32;
   --green-pale: #273229;
   --progress-0: #35322d;
-  --progress-1: #303a32;
-  --progress-2: #374a3c;
-  --progress-3: #46634e;
-  --progress-4: #60836a;
+  --progress-1: #344237;
+  --progress-2: #3f5544;
+  --progress-3: #526e59;
+  --progress-4: #668c71;
   --progress-5: #7ba586;
+  --completion-track: #42443f;
   --amber: #d3ad70;
   --amber-soft: #3b3123;
   --stage-gold: #c79c56;
@@ -523,6 +525,18 @@ h3 {
   transition: border-color 150ms ease, box-shadow 150ms ease;
 }
 
+.field select {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 38px 10px 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
 .field input,
 .password-field input {
   height: 44px;
@@ -542,10 +556,20 @@ h3 {
   border-color: #b9c0b7;
 }
 
+.field select:hover {
+  border-color: #b9c0b7;
+}
+
 .field input:focus,
 .field textarea:focus,
 .password-field input:focus,
 .stepper input:focus {
+  border-color: var(--green);
+  outline: 0;
+  box-shadow: 0 0 0 3px rgba(65, 107, 85, 0.12);
+}
+
+.field select:focus {
   border-color: var(--green);
   outline: 0;
   box-shadow: 0 0 0 3px rgba(65, 107, 85, 0.12);
@@ -2188,6 +2212,28 @@ h3 {
   line-height: 1.35;
 }
 
+.history-item-poms {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+
+.history-pom-backfill {
+  min-width: 20px;
+  min-height: 18px;
+  display: inline-grid;
+  place-items: center;
+  padding: 1px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 99px;
+  background: var(--surface-muted);
+  color: var(--ink-soft);
+  font-size: 0.62rem;
+  font-weight: 720;
+  line-height: 1;
+}
+
 .history-item-supplement {
   color: #737b72;
 }
@@ -2201,6 +2247,26 @@ h3 {
   font-size: 0.7rem;
   font-weight: 700;
   white-space: nowrap;
+}
+
+.history-item-status.has-completion-meter,
+.record-result-progress.has-completion-meter {
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+}
+
+.history-item-status.has-completion-meter::after,
+.record-result-progress.has-completion-meter::after {
+  width: 54px;
+  height: 3px;
+  border-radius: 99px;
+  background: linear-gradient(
+    90deg,
+    var(--completion-tone) 0 var(--completion-percent),
+    var(--completion-track) var(--completion-percent) 100%
+  );
+  content: "";
 }
 
 .history-item-status.is-pending {
@@ -2299,6 +2365,11 @@ h3 {
 .focus-form {
   display: grid;
   gap: 11px;
+}
+
+.pom-backfill-trigger {
+  min-height: 44px;
+  flex: 0 0 auto;
 }
 
 .focus-section {
@@ -2419,6 +2490,24 @@ h3 {
 .stepper input::-webkit-outer-spin-button {
   margin: 0;
   -webkit-appearance: none;
+}
+
+.pom-backfill-stepper {
+  width: max-content;
+  grid-template-columns: 44px 64px 44px;
+}
+
+.pom-backfill-stepper button,
+.pom-backfill-stepper input {
+  height: 44px;
+}
+
+.pom-backfill-current {
+  min-height: 1.35em;
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
 }
 
 .data-card-summary {
@@ -4416,6 +4505,10 @@ button.subgoal-title:hover { color: var(--goal-accent-strong); }
   text-align: right;
 }
 
+.record-result-progress.has-completion-meter::after {
+  width: 76px;
+}
+
 .record-feedback {
   display: grid;
   gap: 5px;
@@ -4448,6 +4541,13 @@ button.subgoal-title:hover { color: var(--goal-accent-strong); }
   font-size: 1.55rem;
   font-variant-numeric: tabular-nums;
   line-height: 1;
+}
+
+.record-focus-backfill {
+  margin: 8px 0 0;
+  color: var(--ink-soft);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
 }
 
 .record-private-section {
@@ -4685,6 +4785,7 @@ button.subgoal-title:hover { color: var(--goal-accent-strong); }
 @media (max-width: 960px) {
   .auth-card input,
   .dialog input,
+  .dialog select,
   .dialog textarea,
   .focus-section textarea,
   .stepper input {
@@ -4905,6 +5006,7 @@ button.subgoal-title:hover { color: var(--goal-accent-strong); }
 
   .auth-card input,
   .dialog input,
+  .dialog select,
   .dialog textarea,
   .focus-section textarea,
   .stepper input {
@@ -5524,6 +5626,7 @@ html[data-theme="dark"] .focus-section textarea:hover {
 
 html[data-theme="dark"] .field input:focus,
 html[data-theme="dark"] .field textarea:focus,
+html[data-theme="dark"] .field select:focus,
 html[data-theme="dark"] .password-field input:focus,
 html[data-theme="dark"] .stepper input:focus,
 html[data-theme="dark"] .focus-section textarea:focus {
@@ -5933,4 +6036,38 @@ html[data-theme="dark"] .visitor-mascot[data-mascot-key="blue"] img,
 html[data-theme="dark"] .mascot-option-preview[data-mascot-key="blue"] img {
   filter: invert(83%) sepia(11%) saturate(574%) hue-rotate(82deg) brightness(91%) contrast(87%);
   opacity: 0.9;
+}
+.daily-checklist { display: grid; gap: 8px; margin: 12px 0; min-width: 0; }
+.daily-checklist-item { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 10px; min-height: 52px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); font-size: 14px; }
+label.daily-checklist-item { cursor: pointer; }
+.daily-checklist-item.is-checked { background: var(--green-pale); border-color: var(--green-soft); }
+.daily-checklist-item input { width: 20px; height: 20px; accent-color: var(--green); }
+.checklist-item-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.checklist-weight { color: var(--ink-soft); font-variant-numeric: tabular-nums; font-size: 13px; }
+.checklist-mark { color: var(--ink-soft); text-align: center; }
+.is-checked .checklist-mark { color: var(--green); }
+.checklist-plan-row { display: grid; grid-template-columns: minmax(0, 1fr) 78px 44px; gap: 8px; align-items: center; padding: 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-muted); }
+.checklist-plan-row textarea { width: 100%; min-width: 0; min-height: 64px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--surface); color: var(--ink); font: inherit; font-size: 14px; }
+.checklist-weight-input { display: flex; align-items: center; gap: 4px; color: var(--ink-soft); font-size: 13px; }
+.checklist-weight-input input { width: 58px; min-width: 0; height: 44px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); text-align: center; font: inherit; }
+.checklist-remove { min-height: 44px; min-width: 44px; padding: 0; }
+.checklist-toolbar { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; margin: 12px 0; }
+.checklist-toolbar output { font-size: 13px; color: var(--ink-soft); }
+.checklist-toolbar output.is-valid { color: var(--green); }
+.checklist-mode { display: flex; align-items: center; gap: 10px; min-height: 44px; font-size: 14px; }
+.checklist-mode input { width: 18px; height: 18px; accent-color: var(--green); }
+.progress-extra-details { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 16px; }
+.progress-extra-details > summary { cursor: pointer; min-height: 44px; padding: 10px 0; font-size: 14px; color: var(--ink-soft); }
+.progress-extra-details > .field { margin-top: 16px; }
+#progress-percent-output { font-variant-numeric: tabular-nums; }
+.result-progress-heading output[data-progress-state="empty"] { color: var(--ink-soft); }
+.result-progress-heading output[data-progress-state="partial"] { color: var(--amber); }
+.result-progress-heading output[data-progress-state="completed"] { color: var(--green); }
+.daily-checklist-item:focus-within { outline: 2px solid var(--green); outline-offset: 2px; }
+#task-dialog .dialog-actions, #progress-dialog .dialog-actions { position: sticky; bottom: 0; background: var(--surface); z-index: 2; padding-top: 12px; padding-bottom: 12px; }
+@media (max-width: 420px) {
+  .checklist-plan-row { grid-template-columns: minmax(0, 1fr) 44px; }
+  .checklist-plan-row textarea { grid-column: 1 / -1; }
+  .checklist-weight-input { justify-self: start; }
+  .checklist-remove { justify-self: end; }
 }

@@ -54,6 +54,7 @@
     tasks: [],
     stats: {},
     publicPoms: {},
+    publicPomMeta: {},
     activeGoal: null,
     activeStage: null,
     stageYears: {},
@@ -354,6 +355,9 @@
 
   function taskResultStatus(task) {
     if (!task) return "pending";
+    if (dailyChecklist(task).length && !task.resultLocked && task.resultIsStale) {
+      return checkedTotal(task) === 100 ? "completed" : "incomplete";
+    }
     if (["completed", "incomplete"].includes(task.resultStatus)) return task.resultStatus;
     return task.done ? "completed" : "pending";
   }
@@ -383,6 +387,7 @@
 
   function taskCompletionPercent(task) {
     const status = taskResultStatus(task);
+    if (dailyChecklist(task).length && !task.resultLocked) return checkedTotal(task);
     if (status === "completed") return 100;
     const stored = Number.parseInt(task && task.completionPercent, 10);
     const storedPercent = Number.isInteger(stored) ? Math.min(99, Math.max(0, stored)) : 0;
@@ -433,6 +438,21 @@
     return 5;
   }
 
+  function applyCompletionMeter(element, task) {
+    if (!element) return;
+    element.classList.remove("has-completion-meter");
+    element.style.removeProperty("--completion-percent");
+    element.style.removeProperty("--completion-tone");
+    if (!task || !taskHasPublicRecord(task)) return;
+    const percent = taskCompletionPercent(task);
+    const tone = taskIsZeroIncomplete(task)
+      ? "var(--danger)"
+      : `var(--progress-${taskProgressLevel(task)})`;
+    element.classList.add("has-completion-meter");
+    element.style.setProperty("--completion-percent", `${percent}%`);
+    element.style.setProperty("--completion-tone", tone);
+  }
+
   function taskResultLabel(task, includePercent) {
     const status = taskResultStatus(task);
     if (status === "completed") return includePercent ? "已完成 · 100%" : "已完成";
@@ -448,6 +468,45 @@
   function publicPomsFor(key) {
     const parsed = Number.parseInt(state.publicPoms[key], 10);
     return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  function pomMetaFor(key) {
+    const value = state.publicPomMeta[key];
+    const source = value && typeof value === "object" ? value : {};
+    const recordedAt = typeof source.recordedAt === "string" ? source.recordedAt : "";
+    const recordDate = typeof source.recordDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(source.recordDate)
+      ? source.recordDate
+      : "";
+    return {
+      recordedAt,
+      recordDate,
+      backfilled: Boolean(source.backfilled === true || (recordDate && recordDate > key)),
+    };
+  }
+
+  function pomIsBackfilled(key) {
+    return publicPomsFor(key) > 0 && pomMetaFor(key).backfilled;
+  }
+
+  function syncPomRecord(key, record) {
+    if (!record || typeof record !== "object") return;
+    const poms = Number.parseInt(record.poms, 10);
+    if (!Number.isInteger(poms) || poms < 0 || poms > 100000) return;
+    const currentStats = state.stats[key] && typeof state.stats[key] === "object" ? state.stats[key] : {};
+    state.stats[key] = Object.assign({}, currentStats, { poms });
+    if (poms > 0) state.publicPoms[key] = poms;
+    else delete state.publicPoms[key];
+    const recordedAt = typeof record.pomsRecordedAt === "string" ? record.pomsRecordedAt : "";
+    const recordDate = typeof record.pomsRecordDate === "string" ? record.pomsRecordDate : "";
+    if (poms > 0 && recordedAt && recordDate) {
+      state.publicPomMeta[key] = {
+        recordedAt,
+        recordDate,
+        backfilled: Boolean(record.pomsBackfilled),
+      };
+    } else {
+      delete state.publicPomMeta[key];
+    }
   }
 
   function statsFor(key) {
@@ -894,6 +953,7 @@
     state.tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
     state.stats = payload.stats && typeof payload.stats === "object" ? payload.stats : {};
     state.publicPoms = payload.publicPoms && typeof payload.publicPoms === "object" ? payload.publicPoms : {};
+    state.publicPomMeta = payload.publicPomMeta && typeof payload.publicPomMeta === "object" ? payload.publicPomMeta : {};
     state.user = payload.user || state.user;
     const currentYear = Number(dateKeyInShanghai().slice(0, 4));
     const years = Array.from(new Set([currentYear, state.historyYear, state.visitorHistoryYear]));
@@ -946,6 +1006,7 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.publicPomMeta = {};
     state.spaces = [];
     state.defaultSpaceId = "";
     state.activeSpaceId = "";
@@ -983,6 +1044,7 @@
     state.focusSaveTimer = null;
     state.stats = {};
     state.publicPoms = {};
+    state.publicPomMeta = {};
     state.selectedOwnerDate = "";
     state.selectedVisitorDate = "";
     state.ownerHistoryLimit = HISTORY_PAGE_SIZE;
@@ -995,6 +1057,7 @@
     $("#today-proof-text").textContent = "";
     $("#today-proof-summary").hidden = true;
     $("#visitor-today-task-text").textContent = "";
+    $$(".checklist-readonly").forEach((list) => { list.replaceChildren(); list.hidden = true; });
     $("#visitor-proof-text").textContent = "";
     $("#visitor-today-proof").hidden = true;
     $("#focus-poms").value = "0";
@@ -1014,7 +1077,10 @@
     $("#record-progress-section").hidden = true;
     $("#record-progress-section").open = false;
     $("#record-progress-list").replaceChildren();
+    applyCompletionMeter($("#record-daily-progress"), null);
     $("#record-focus-section").hidden = true;
+    $("#record-focus-backfill").hidden = true;
+    $("#record-focus-backfill").textContent = "";
     $("#record-private-section").hidden = true;
     $("#record-distractions-text").textContent = "";
     $("#record-note-text").textContent = "";
@@ -1028,6 +1094,7 @@
     $("#goal-form").reset();
     $("#stage-form").reset();
     $("#stage-complete-form").reset();
+    $("#pom-backfill-form").reset();
     $("#subgoal-form").reset();
     $("#subgoal-form").dataset.editId = "";
     $("#password-form").reset();
@@ -1069,7 +1136,7 @@
     $("#workspace-danger-zone").open = false;
     clearProgressFiles();
     clearStageImagePreview();
-    ["#task-dialog", "#progress-dialog", "#proof-dialog", "#goal-route-dialog", "#goal-dialog", "#stage-dialog", "#stage-complete-dialog", "#proof-view-dialog", "#password-dialog", "#confirm-dialog", "#connect-space-dialog", "#refresh-viewer-code-dialog", "#delete-space-dialog", "#ip-block-dialog", "#manager-invite-dialog"].forEach((selector) => {
+    ["#task-dialog", "#progress-dialog", "#proof-dialog", "#goal-route-dialog", "#goal-dialog", "#stage-dialog", "#stage-complete-dialog", "#proof-view-dialog", "#pom-backfill-dialog", "#password-dialog", "#confirm-dialog", "#connect-space-dialog", "#refresh-viewer-code-dialog", "#delete-space-dialog", "#ip-block-dialog", "#manager-invite-dialog"].forEach((selector) => {
       const dialog = $(selector);
       if (dialog.open) closeDialog(dialog);
     });
@@ -1081,6 +1148,7 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.publicPomMeta = {};
     state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
@@ -1347,6 +1415,7 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.publicPomMeta = {};
     state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
@@ -1371,6 +1440,7 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.publicPomMeta = {};
     state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
@@ -1390,6 +1460,7 @@
     state.tasks = [];
     state.stats = {};
     state.publicPoms = {};
+    state.publicPomMeta = {};
     state.activeGoal = null;
     state.activeStage = null;
     state.stageYears = {};
@@ -1557,9 +1628,9 @@
   function currentStreak(tasks) {
     const map = new Map(tasks.map((task) => [task.date, task]));
     const today = dateKeyInShanghai();
-    let cursor = map.get(today) && map.get(today).done ? today : shiftDate(today, -1);
+    let cursor = taskResultStatus(map.get(today)) === "completed" ? today : shiftDate(today, -1);
     let count = 0;
-    while (map.get(cursor) && map.get(cursor).done) {
+    while (taskResultStatus(map.get(cursor)) === "completed") {
       count += 1;
       cursor = shiftDate(cursor, -1);
     }
@@ -1868,6 +1939,7 @@
     $("#owner-streak-count").textContent = String(currentStreak(state.tasks));
 
     $("#today-task-text").textContent = todayTask ? todayTask.text : "今天还没有设置任务。";
+    renderTaskChecklist("#today-task-text", todayTask);
     $("#today-empty-hint").hidden = Boolean(todayTask);
     updateStatus($("#today-status"), todayTask, "未设置", "待完成");
     $("#edit-today-task").dataset.taskDate = today;
@@ -1878,7 +1950,7 @@
     $("#complete-today-task").textContent = todayTask && taskHasResult(todayTask) ? "更新最终结果" : "记录最终结果";
     $("#add-today-progress").dataset.taskDate = today;
     $("#add-today-progress").hidden = !todayTask || !taskCanAddProgress(todayTask);
-    $("#add-today-progress").textContent = todayTask && taskHasProgress(todayTask) ? "继续补充进度" : "添加进度";
+    $("#add-today-progress").textContent = todayTask && taskHasProgress(todayTask) ? "再添一条进度" : "添加进度";
 
     const ownerRecord = Boolean(todayTask && taskHasPublicRecord(todayTask));
     $("#today-proof-summary").hidden = !ownerRecord;
@@ -1891,6 +1963,7 @@
     }
 
     $("#tomorrow-task-text").textContent = tomorrowTask ? tomorrowTask.text : "还没有安排明天。";
+    renderTaskChecklist("#tomorrow-task-text", tomorrowTask);
     $("#edit-tomorrow-task").dataset.taskDate = tomorrow;
     $("#edit-tomorrow-task").textContent = tomorrowTask ? "编辑" : "设置";
 
@@ -1913,6 +1986,7 @@
     $("#visitor-mascot").classList.toggle("is-following", Boolean(task && taskHasProgress(task) && !taskHasResult(task)));
     $("#visitor-today-date").textContent = `${today} · ${dateLabel(today)}`;
     $("#visitor-today-task-text").textContent = task ? task.text : "今天还没有公开任务。";
+    renderTaskChecklist("#visitor-today-task-text", task);
     updateStatus($("#visitor-today-status"), task, "暂无任务", "进行中");
     $("#visitor-today-poms").textContent = `${publicPomsFor(today)} 个番茄`;
     const hasRecord = Boolean(task && taskHasPublicRecord(task));
@@ -1933,7 +2007,7 @@
   }
 
   function bestStreak(tasks) {
-    const keys = tasks.filter((task) => task.done).map((task) => task.date).sort();
+    const keys = tasks.filter((task) => taskResultStatus(task) === "completed").map((task) => task.date).sort();
     let best = 0;
     let current = 0;
     let previous = "";
@@ -1965,7 +2039,7 @@
     (stages.completionDates || []).forEach((item) => {
       if (item && item.date) completionMap.set(item.date, item.stageId);
     });
-    const doneCount = yearTasks.filter((task) => task.done).length;
+    const doneCount = yearTasks.filter((task) => taskResultStatus(task) === "completed").length;
     const scheduledCount = yearTasks.length;
     $(`#${prefix}history-year-label`).textContent = String(year);
     $(`#${prefix}history-done-count`).textContent = String(doneCount);
@@ -2027,7 +2101,11 @@
         const feedback = taskHasResult(task) && taskResultNote(task) ? `；反馈：${taskResultNote(task)}` : "";
         status.push(`每日任务${result}${supplement}：${task.text}${feedback}`);
       }
-      if (poms > 0) status.push(`专注番茄：${poms} 个`);
+      if (poms > 0) {
+        const pomMeta = pomMetaFor(key);
+        const backfillTime = pomMeta.backfilled ? completionTime(pomMeta.recordedAt) : "";
+        status.push(`专注番茄：${poms} 个${backfillTime ? `（补录于 ${backfillTime}）` : ""}`);
+      }
       if (hasPrivate) status.push("含私人记录，仅你可见");
       if (!status.length) status.push("无记录");
       cell.setAttribute("aria-label", `${key}，${status.join("；")}`);
@@ -2144,6 +2222,7 @@
         item.className = "history-item";
         if (entry.stageId !== null) item.classList.add("has-stage");
         if (entry.poms > 0) item.classList.add("has-focus");
+        if (pomIsBackfilled(entry.date)) item.classList.add("has-pom-backfill");
         if (entry.task && taskHasSupplement(entry.task)) item.classList.add("is-supplemented");
         if (zeroIncomplete) item.classList.add("is-zero-incomplete");
         if (entry.hasPrivate) item.classList.add("has-private-record");
@@ -2162,7 +2241,14 @@
         if (entry.poms > 0) {
           const focusMeta = document.createElement("span");
           focusMeta.className = "history-item-poms";
-          focusMeta.textContent = `专注 · ${entry.poms} 个番茄`;
+          focusMeta.append(document.createTextNode(`专注 · ${entry.poms} 个番茄`));
+          if (pomIsBackfilled(entry.date)) {
+            const backfill = document.createElement("span");
+            backfill.className = "history-pom-backfill";
+            backfill.textContent = "补";
+            backfill.title = `补录于 ${completionTime(pomMetaFor(entry.date).recordedAt) || "较晚日期"}`;
+            focusMeta.appendChild(backfill);
+          }
           text.appendChild(focusMeta);
         }
         if (entry.task && taskHasSupplement(entry.task)) {
@@ -2191,12 +2277,13 @@
           action.className = `history-item-status${status === "completed" ? " is-done" : (status === "incomplete" ? " is-incomplete" : " is-pending")}${zeroIncomplete ? " is-zero-incomplete" : ""}`;
           action.textContent = taskResultLabel(entry.task, status === "incomplete" || taskHasProgress(entry.task));
         }
+        if (entry.task && entry.stageId === null) applyCompletionMeter(action, entry.task);
         const recordKinds = [];
         if (entry.stageId !== null) recordKinds.push("阶段成果");
         if (entry.task) recordKinds.push("每日记录");
         if (entry.poms > 0) recordKinds.push("专注记录");
         if (entry.hasPrivate) recordKinds.push("私人记录");
-        action.setAttribute("aria-label", `查看 ${entry.date} 的${recordKinds.join("和")}${zeroIncomplete ? "；0% 未完成警示" : ""}`);
+        action.setAttribute("aria-label", `查看 ${entry.date} 的${recordKinds.join("和")}${zeroIncomplete ? "；0% 未完成警示" : ""}${pomIsBackfilled(entry.date) ? "；番茄为历史补录" : ""}`);
         action.addEventListener("click", () => openDateRecord(entry.date, entry.task, entry.stageId, scope));
         item.append(time, text, action);
         list.appendChild(item);
@@ -2232,6 +2319,117 @@
     else dialog.removeAttribute("open");
   }
 
+  function dailyChecklist(task) {
+    return task && Array.isArray(task.checklist) ? task.checklist : [];
+  }
+
+  function checkedTotal(task, checked = task?.checkedItems || []) {
+    return dailyChecklist(task).reduce((sum, item, index) => sum + (checked.includes(index) ? item.weight : 0), 0);
+  }
+
+  function renderChecklist(container, task, editable = false, checked = task?.checkedItems || []) {
+    container.replaceChildren();
+    const items = dailyChecklist(task);
+    container.hidden = !items.length;
+    items.forEach((item, index) => {
+      const row = document.createElement(editable ? "label" : "div");
+      row.className = "daily-checklist-item";
+      row.classList.toggle("is-checked", checked.includes(index));
+      const mark = document.createElement(editable ? "input" : "span");
+      if (editable) {
+        mark.type = "checkbox";
+        mark.value = String(index);
+        mark.checked = checked.includes(index);
+        mark.addEventListener("change", () => {
+          row.classList.toggle("is-checked", mark.checked);
+          const selected = Array.from(container.querySelectorAll("input:checked"), (input) => Number(input.value));
+          $("#progress-percent-input").value = String(checkedTotal(task, selected));
+          updateProgressOutput();
+        });
+      } else {
+        mark.className = "checklist-mark";
+        mark.textContent = checked.includes(index) ? "✓" : "○";
+        mark.setAttribute("aria-label", checked.includes(index) ? "已完成" : "未完成");
+      }
+      const text = document.createElement("span");
+      text.className = "checklist-item-text";
+      text.textContent = item.text;
+      const weight = document.createElement("span");
+      weight.className = "checklist-weight";
+      weight.textContent = `${item.weight}%`;
+      row.append(mark, text, weight);
+      container.append(row);
+    });
+  }
+
+  function renderTaskChecklist(selector, task, frozen = false) {
+    const text = $(selector);
+    let list = text.nextElementSibling;
+    if (!list || !list.classList.contains("daily-checklist")) {
+      list = document.createElement("div");
+      list.className = "daily-checklist checklist-readonly";
+      text.after(list);
+    }
+    const entries = taskProgressEntries(task).filter((entry) => !entry.legacy && !entry.supplemental);
+    const checked = frozen && task?.resultLocked ? (entries.at(-1)?.checkedItems || []) : (task?.checkedItems || []);
+    renderChecklist(list, task, false, checked);
+    text.hidden = dailyChecklist(task).length > 0;
+  }
+
+  function planRows() {
+    return Array.from($("#task-checklist-rows").children, (row) => ({
+      text: row.querySelector("textarea").value.trim(),
+      weight: row.querySelector('input[type="number"]').valueAsNumber,
+    }));
+  }
+
+  function updatePlanTotal() {
+    const total = planRows().reduce((sum, item) => sum + (Number.isFinite(item.weight) ? item.weight : 0), 0);
+    const output = $("#task-checklist-total");
+    output.textContent = `已分配 ${total}% / 100%${total < 100 ? ` · 还差 ${100 - total}%` : total > 100 ? ` · 超出 ${total - 100}%` : ""}`;
+    output.classList.toggle("is-valid", total === 100);
+    $("#task-checklist-add").disabled = $("#task-checklist-rows").children.length >= 20 || state.planLocked;
+  }
+
+  function addPlanRow(item = { text: "", weight: "" }) {
+    const row = document.createElement("div");
+    row.className = "checklist-plan-row";
+    const text = document.createElement("textarea");
+    text.rows = 2;
+    text.maxLength = 200;
+    text.placeholder = "这一项准备完成什么？";
+    text.setAttribute("aria-label", "任务内容");
+    text.value = item.text;
+    const weightWrap = document.createElement("label");
+    weightWrap.className = "checklist-weight-input";
+    const weight = document.createElement("input");
+    weight.type = "number";
+    weight.min = "1";
+    weight.max = "100";
+    weight.step = "1";
+    weight.inputMode = "numeric";
+    weight.setAttribute("aria-label", "任务占比（百分比）");
+    weight.value = String(item.weight);
+    weightWrap.append(weight, "%");
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button button-quiet checklist-remove";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", "删除这一项");
+    remove.addEventListener("click", () => { row.remove(); updatePlanTotal(); });
+    [text, weight, remove].forEach((input) => { input.disabled = state.planLocked; });
+    weight.addEventListener("input", updatePlanTotal);
+    row.append(text, weightWrap, remove);
+    $("#task-checklist-rows").append(row);
+    updatePlanTotal();
+  }
+
+  function togglePlanMode() {
+    const enabled = $("#task-checklist-mode").checked;
+    $("#task-checklist-editor").hidden = !enabled;
+    $("#task-legacy-field").hidden = enabled;
+  }
+
   function openTaskEditor(key, suggestedText = "") {
     if (!canManageActiveWorkspace()) return;
     const task = taskFor(key);
@@ -2242,12 +2440,20 @@
     $("#task-date-input").value = key;
     $("#task-dialog-date").textContent = `${key} · ${dateLabel(key)}`;
     $("#task-text-input").value = task ? task.text : suggestedText;
+    const items = dailyChecklist(task);
+    state.planLocked = Boolean(task && taskHasProgress(task));
+    $("#task-checklist-mode").checked = items.length > 0 || !task;
+    $("#task-checklist-mode").disabled = state.planLocked;
+    $("#task-checklist-rows").replaceChildren();
+    (items.length ? items : [{ text: task ? task.text.slice(0, 200) : suggestedText.slice(0, 200), weight: 100 }]).forEach(addPlanRow);
+    $("#task-checklist-help").textContent = state.planLocked ? "已有进度，项目与占比已固定；请通过添加进度勾选或补充说明。" : "开始记录后，项目与占比保持固定。";
+    togglePlanMode();
     $("#task-dialog-title").textContent = task ? "编辑任务" : "设置任务";
     $("#delete-task-button").hidden = !task;
     setMessage($("#task-dialog-message"), "");
     updateCharacterCount($("#task-text-input"));
     showDialog($("#task-dialog"));
-    window.setTimeout(() => $("#task-text-input").focus(), 0);
+    window.setTimeout(() => ($("#task-checklist-mode").checked ? $("#task-checklist-rows textarea") : $("#task-text-input")).focus(), 0);
   }
 
   async function saveTask(event) {
@@ -2256,7 +2462,12 @@
     const button = $("#save-task-button");
     const key = $("#task-date-input").value;
     const text = $("#task-text-input").value.trim();
-    if (!text) {
+    const checklist = $("#task-checklist-mode").checked ? planRows() : [];
+    if ($("#task-checklist-mode").checked && (!checklist.length || checklist.some((item) => !item.text || !Number.isInteger(item.weight) || item.weight < 1 || item.weight > 100) || checklist.reduce((sum, item) => sum + item.weight, 0) !== 100)) {
+      setMessage($("#task-dialog-message"), "请填写每项内容和整数占比，合计须为 100%。");
+      return;
+    }
+    if (!text && !checklist.length) {
       setMessage($("#task-dialog-message"), "请填写任务内容。");
       $("#task-text-input").focus();
       return;
@@ -2264,7 +2475,7 @@
     setLoading(button, true);
     setMessage($("#task-dialog-message"), "");
     try {
-      await api(`/api/tasks/${encodeURIComponent(key)}`, { method: "PUT", body: { text } });
+      await api(`/api/tasks/${encodeURIComponent(key)}`, { method: "PUT", body: { text, checklist } });
       closeDialog($("#task-dialog"));
       await loadData();
       toast("任务已保存。", "success");
@@ -2390,6 +2601,7 @@
   }
 
   function clearProgressFiles() {
+    state.progressChecklistTask = null;
     revokeProgressPreviewUrls();
     state.progressFiles = [];
     state.progressRecordId = "";
@@ -2500,9 +2712,14 @@
       : "");
   }
 
+  function setProgressOutput(element, percent) {
+    element.textContent = `${percent}%`;
+    element.dataset.progressState = percent === 100 ? "completed" : (percent > 0 ? "partial" : "empty");
+  }
+
   function updateProgressOutput() {
     const value = Math.min(100, Math.max(0, Number.parseInt($("#progress-percent-input").value, 10) || 0));
-    $("#progress-percent-output").textContent = `${value}%`;
+    setProgressOutput($("#progress-percent-output"), value);
   }
 
   function openProgressEditor(key) {
@@ -2516,10 +2733,18 @@
     const supplemental = task.progressEntryMode === "supplement" || key === shiftDate(dateKeyInShanghai(), -1);
     clearProgressFiles();
     $("#progress-form").reset();
+    const weighted = dailyChecklist(task).length > 0;
+    state.progressChecklistTask = weighted ? task : null;
+    renderChecklist($("#progress-checklist"), task, true);
+    $("#progress-extra-details").open = !weighted;
+    $("#progress-percent-input").hidden = weighted;
+    $("#progress-percent-input").step = weighted ? "1" : "5";
+    $("#progress-percent-input").disabled = weighted;
+    $("#progress-percent-input").nextElementSibling.hidden = weighted;
     state.progressRecordId = uniqueToken("progress");
     $("#progress-date-input").value = key;
     $("#progress-dialog-title").textContent = supplemental ? "补充昨日进度" : "添加一次进度";
-    $("#progress-dialog-date").textContent = `${key} · ${task.text}`;
+    $("#progress-dialog-date").textContent = weighted ? `${key} · 勾选已完成的项目，保存后生效。` : `${key} · ${task.text}`;
     $("#progress-note-help").textContent = supplemental
       ? "这条记录会标为次日补充；原完成度和完成结果不会改变。"
       : "每次保存都会追加一条公开时间记录，不会覆盖之前的内容。";
@@ -2527,12 +2752,17 @@
       ? "补充会作为公开节点保留实际记录时间，但不会改写昨天 24:00 已冻结的结果。"
       : "保存一次，就增加一个带时间的公开节点；备注、链接和附件会给访客查看。私人便签和分心记录始终不会公开。";
     $("#submit-progress-button").textContent = supplemental ? "保存这次补充" : "保存这次进度";
+    if (weighted) $("#submit-progress-button").textContent = "保存并收起";
     const latest = latestProgressEntry(task);
     state.progressBaselinePercent = Math.max(
       latest ? progressPercent(latest) : 0,
       taskCompletionPercent(task),
     );
     $("#progress-percent-input").value = String(state.progressBaselinePercent);
+    if (weighted) {
+      state.progressBaselinePercent = checkedTotal(task);
+      $("#progress-percent-input").value = String(state.progressBaselinePercent);
+    }
     const existingAssets = taskProgressEntries(task).flatMap((entry) => Array.isArray(entry.assets) ? entry.assets : []);
     const existingFiles = existingAssets.filter((asset) => asset && asset.kind === "file").length;
     const existingLinks = existingAssets.filter((asset) => asset && asset.kind === "link").length;
@@ -2545,7 +2775,7 @@
     updateCharacterCount($("#progress-note-input"));
     setMessage($("#progress-dialog-message"), "");
     showDialog($("#progress-dialog"));
-    window.setTimeout(() => $("#progress-note-input").focus(), 0);
+    window.setTimeout(() => (weighted ? $("#progress-checklist input") : $("#progress-note-input")).focus(), 0);
   }
 
   function createdProgressFromPayload(payload) {
@@ -2570,11 +2800,20 @@
     }
     const nextPercent = Math.min(100, Math.max(0, Number.parseInt($("#progress-percent-input").value, 10) || 0));
     const note = $("#progress-note-input").value.trim();
+    const checklistTask = state.progressChecklistTask;
+    const checkedItems = Array.from($("#progress-checklist").querySelectorAll("input:checked"), (input) => Number(input.value));
+    const checkedChanged = checklistTask && JSON.stringify(checkedItems) !== JSON.stringify(checklistTask.checkedItems || []);
     if (!state.progressUploadId
       && !note
       && rawLinks.length === 0
       && state.progressFiles.length === 0
+      && !checkedChanged
       && nextPercent === state.progressBaselinePercent) {
+      if (checklistTask) {
+        closeDialog($("#progress-dialog"));
+        toast("勾选没有变化，已收起。", "success");
+        return;
+      }
       setMessage($("#progress-dialog-message"), "这次还没有新增内容。写一句备注、调整进度，或添加链接/文件后再保存。");
       $("#progress-note-input").focus();
       return;
@@ -2592,6 +2831,7 @@
             links: rawLinks.map((value) => httpUrl(value)),
             hasPendingFiles: state.progressFiles.length > 0,
             clientRecordId: state.progressRecordId,
+            ...(checklistTask ? { checkedItems, checklist: checklistTask.checklist, checklistRevision: checklistTask.checklistRevision } : {}),
           },
         });
         const created = createdProgressFromPayload(payload);
@@ -2632,10 +2872,11 @@
       } else {
         closeDialog($("#progress-dialog"));
         clearProgressFiles();
-        toast(files.length ? `进度已保存，${files.length} 个附件已按顺序上传。` : "这次进度已保存。", "success");
+        toast(files.length ? `进度已保存，${files.length} 个附件已按顺序上传。` : checklistTask ? `已保存 · 完成 ${nextPercent}%，清单已收起。` : "这次进度已保存。", "success");
       }
     } catch (error) {
       setMessage($("#progress-dialog-message"), error.message);
+      if (error.status === 409) await loadData();
     } finally {
       setLoading(button, false);
       if (keepOpen) button.textContent = "重试未上传附件";
@@ -2648,6 +2889,27 @@
   }
 
   function updateResultForm() {
+    const checklistTask = taskFor($("#proof-date-input").value);
+    const weighted = dailyChecklist(checklistTask).length > 0;
+    $("#result-progress-input").step = weighted ? "1" : "5";
+    $("#result-status-completed").disabled = weighted;
+    $("#result-status-incomplete").disabled = weighted;
+    $("#proof-text-input").required = !weighted;
+    if (weighted) {
+      const percent = checkedTotal(checklistTask);
+      $("#result-status-completed").checked = percent === 100;
+      $("#result-status-incomplete").checked = percent < 100;
+      $("#result-progress-input").max = "100";
+      $("#result-progress-input").value = String(percent);
+      $("#result-progress-input").disabled = true;
+      setProgressOutput($("#result-progress-output"), percent);
+      $("#result-progress-field").classList.add("is-locked");
+      $("#result-progress-help").textContent = "由已保存的勾选自动计算；如需调整，请使用添加进度。";
+      $("#result-note-label").textContent = "补充说明（可选）";
+      $("#proof-requirement").textContent = "可以留空；当天 24:00 会按清单自动冻结结果。";
+      $("#proof-text-input").placeholder = "有想补充的再写，不必重复清单内容…";
+      return;
+    }
     const status = selectedResultStatus();
     const completed = status === "completed";
     const progress = $("#result-progress-input");
@@ -2670,7 +2932,7 @@
       progress.disabled = false;
     }
     const percent = completed ? 100 : Math.min(99, Math.max(0, Number.parseInt(progress.value, 10) || 0));
-    $("#result-progress-output").textContent = `${percent}%`;
+    setProgressOutput($("#result-progress-output"), percent);
     $("#result-progress-field").classList.toggle("is-locked", completed);
     $("#result-progress-help").textContent = completed
       ? "选择“完成”时自动记为 100%。"
@@ -2691,7 +2953,7 @@
       return;
     }
     $("#proof-date-input").value = key;
-    $("#proof-dialog-date").textContent = `${key} · ${task.text}`;
+    $("#proof-dialog-date").textContent = dailyChecklist(task).length ? `${key} · ${task.checkedItems.length} / ${task.checklist.length} 项已完成` : `${key} · ${task.text}`;
     $("#proof-dialog-title").textContent = taskHasResult(task) ? "更新今日反馈" : "记录今日结果";
     const status = taskResultStatus(task) === "incomplete" ? "incomplete" : "completed";
     $("#result-status-completed").checked = status === "completed";
@@ -2716,7 +2978,7 @@
       ? 100
       : Math.min(99, Math.max(0, Number.parseInt($("#result-progress-input").value, 10) || 0));
     const resultNote = $("#proof-text-input").value.trim();
-    if (!resultNote) {
+    if (!resultNote && !dailyChecklist(task).length) {
       setMessage($("#proof-dialog-message"), "请填写备注。");
       $("#proof-text-input").focus();
       return;
@@ -2935,6 +3197,15 @@
       note.textContent = entry.note.trim();
       article.appendChild(note);
     }
+    const checklist = dailyChecklist(taskFor(taskDate));
+    if (checklist.length && Array.isArray(entry.checkedItems)) {
+      const summary = document.createElement("p");
+      summary.className = "progress-entry-note";
+      summary.textContent = entry.checkedItems.length
+        ? `已完成：${entry.checkedItems.map((index) => checklist[index]?.text || "").join("、")}`
+        : "尚未勾选完成项目。";
+      article.appendChild(summary);
+    }
     const assets = Array.isArray(entry.assets) ? entry.assets : [];
     const linkItems = assets.filter((asset) => asset && asset.kind === "link" && httpUrl(asset.url))
       .map((asset) => progressLinkItem(taskDate, entry, asset));
@@ -2985,10 +3256,13 @@
     $("#record-stage-section").hidden = true;
     $("#record-daily-section").hidden = true;
     $("#record-focus-section").hidden = true;
+    $("#record-focus-backfill").hidden = true;
+    $("#record-focus-backfill").textContent = "";
     $("#record-private-section").hidden = true;
     $("#record-progress-section").hidden = true;
     $("#record-progress-section").open = false;
     $("#record-progress-list").replaceChildren();
+    applyCompletionMeter($("#record-daily-progress"), null);
     $("#record-distractions-block").hidden = true;
     $("#record-note-block").hidden = true;
     $("#record-distractions-text").textContent = "";
@@ -3030,10 +3304,13 @@
     statusElement.classList.add(status === "completed" ? "is-completed" : (status === "incomplete" ? "is-incomplete" : "is-pending"));
     statusElement.textContent = taskResultLabel(task, false);
     $("#record-daily-title").textContent = task.text;
-    $("#record-daily-progress").textContent = hasResult ? taskCompletionSummary(task) : "尚未记录结果";
+    renderTaskChecklist("#record-daily-title", task, true);
+    const progressElement = $("#record-daily-progress");
+    progressElement.textContent = hasResult ? taskCompletionSummary(task) : "尚未记录结果";
+    applyCompletionMeter(progressElement, task);
     $("#record-daily-feedback-label").textContent = "备注";
     $("#proof-view-text").textContent = taskResultNote(task) || "未填写文字反馈。";
-    $("#record-daily-feedback").hidden = !hasResult;
+    $("#record-daily-feedback").hidden = !hasResult || (dailyChecklist(task).length > 0 && !taskResultNote(task));
     const latest = latestProgressEntry(task);
     $("#proof-view-time").textContent = hasResult
       ? (task.resultLockSource === "automatic"
@@ -3054,6 +3331,11 @@
     const poms = publicPomsFor(key);
     if (poms <= 0) return false;
     $("#record-focus-count").textContent = String(poms);
+    const backfill = $("#record-focus-backfill");
+    const pomMeta = pomMetaFor(key);
+    const recordedAt = completionTime(pomMeta.recordedAt);
+    backfill.textContent = recordedAt ? `补录于 ${recordedAt}` : "";
+    backfill.hidden = !pomMeta.backfilled || !recordedAt;
     $("#record-focus-section").hidden = false;
     return true;
   }
@@ -3091,7 +3373,7 @@
     const hasPrivate = renderPrivateRecord(key, scope);
     const canAddProgress = Boolean(task && scope === "owner" && canManageActiveWorkspace() && taskCanAddProgress(task));
     $("#record-add-progress").hidden = !canAddProgress;
-    $("#record-add-progress").textContent = task && task.progressEntryMode === "supplement" ? "补充昨日进度" : "继续补充进度";
+    $("#record-add-progress").textContent = task && task.progressEntryMode === "supplement" ? "补充昨日进度" : "再添一条进度";
     $("#record-add-progress").dataset.taskDate = canAddProgress ? key : "";
     const sectionCount = Number(Boolean(stage)) + Number(Boolean(task)) + Number(hasFocus) + Number(hasPrivate);
     $("#proof-view-title").textContent = sectionCount > 1
@@ -3429,26 +3711,108 @@
     }
   }
 
+  function pomBackfillDates() {
+    const today = dateKeyInShanghai();
+    return [1, 2, 3].map((distance) => shiftDate(today, -distance));
+  }
+
+  function updatePomBackfillSelection() {
+    const key = $("#pom-backfill-date").value;
+    const poms = publicPomsFor(key);
+    const meta = pomMetaFor(key);
+    $("#pom-backfill-count").value = String(poms);
+    const recordedAt = completionTime(meta.recordedAt);
+    $("#pom-backfill-current").textContent = meta.backfilled && recordedAt
+      ? `当前 ${poms} 个 · 上次补录于 ${recordedAt}`
+      : (poms > 0 ? `当前 ${poms} 个 · 当日已有记录` : "该日尚未记录番茄。");
+    setMessage($("#pom-backfill-message"), "");
+  }
+
+  function openPomBackfill() {
+    if (!canManageActiveWorkspace()) return;
+    const select = $("#pom-backfill-date");
+    select.replaceChildren();
+    pomBackfillDates().forEach((key) => {
+      const option = document.createElement("option");
+      option.value = key;
+      option.textContent = `${key} · ${dateLabel(key)}`;
+      select.appendChild(option);
+    });
+    updatePomBackfillSelection();
+    showDialog($("#pom-backfill-dialog"));
+    window.setTimeout(() => select.focus(), 0);
+  }
+
+  function stepPomBackfill(amount) {
+    const input = $("#pom-backfill-count");
+    const current = input.valueAsNumber;
+    const safeCurrent = Number.isInteger(current) ? current : 0;
+    input.value = String(Math.min(100000, Math.max(0, safeCurrent + amount)));
+    setMessage($("#pom-backfill-message"), "");
+  }
+
+  async function savePomBackfill(event) {
+    event.preventDefault();
+    if (!canManageActiveWorkspace()) return;
+    const key = $("#pom-backfill-date").value;
+    const input = $("#pom-backfill-count");
+    const poms = input.valueAsNumber;
+    if (!pomBackfillDates().includes(key)) {
+      setMessage($("#pom-backfill-message"), "补录日期已过期，请关闭后重新选择。");
+      return;
+    }
+    if (!input.checkValidity() || !Number.isInteger(poms) || poms < 0 || poms > 100000) {
+      setMessage($("#pom-backfill-message"), "番茄数量应在 0 到 100000 之间。");
+      $("#pom-backfill-count").focus();
+      return;
+    }
+    const button = $("#save-pom-backfill");
+    setLoading(button, true);
+    setMessage($("#pom-backfill-message"), "");
+    try {
+      const result = await api(`/api/stats/${encodeURIComponent(key)}/poms`, {
+        method: "PUT",
+        body: { poms },
+      });
+      if (!result.pomRecord) throw new ApiError("番茄已保存，但服务器没有返回记录。请刷新后检查。", 0, "missing_pom_record");
+      syncPomRecord(key, result.pomRecord);
+      renderHistory("owner");
+      renderVisitor();
+      closeDialog($("#pom-backfill-dialog"));
+      if (result.idempotent) toast(`${key} 已是 ${poms} 个番茄，未重复记录。`, "success");
+      else if (poms === 0) toast(`已清除 ${key} 的番茄数量。`, "success");
+      else toast(`已为 ${key} 补录 ${poms} 个番茄。`, "success");
+      window.setTimeout(() => $("#open-pom-backfill").focus(), 0);
+    } catch (error) {
+      setMessage($("#pom-backfill-message"), error.message);
+    } finally {
+      setLoading(button, false);
+    }
+  }
+
   async function saveFocus(showFeedback) {
     if (!canManageActiveWorkspace()) return;
     window.clearTimeout(state.focusSaveTimer);
-    const poms = Number.parseInt($("#focus-poms").value, 10);
+    const input = $("#focus-poms");
+    const poms = input.valueAsNumber;
     const note = $("#focus-note").value;
     const distractions = $("#focus-distractions").value;
-    if (!Number.isInteger(poms) || poms < 0 || poms > 100000) {
+    if (!input.checkValidity() || !Number.isInteger(poms) || poms < 0 || poms > 100000) {
       if (showFeedback) toast("专注番茄数量应在 0–100000 之间。", "error");
       return;
     }
     const button = $("#save-focus");
     if (showFeedback) setLoading(button, true);
+    const today = dateKeyInShanghai();
     try {
-      const result = await api(`/api/stats/${dateKeyInShanghai()}`, {
+      const result = await api(`/api/stats/${today}`, {
         method: "PUT",
         body: { poms, note, distractions },
       });
-      const today = dateKeyInShanghai();
       state.stats[today] = result.stats;
-      state.publicPoms[today] = result.stats.poms;
+      if (result.pomRecord) syncPomRecord(today, result.pomRecord);
+      else if (result.stats.poms > 0) state.publicPoms[today] = result.stats.poms;
+      else delete state.publicPoms[today];
       renderHistory("owner");
       renderVisitor();
       if (showFeedback) toast("今日专注已保存。", "success");
@@ -4993,6 +5357,12 @@
       openDateRecord(button.dataset.recordDate, taskFor(button.dataset.recordDate), button.dataset.stageId, scope);
     }));
     $("#task-form").addEventListener("submit", saveTask);
+    $("#task-checklist-mode").addEventListener("change", togglePlanMode);
+    $("#task-checklist-add").addEventListener("click", () => {
+      if (state.planLocked || planRows().length >= 20) return;
+      addPlanRow();
+      $("#task-checklist-rows").lastElementChild.querySelector("textarea").focus();
+    });
     $("#delete-task-button").addEventListener("click", deleteTask);
     $("#progress-form").addEventListener("submit", submitProgress);
     $("#progress-percent-input").addEventListener("input", updateProgressOutput);
@@ -5005,12 +5375,19 @@
       event.preventDefault();
       saveFocus(true);
     });
-    $$('[data-step]').forEach((button) => button.addEventListener("click", () => {
+    [$("#focus-decrease"), $("#focus-increase")].forEach((button) => button.addEventListener("click", () => {
       const input = $("#focus-poms");
       const next = Math.min(100000, Math.max(0, (Number.parseInt(input.value, 10) || 0) + Number(button.dataset.step)));
       input.value = String(next);
       scheduleFocusSave();
     }));
+    $("#open-pom-backfill").addEventListener("click", openPomBackfill);
+    $("#pom-backfill-form").addEventListener("submit", savePomBackfill);
+    $("#pom-backfill-date").addEventListener("change", updatePomBackfillSelection);
+    [$("#pom-backfill-decrease"), $("#pom-backfill-increase")].forEach((button) => {
+      button.addEventListener("click", () => stepPomBackfill(Number(button.dataset.step)));
+    });
+    $("#pom-backfill-count").addEventListener("input", () => setMessage($("#pom-backfill-message"), ""));
     $("#focus-poms").addEventListener("change", scheduleFocusSave);
     $("#focus-distractions").addEventListener("input", scheduleFocusSave);
     $("#focus-note").addEventListener("input", scheduleFocusSave);
@@ -5104,7 +5481,7 @@
       event.preventDefault();
       finishConfirmation(false);
     });
-    [$("#task-dialog"), $("#progress-dialog"), $("#proof-dialog"), $("#stage-dialog"), $("#stage-complete-dialog")].forEach((dialog) => dialog.addEventListener("close", () => {
+    [$("#task-dialog"), $("#progress-dialog"), $("#proof-dialog"), $("#stage-dialog"), $("#stage-complete-dialog"), $("#pom-backfill-dialog")].forEach((dialog) => dialog.addEventListener("close", () => {
       setMessage(dialog.querySelector(".form-message"), "");
       if (dialog === $("#progress-dialog")) clearProgressFiles();
       if (dialog === $("#stage-complete-dialog")) clearStageImagePreview();

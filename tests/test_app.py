@@ -9,7 +9,9 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import math
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -480,6 +482,14 @@ class DailySealApiTests(unittest.TestCase):
             headers={"X-CSRF-Token": "wrong-token"},
         )
         self.assertEqual(mismatch.status_code, 403)
+        missing_pom_backfill = self.client.put(
+            "/api/stats/2026-07-16/poms",
+            json={"poms": 3},
+        )
+        self.assertEqual(missing_pom_backfill.status_code, 403)
+        self.assertEqual(
+            missing_pom_backfill.get_json()["code"], "csrf_failed"
+        )
         with self.db() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
 
@@ -591,6 +601,11 @@ class DailySealApiTests(unittest.TestCase):
                 json={"poms": 1, "note": "forbidden"},
                 headers={"X-CSRF-Token": token},
             ),
+            self.client.put(
+                "/api/stats/2026-07-16/poms",
+                json={"poms": 1},
+                headers={"X-CSRF-Token": token},
+            ),
             self.client.post(
                 "/api/import",
                 json={"data": {"tasks": {}, "poms": {}, "notes": {}}},
@@ -699,6 +714,7 @@ class DailySealApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(payload["publicPoms"], {"2026-07-17": 4})
+        self.assertEqual(payload["publicPomMeta"], {})
         self.assertEqual(payload["tasks"][0]["proofImageUrl"], task["proofImageUrl"])
 
         cannot_edit = self.put_task(self.client, text="rewrite completed task")
@@ -721,6 +737,7 @@ class DailySealApiTests(unittest.TestCase):
             export_data["tasks"]["2026-07-17"]["proofFileMime"], "image/jpeg"
         )
         self.assertEqual(export_data["poms"]["2026-07-17"], 4)
+        self.assertEqual(export_data["pomMeta"], {})
         self.assertEqual(export_data["notes"]["2026-07-17"], "Focused session")
         self.assertEqual(
             export_data["distractions"]["2026-07-17"], "Checked messages once"
@@ -1976,7 +1993,7 @@ class DailySealApiTests(unittest.TestCase):
         )
 
         exported = json.loads(self.client.get("/api/export").get_data(as_text=True))
-        self.assertEqual(exported["formatVersion"], 2)
+        self.assertEqual(exported["formatVersion"], 3)
         self.assertFalse(exported["attachmentsIncluded"])
         self.assertEqual(
             self.client.delete(
@@ -2424,6 +2441,254 @@ class DailySealApiTests(unittest.TestCase):
             },
         )
 
+    def test_pom_backfill_is_limited_to_three_days_and_keeps_private_text_separate(self):
+        provider = server.app.config.pop("BUSINESS_DATE_PROVIDER")
+        snapshot_time = int(
+            server.datetime(
+                2026, 3, 1, 0, 0, tzinfo=server.CHINA_STANDARD_TIME
+            ).timestamp()
+        )
+        try:
+            with patch.object(server, "now_ts", return_value=snapshot_time) as clock:
+                sampled_at, sampled_date = server.business_clock_snapshot()
+            self.assertEqual(clock.call_count, 1)
+            self.assertEqual(sampled_at, snapshot_time)
+            self.assertEqual(sampled_date, "2026-03-01")
+        finally:
+            server.app.config["BUSINESS_DATE_PROVIDER"] = provider
+        self.assertEqual(
+            server.pom_recording_mode("2025-12-29", "2026-01-01"),
+            "backfill",
+        )
+        self.assertIsNone(
+            server.pom_recording_mode("2025-12-28", "2026-01-01")
+        )
+        self.assertEqual(
+            server.pom_recording_mode("2024-02-29", "2024-03-03"),
+            "backfill",
+        )
+        self.login_unlocked_owner()
+        current_date = "2026-03-01"
+        server.app.config["BUSINESS_DATE_PROVIDER"] = (
+            lambda _task_date_hint=None: current_date
+        )
+        token = self.csrf()
+        backfill_dates = ["2026-02-28", "2026-02-27", "2026-02-26"]
+        with self.db() as connection:
+            connection.execute(
+                "INSERT INTO daily_stats("
+                "stat_date, poms, note, distractions, updated_at"
+                ") VALUES (?, 0, ?, ?, ?)",
+                (
+                    backfill_dates[1],
+                    "private note stays",
+                    "private distraction stays",
+                    1,
+                ),
+            )
+
+        empty_zero = self.client.put(
+            f"/api/stats/{backfill_dates[0]}/poms",
+            json={"poms": 0},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(empty_zero.status_code, 200)
+        self.assertTrue(empty_zero.get_json()["idempotent"])
+        self.assertEqual(
+            empty_zero.get_json()["pomRecord"],
+            {
+                "poms": 0,
+                "pomsRecordedAt": None,
+                "pomsRecordDate": None,
+                "pomsBackfilled": False,
+            },
+        )
+        with self.db() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM daily_stats WHERE stat_date = ?",
+                    (backfill_dates[0],),
+                ).fetchone()
+            )
+
+        first_recorded_at = int(
+            server.datetime(
+                2026, 3, 1, 9, 15, tzinfo=server.CHINA_STANDARD_TIME
+            ).timestamp()
+        )
+        with patch.object(server, "now_ts", return_value=first_recorded_at):
+            responses = [
+                self.client.put(
+                    f"/api/stats/{key}/poms",
+                    json={"poms": index + 3},
+                    headers={"X-CSRF-Token": token},
+                )
+                for index, key in enumerate(backfill_dates)
+            ]
+        for index, response in enumerate(responses):
+            self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+            payload = response.get_json()
+            self.assertFalse(payload["idempotent"])
+            self.assertEqual(payload["mode"], "backfill")
+            self.assertEqual(payload["pomRecord"]["poms"], index + 3)
+            self.assertTrue(payload["pomRecord"]["pomsBackfilled"])
+            self.assertEqual(
+                payload["pomRecord"]["pomsRecordDate"], current_date
+            )
+            self.assertEqual(
+                payload["pomRecord"]["pomsRecordedAt"],
+                server.utc_iso(first_recorded_at),
+            )
+
+        later_recorded_at = first_recorded_at + 3600
+        with patch.object(server, "now_ts", return_value=later_recorded_at):
+            retry = self.client.put(
+                f"/api/stats/{backfill_dates[1]}/poms",
+                json={"poms": 4},
+                headers={"X-CSRF-Token": token},
+            )
+            corrected = self.client.put(
+                f"/api/stats/{backfill_dates[1]}/poms",
+                json={"poms": 8},
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertTrue(retry.get_json()["idempotent"])
+        self.assertEqual(
+            retry.get_json()["pomRecord"]["pomsRecordedAt"],
+            server.utc_iso(first_recorded_at),
+        )
+        self.assertFalse(corrected.get_json()["idempotent"])
+        self.assertEqual(corrected.get_json()["pomRecord"]["poms"], 8)
+        self.assertEqual(
+            corrected.get_json()["pomRecord"]["pomsRecordedAt"],
+            server.utc_iso(later_recorded_at),
+        )
+
+        too_old = self.client.put(
+            "/api/stats/2026-02-25/poms",
+            json={"poms": 1},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(too_old.status_code, 409)
+        self.assertEqual(
+            too_old.get_json()["code"], "pom_backfill_window_closed"
+        )
+        future = self.client.put(
+            "/api/stats/2026-03-02/poms",
+            json={"poms": 1},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(future.status_code, 409)
+        self.assertEqual(future.get_json()["code"], "pom_window_not_open")
+
+        transition_dates = iter(("2026-03-01", "2026-03-02"))
+        server.app.config["BUSINESS_DATE_PROVIDER"] = (
+            lambda _task_date_hint=None: next(transition_dates)
+        )
+        closed_during_lock = self.client.put(
+            f"/api/stats/{backfill_dates[2]}/poms",
+            json={"poms": 99},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(closed_during_lock.status_code, 409)
+        self.assertEqual(
+            closed_during_lock.get_json()["code"],
+            "pom_backfill_window_closed",
+        )
+        server.app.config["BUSINESS_DATE_PROVIDER"] = (
+            lambda _task_date_hint=None: current_date
+        )
+        with self.db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT poms FROM daily_stats WHERE stat_date = ?",
+                    (backfill_dates[2],),
+                ).fetchone()["poms"],
+                5,
+            )
+        blocked_private_update = self.client.put(
+            f"/api/stats/{backfill_dates[1]}",
+            json={
+                "poms": 9,
+                "note": "must not replace",
+                "distractions": "must not replace",
+            },
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(blocked_private_update.status_code, 409)
+        self.assertEqual(
+            blocked_private_update.get_json()["code"], "focus_window_closed"
+        )
+
+        owner_payload = self.client.get("/api/data").get_json()
+        self.assertEqual(owner_payload["publicPoms"][backfill_dates[1]], 8)
+        self.assertEqual(
+            owner_payload["stats"][backfill_dates[1]],
+            {
+                "poms": 8,
+                "note": "private note stays",
+                "distractions": "private distraction stays",
+            },
+        )
+        self.assertEqual(
+            owner_payload["publicPomMeta"][backfill_dates[1]],
+            {
+                "recordedAt": server.utc_iso(later_recorded_at),
+                "recordDate": current_date,
+                "backfilled": True,
+            },
+        )
+
+        viewer_client = server.app.test_client()
+        self.assertEqual(self.register_viewer(viewer_client).status_code, 200)
+        viewer_response = viewer_client.get("/api/data")
+        viewer_payload = viewer_response.get_json()
+        self.assertNotIn("stats", viewer_payload)
+        self.assertEqual(viewer_payload["publicPoms"][backfill_dates[1]], 8)
+        self.assertEqual(
+            viewer_payload["publicPomMeta"][backfill_dates[1]],
+            owner_payload["publicPomMeta"][backfill_dates[1]],
+        )
+        self.assertNotIn("private note stays", viewer_response.get_data(as_text=True))
+        self.assertNotIn(
+            "private distraction stays", viewer_response.get_data(as_text=True)
+        )
+
+        with patch.object(server, "now_ts", return_value=later_recorded_at + 60):
+            cleared = self.client.put(
+                f"/api/stats/{backfill_dates[0]}/poms",
+                json={"poms": 0},
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(cleared.status_code, 200)
+        refreshed = self.client.get("/api/data").get_json()
+        self.assertNotIn(backfill_dates[0], refreshed["publicPoms"])
+        self.assertNotIn(backfill_dates[0], refreshed["publicPomMeta"])
+
+        exported = json.loads(self.client.get("/api/export").get_data(as_text=True))
+        self.assertEqual(exported["formatVersion"], 3)
+        self.assertEqual(
+            exported["pomMeta"][backfill_dates[1]],
+            refreshed["publicPomMeta"][backfill_dates[1]],
+        )
+        with self.db() as connection:
+            connection.execute("DELETE FROM daily_stats")
+        imported = self.client.post(
+            "/api/import",
+            json={"data": exported},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(imported.status_code, 200, imported.get_data(as_text=True))
+        round_trip = self.client.get("/api/data").get_json()
+        self.assertEqual(
+            round_trip["publicPomMeta"][backfill_dates[1]],
+            exported["pomMeta"][backfill_dates[1]],
+        )
+        self.assertEqual(
+            round_trip["stats"][backfill_dates[1]]["note"],
+            "private note stays",
+        )
+
     def test_attachment_limits_are_consistent_at_10_mib_per_file(self):
         self.assertEqual(server.MAX_ATTACHMENT_BYTES, 10 * 1024 * 1024)
         self.assertEqual(server.app.config["MAX_CONTENT_LENGTH"], 12 * 1024 * 1024)
@@ -2548,6 +2813,143 @@ class DailySealApiTests(unittest.TestCase):
         zero_color = styles.index(".history-item-status.is-zero-incomplete,")
         self.assertLess(combined_color, incomplete_color)
         self.assertLess(incomplete_color, zero_color)
+
+    def test_pom_backfill_ui_and_completion_scale_follow_visual_contracts(self):
+        static_dir = WORK_DIR / "app" / "static"
+        index_html = (static_dir / "index.html").read_text(encoding="utf-8")
+        app_script = (static_dir / "app.js").read_text(encoding="utf-8")
+        styles = (static_dir / "app.css").read_text(encoding="utf-8")
+
+        for markup_contract in (
+            'id="open-pom-backfill"',
+            'id="pom-backfill-dialog"',
+            'id="pom-backfill-date"',
+            'id="pom-backfill-count"',
+            'id="record-focus-backfill"',
+            "可补录前 3 个北京时间自然日",
+            "只修正该日番茄总数，不改变任务结果或进度内容",
+            "保存补录",
+        ):
+            self.assertIn(markup_contract, index_html)
+        for script_contract in (
+            "publicPomMeta",
+            "function pomBackfillDates()",
+            "return [1, 2, 3]",
+            'backfill.textContent = "补"',
+            "补录于 ${recordedAt}",
+            "再添一条进度",
+            "补充昨日进度",
+            "applyCompletionMeter",
+            "--completion-percent",
+            "const poms = input.valueAsNumber",
+            "input.checkValidity()",
+        ):
+            self.assertIn(script_contract, app_script)
+        self.assertNotIn(
+            'cell.classList.add("is-pom-backfilled")', app_script
+        )
+        self.assertRegex(
+            styles,
+            r"\.pom-backfill-trigger\s*\{[^}]*min-height:\s*44px",
+        )
+        self.assertRegex(
+            styles,
+            r"\.pom-backfill-stepper button,\s*"
+            r"\.pom-backfill-stepper input\s*\{[^}]*height:\s*44px",
+        )
+        self.assertIn(".history-pom-backfill", styles)
+        self.assertIn(".record-focus-backfill", styles)
+        self.assertIn(".record-result-progress.has-completion-meter", styles)
+
+        light_start = styles.index(":root {")
+        dark_start = styles.index('html[data-theme="dark"] {')
+        light_tokens = styles[light_start:dark_start]
+        dark_end = styles.index("\n}", dark_start) + 2
+        dark_tokens = styles[dark_start:dark_end]
+
+        def color_token(block, name):
+            match = re.search(rf"--{re.escape(name)}:\s*(#[0-9a-fA-F]{{6}})", block)
+            self.assertIsNotNone(match, name)
+            return match.group(1)
+
+        def rgb(hex_value):
+            return tuple(
+                int(hex_value[index:index + 2], 16) / 255
+                for index in (1, 3, 5)
+            )
+
+        def linear(channel):
+            return (
+                channel / 12.92
+                if channel <= 0.04045
+                else ((channel + 0.055) / 1.055) ** 2.4
+            )
+
+        def luminance(hex_value):
+            red, green, blue = (linear(value) for value in rgb(hex_value))
+            return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+        def contrast(first, second):
+            lighter, darker = sorted(
+                (luminance(first), luminance(second)), reverse=True
+            )
+            return (lighter + 0.05) / (darker + 0.05)
+
+        def oklab(hex_value):
+            red, green, blue = (linear(value) for value in rgb(hex_value))
+            long_value = 0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue
+            medium_value = 0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue
+            short_value = 0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue
+            long_root = long_value ** (1 / 3)
+            medium_root = medium_value ** (1 / 3)
+            short_root = short_value ** (1 / 3)
+            return (
+                0.2104542553 * long_root + 0.793617785 * medium_root - 0.0040720468 * short_root,
+                1.9779984951 * long_root - 2.428592205 * medium_root + 0.4505937099 * short_root,
+                0.0259040371 * long_root + 0.7827717662 * medium_root - 0.808675766 * short_root,
+            )
+
+        def delta_ok(first, second):
+            first_lab = oklab(first)
+            second_lab = oklab(second)
+            return math.sqrt(
+                sum(((one - two) * 100) ** 2 for one, two in zip(first_lab, second_lab))
+            )
+
+        for block in (light_tokens, dark_tokens):
+            palette = [color_token(block, f"progress-{level}") for level in range(6)]
+            for before, after in zip(palette, palette[1:]):
+                self.assertGreaterEqual(delta_ok(before, after), 5.0)
+            surface = color_token(block, "surface")
+            surface_muted = color_token(block, "surface-muted")
+            for semantic_text in ("amber", "danger", "green"):
+                self.assertGreaterEqual(
+                    contrast(color_token(block, semantic_text), surface), 4.5
+                )
+            self.assertGreaterEqual(
+                contrast(color_token(block, "ink-soft"), surface_muted), 4.5
+            )
+
+        palette_levels = []
+        for percent in range(101):
+            if percent == 0:
+                level = 0
+            elif percent < 25:
+                level = 1
+            elif percent < 50:
+                level = 2
+            elif percent < 75:
+                level = 3
+            elif percent < 100:
+                level = 4
+            else:
+                level = 5
+            palette_levels.append(level)
+            self.assertIn(level, range(6))
+            if percent < 100:
+                self.assertNotEqual(level, 5)
+        self.assertEqual(palette_levels[99], 4)
+        self.assertEqual(palette_levels[100], 5)
 
     def test_completion_rejects_missing_invalid_unsupported_and_oversize_proof(self):
         self.login_unlocked_owner()
@@ -3109,7 +3511,8 @@ class DailySealApiTests(unittest.TestCase):
                 for row in connection.execute("PRAGMA table_info(daily_stats)").fetchall()
             }
             stat_row = connection.execute(
-                "SELECT stat_date, poms, note, distractions FROM daily_stats"
+                "SELECT stat_date, poms, note, distractions, "
+                "poms_recorded_at, poms_record_date FROM daily_stats"
             ).fetchone()
             progress_columns = {
                 row["name"]
@@ -3148,6 +3551,8 @@ class DailySealApiTests(unittest.TestCase):
         self.assertTrue({"title", "description", "color_key", "status"}.issubset(goal_columns))
         self.assertTrue({"stage_id", "title", "position", "status"}.issubset(subgoal_columns))
         self.assertIn("distractions", stat_columns)
+        self.assertIn("poms_recorded_at", stat_columns)
+        self.assertIn("poms_record_date", stat_columns)
         self.assertEqual(row["task_date"], "2026-01-15")
         self.assertEqual(row["text"], "legacy task")
         self.assertEqual(row["created_at"], legacy_created_at)
@@ -3169,6 +3574,8 @@ class DailySealApiTests(unittest.TestCase):
         self.assertEqual(stat_row["poms"], 5)
         self.assertEqual(stat_row["note"], "legacy private note")
         self.assertEqual(stat_row["distractions"], "")
+        self.assertIsNone(stat_row["poms_recorded_at"])
+        self.assertIsNone(stat_row["poms_record_date"])
         self.assertIn("client_key", progress_columns)
         self.assertIn("record_date", progress_columns)
         self.assertTrue(
@@ -3262,6 +3669,7 @@ class DailySealApiTests(unittest.TestCase):
         ).get_json()["task"]
         owner_payload = owner_client.get("/api/data").get_json()
         self.assertEqual(owner_payload["publicPoms"], {today: 7})
+        self.assertEqual(owner_payload["publicPomMeta"], {})
         self.assertIn(future_date, owner_payload["stats"])
 
         viewer_client = server.app.test_client()
@@ -3271,6 +3679,7 @@ class DailySealApiTests(unittest.TestCase):
         payload = viewer_data.get_json()
         self.assertNotIn("stats", payload)
         self.assertEqual(payload["publicPoms"], {today: 7})
+        self.assertEqual(payload["publicPomMeta"], {})
         raw_viewer_data = viewer_data.get_data(as_text=True)
         # Progress-entry `note` is intentionally public; the private daily
         # note remains absent because viewers never receive the `stats` map.
@@ -3427,9 +3836,27 @@ class DailySealApiTests(unittest.TestCase):
         )
         exported = json.loads(self.client.get("/api/export").get_data(as_text=True))
         self.assertEqual(exported["notes"]["2026-01-20"], "")
+        self.assertEqual(exported["pomMeta"], {})
         self.assertEqual(
             exported["distractions"]["2026-01-20"], "looked at the phone"
         )
+        with self.db() as connection:
+            connection.execute("DELETE FROM daily_stats")
+        reimported = self.client.post(
+            "/api/import",
+            json={"data": exported},
+            headers={"X-CSRF-Token": self.csrf()},
+        )
+        self.assertEqual(
+            reimported.status_code,
+            200,
+            reimported.get_data(as_text=True),
+        )
+        second_export = json.loads(
+            self.client.get("/api/export").get_data(as_text=True)
+        )
+        self.assertEqual(second_export["poms"]["2026-01-20"], 2)
+        self.assertEqual(second_export["pomMeta"], {})
 
     def test_logout_revokes_session_and_user_agent_change_invalidates_it(self):
         self.login_unlocked_owner()
